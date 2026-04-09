@@ -1,4 +1,5 @@
 #include "../../../../include/bazzulto/console.h"
+#include "../../../../include/bazzulto/heap.h"
 #include "../../../../include/bazzulto/kernel.h"
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
@@ -43,6 +44,9 @@ __attribute__((used, section(".limine_requests_end")))
 static volatile LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset = 0;
+
+// The kernel's page table — exposed so other subsystems can map new pages.
+uint64_t *kernel_page_table = NULL;
 
 // Print a size_t as decimal — temporary until we have console_printf.
 static void print_number(size_t n) {
@@ -133,8 +137,13 @@ void kernel_main(void) {
     }
 
     // --- Step 4: activate our page table ---
+    kernel_page_table = kernel_table;
     virtual_memory_activate(kernel_table);
     console_println("Virtual memory: active");
+
+    // --- Step 5: initialize the kernel heap ---
+    heap_init();
+    console_println("Heap: ok");
 
     console_println("Kernel initialized. Halting.");
     for (;;) __asm__("wfe");

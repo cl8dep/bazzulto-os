@@ -1,10 +1,15 @@
 #include "../../include/bazzulto/physical_memory.h"
+#include "../../include/bazzulto/kernel.h"
 
-// Each free page stores a pointer to the next free page at its own address.
-// This means the free list has zero memory overhead — the list nodes live
-// inside the free pages themselves.
+// The free list stores virtual addresses (via HHDM), not physical addresses.
+// This means nodes are always accessible regardless of which page table is active,
+// as long as the HHDM is mapped — which is true from the moment hhdm_offset is set.
+//
+// physical_memory_alloc returns a PHYSICAL address (suitable for page table entries).
+// physical_memory_free expects a PHYSICAL address.
+// Callers use PHYSICAL_TO_VIRTUAL to access the memory contents if needed.
 struct free_page {
-    struct free_page *next;
+    struct free_page *next;  // virtual address of next free page
 };
 
 static struct free_page *free_list_head = NULL;
@@ -14,15 +19,10 @@ void physical_memory_init(struct limine_memmap_response *memmap) {
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *entry = memmap->entries[i];
 
-        // Only add pages from regions the firmware marked as usable.
-        // Other types (reserved, ACPI, framebuffer, etc.) must not be touched.
         if (entry->type != LIMINE_MEMMAP_USABLE) {
             continue;
         }
 
-        // Walk the region page by page and push each page onto the free list.
-        // We cast the physical address to a pointer because at this stage the
-        // kernel has a direct map of all physical memory (set up by Limine).
         uint64_t address = entry->base;
         uint64_t end     = entry->base + entry->length;
 
@@ -35,21 +35,21 @@ void physical_memory_init(struct limine_memmap_response *memmap) {
 
 void *physical_memory_alloc(void) {
     if (free_list_head == NULL) {
-        return NULL;  // out of memory
+        return NULL;
     }
 
-    // Pop the first page off the free list and return it.
-    struct free_page *page = free_list_head;
-    free_list_head = page->next;
+    // The node is stored at a virtual address — convert back to physical before returning.
+    struct free_page *node = free_list_head;
+    free_list_head = node->next;
     free_page_count--;
 
-    return (void *)page;
+    return (void *)VIRTUAL_TO_PHYSICAL(node);
 }
 
-void physical_memory_free(void *page) {
-    // Write the current list head into the start of the page, then
-    // make this page the new head. The page itself becomes the list node.
-    struct free_page *node = (struct free_page *)page;
+void physical_memory_free(void *physical_page) {
+    // Store the node at the virtual address of the page so it remains accessible
+    // after our own page table (which only maps via HHDM) is activated.
+    struct free_page *node = (struct free_page *)PHYSICAL_TO_VIRTUAL(physical_page);
     node->next = free_list_head;
     free_list_head = node;
     free_page_count++;

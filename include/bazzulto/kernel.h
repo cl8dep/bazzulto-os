@@ -11,6 +11,10 @@
 // Set once during boot by kernel_main, then read-only forever after.
 extern uint64_t hhdm_offset;
 
+// The kernel's top-level page table. Other subsystems use this to map
+// new virtual memory regions (e.g. the heap growing into new pages).
+extern uint64_t *kernel_page_table;
+
 // Convert a physical address to a kernel virtual address via the HHDM.
 #define PHYSICAL_TO_VIRTUAL(physical) ((void *)((uint64_t)(physical) + hhdm_offset))
 

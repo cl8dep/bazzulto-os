@@ -24,7 +24,8 @@ C_SOURCES := \
     kernel/arch/arm64/boot/main.c \
     kernel/drivers/console/console.c \
     kernel/memory/physical_memory.c \
-    kernel/memory/virtual_memory.c
+    kernel/memory/virtual_memory.c \
+    kernel/memory/heap.c
 
 ASM_SOURCES := \
     kernel/arch/arm64/boot/start.S

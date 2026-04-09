@@ -67,6 +67,20 @@ void virtual_memory_map(uint64_t *level0_table, uint64_t virtual_addr,
 
     // Level 3 entry points directly to the physical page, not another table.
     level3_table[LEVEL3_INDEX(virtual_addr)] = physical_addr | flags;
+
+    // Invalidate the TLB entry for this virtual address so the CPU picks up
+    // the new mapping immediately. Without this, the CPU may use a stale
+    // (absent) TLB entry and fault on the next access to this address.
+    // vaae1is = invalidate by virtual address, all ASIDs, EL1, inner shareable.
+    __asm__ volatile(
+        "dsb ishst\n"           // ensure the page table write is visible to the MMU
+        "tlbi vaae1is, %0\n"   // invalidate TLB entry for this virtual page
+        "dsb ish\n"             // wait for invalidation to complete
+        "isb\n"                 // flush instruction pipeline
+        :
+        : "r"(virtual_addr >> 12)
+        : "memory"
+    );
 }
 
 void virtual_memory_activate(uint64_t *kernel_table) {
