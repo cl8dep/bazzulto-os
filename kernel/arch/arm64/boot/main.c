@@ -1,4 +1,5 @@
 #include "../../../../include/bazzulto/console.h"
+#include "../../../../include/bazzulto/exceptions.h"
 #include "../../../../include/bazzulto/heap.h"
 #include "../../../../include/bazzulto/kernel.h"
 #include "../../../../include/bazzulto/physical_memory.h"
@@ -144,6 +145,9 @@ void kernel_main(void) {
     // --- Step 5: initialize the kernel heap ---
     heap_init();
     console_println("Heap: ok");
+
+    // --- Step 6: install exception vector table ---
+    exceptions_init();
 
     console_println("Kernel initialized. Halting.");
     for (;;) __asm__("wfe");

@@ -22,13 +22,15 @@ LDFLAGS := -nostdlib -static \
 # --- Sources ---
 C_SOURCES := \
     kernel/arch/arm64/boot/main.c \
+    kernel/arch/arm64/exceptions/exceptions.c \
     kernel/drivers/console/console.c \
     kernel/memory/physical_memory.c \
     kernel/memory/virtual_memory.c \
     kernel/memory/heap.c
 
 ASM_SOURCES := \
-    kernel/arch/arm64/boot/start.S
+    kernel/arch/arm64/boot/start.S \
+    kernel/arch/arm64/exceptions/exception_vectors.S
 
 OBJECTS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.S=.o)
 
