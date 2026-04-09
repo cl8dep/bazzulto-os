@@ -22,7 +22,9 @@ LDFLAGS := -nostdlib -static \
 # --- Sources ---
 C_SOURCES := \
     kernel/arch/arm64/boot/main.c \
-    kernel/drivers/console/console.c
+    kernel/drivers/console/console.c \
+    kernel/memory/physical_memory.c \
+    kernel/memory/virtual_memory.c
 
 ASM_SOURCES := \
     kernel/arch/arm64/boot/start.S
