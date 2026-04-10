@@ -1,22 +1,41 @@
 // Bazzulto OS - ARM64 kernel entry point
 // This is the first code that runs after Limine hands control to the kernel.
-// Responsibilities: set up the stack, then jump to kernel_main in C.
+//
+// Limine boot contract (limine-protocol PROTOCOL.md, verified from trunk):
+//   - CPU at EL1, all interrupts masked (PSTATE.{D,A,I,F} = 1)
+//   - MMU ON: SCTLR_EL1.{M,C,I} = 1 (MMU, D-cache, I-cache enabled)
+//   - MAIR_EL1: Attr0=0xFF (normal WB-RWA), Attr1=framebuffer type
+//   - TCR_EL1: T0SZ=T1SZ=16, 4KB granule, Inner Shareable, WB-RWA
+//   - TTBR1_EL1: bootloader page tables (kernel + HHDM mapped)
+//   - VBAR_EL1: bootloader vectors that just hang — we must replace
+//   - SPSel: UNDEFINED (rev 0) or 0 (rev 6+) — we must set to 1
+//   - SP: bootloader stack (64KB default) — we override with our own
+//   - x0-x28, x29 = 0; x30 = 0 (must not return from entry)
+//   - GIC: firmware-dependent (not initialized by Limine)
 
 .section .text
 .global _start
 
 _start:
-    // Load the address of the top of our stack into x9 (a scratch register)
-    // and move it into SP. This must happen before any C function is called.
+    // Select SP_EL1 as the stack pointer for EL1.
+    //
+    // ARM ARM D1.8.2: SPSel controls which SP is used at the current EL.
+    //   SPSel=0 → SP_EL0 (EL1t mode)
+    //   SPSel=1 → SP_EL1 (EL1h mode)
+    //
+    // We MUST use SP_EL1 because exception entry at EL1 forces PSTATE.SP=1
+    // (ARM ARM D1.10.1). If we ran with SP_EL0, exception handlers would
+    // use the uninitialized SP_EL1 and crash immediately.
+    msr spsel, #1
+
+    // Set up the kernel stack. Now that SPSel=1, `mov sp` writes SP_EL1.
     adr x9, stack_top
     mov sp, x9
 
-    // Clear the frame pointer so stack traces stop here instead of
-    // wandering into garbage memory above us.
+    // Clear the frame pointer so stack traces stop here.
     mov x29, #0
 
-    // Jump to the C kernel entry point. x0 still holds the pointer to the
-    // Limine boot info structure, as placed there by the bootloader.
+    // Jump to the C kernel entry point.
     bl kernel_main
 
     // kernel_main should never return. If it does, halt the CPU permanently.

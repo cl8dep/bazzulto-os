@@ -42,7 +42,6 @@ static int heap_grow(void) {
                        (uint64_t)physical_page,
                        PAGE_FLAGS_KERNEL_DATA);
 
-    // Place a block header at the start of the new page.
     struct block_header *new_block = (struct block_header *)heap_current_end;
     new_block->size    = PAGE_SIZE - HEADER_SIZE;
     new_block->is_free = 1;
@@ -50,13 +49,26 @@ static int heap_grow(void) {
 
     heap_current_end += PAGE_SIZE;
 
-    // Append to the end of the block list.
     if (!heap_head) {
         heap_head = new_block;
+        return 1;
+    }
+
+    // Find the last block in the list.
+    struct block_header *tail = heap_head;
+    while (tail->next) tail = tail->next;
+
+    // If the tail block is free and ends exactly where the new page starts,
+    // merge them into one larger free block. This allows kmalloc to satisfy
+    // requests larger than a single page (e.g. 8KB kernel stacks).
+    // Without merging, each page is a separate 4072-byte block and large
+    // allocations would loop forever growing the heap one page at a time.
+    uint8_t *tail_end = (uint8_t *)tail + HEADER_SIZE + tail->size;
+    if (tail->is_free && (struct block_header *)tail_end == new_block) {
+        tail->size += HEADER_SIZE + new_block->size;
+        // new_block is absorbed into tail — do not append it separately.
     } else {
-        struct block_header *current = heap_head;
-        while (current->next) current = current->next;
-        current->next = new_block;
+        tail->next = new_block;
     }
 
     return 1;

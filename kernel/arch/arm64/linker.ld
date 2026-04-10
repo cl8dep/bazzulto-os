@@ -11,9 +11,18 @@ SECTIONS {
        that keeps kernel addresses clearly separate from userspace. */
     . = 0xFFFFFFFF80000000;
 
+    /* --- Executable region: mapped with PAGE_FLAGS_KERNEL_CODE --- */
+    _text_start = .;
     .text : {
         *(.text .text.*)
     }
+
+    /* Page-align between code and data so they can have different
+       page table permissions (executable vs non-executable). */
+    . = ALIGN(4096);
+    _text_end = .;
+
+    /* --- Non-executable region: mapped with PAGE_FLAGS_KERNEL_DATA --- */
 
     .rodata : {
         *(.rodata .rodata.*)
@@ -40,4 +49,7 @@ SECTIONS {
         *(.bss .bss.*)
         *(COMMON)
     }
+
+    . = ALIGN(4096);
+    _kernel_end = .;
 }

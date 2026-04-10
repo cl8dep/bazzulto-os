@@ -1,6 +1,9 @@
 #include "../../../../include/bazzulto/console.h"
 #include "../../../../include/bazzulto/exceptions.h"
 #include "../../../../include/bazzulto/heap.h"
+#include "../../../../include/bazzulto/scheduler.h"
+#include "../../../../include/bazzulto/timer.h"
+#include "../../../../include/bazzulto/uart.h"
 #include "../../../../include/bazzulto/kernel.h"
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
@@ -46,9 +49,6 @@ static volatile LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset = 0;
 
-// The kernel's page table — exposed so other subsystems can map new pages.
-uint64_t *kernel_page_table = NULL;
-
 // Print a size_t as decimal — temporary until we have console_printf.
 static void print_number(size_t n) {
     char digits[20];
@@ -61,6 +61,28 @@ static void print_number(size_t n) {
     digits[length] = '\0';
     console_print(digits);
 }
+
+static void process_a(void) {
+    for (;;) {
+        console_println("[A] tick");
+        uart_puts("[A] tick\n");
+        timer_delay_ms(1000);
+    }
+}
+
+static void process_b(void) {
+    uart_puts("[B] UART echo ready — type something:\n");
+    for (;;) {
+        char c = uart_getc();   // blocks until a character arrives via IRQ
+        uart_putc(c);           // echo back
+        if (c == '\r') {
+            uart_putc('\n');    // terminal sends \r on Enter
+        }
+    }
+}
+
+// The kernel's page table — exposed so other subsystems can map new pages.
+uint64_t *kernel_page_table = NULL;
 
 void kernel_main(void) {
     if (!framebuffer_request.response || framebuffer_request.response->framebuffer_count < 1) {
@@ -111,14 +133,17 @@ void kernel_main(void) {
         for (;;) __asm__("wfe");
     }
 
-    // Map the entire kernel image (we use 4MB as a safe upper bound for now).
-    // Each page is mapped with the same virtual→physical offset Limine set up.
-    uint64_t kernel_size = 4 * 1024 * 1024;
-    for (uint64_t offset = 0; offset < kernel_size; offset += PAGE_SIZE) {
-        virtual_memory_map(kernel_table,
-                           kernel_virtual_base  + offset,
-                           kernel_physical_base + offset,
-                           PAGE_FLAGS_KERNEL_CODE);
+    // Map the kernel image using linker-exported section boundaries.
+    // .text is mapped executable; everything else is non-executable (W^X).
+    // Physical addresses are derived from the VA→PA offset Limine provides.
+    extern char _text_start[], _text_end[], _kernel_end[];
+    uint64_t phys_offset = kernel_physical_base - kernel_virtual_base;
+
+    for (uint64_t va = (uint64_t)_text_start; va < (uint64_t)_text_end; va += PAGE_SIZE) {
+        virtual_memory_map(kernel_table, va, va + phys_offset, PAGE_FLAGS_KERNEL_CODE);
+    }
+    for (uint64_t va = (uint64_t)_text_end; va < (uint64_t)_kernel_end; va += PAGE_SIZE) {
+        virtual_memory_map(kernel_table, va, va + phys_offset, PAGE_FLAGS_KERNEL_DATA);
     }
 
     // Map every usable physical region via the HHDM so PHYSICAL_TO_VIRTUAL
@@ -137,6 +162,25 @@ void kernel_main(void) {
         }
     }
 
+    // Map GIC MMIO regions as device memory so timer_init can access them after
+    // we activate our page table. These are MMIO addresses — not RAM — so they
+    // won't appear in the Limine memory map. We must add them explicitly.
+    // GIC Distributor: 0x08000000, size 64KB (16 pages)
+    // GIC CPU Interface: 0x08010000, size 64KB (16 pages)
+    for (uint64_t page = 0; page < 16; page++) {
+        uint64_t gicd_page = 0x08000000ULL + page * PAGE_SIZE;
+        uint64_t gicc_page = 0x08010000ULL + page * PAGE_SIZE;
+        virtual_memory_map(kernel_table, hhdm_offset + gicd_page, gicd_page, PAGE_FLAGS_KERNEL_DEVICE);
+        virtual_memory_map(kernel_table, hhdm_offset + gicc_page, gicc_page, PAGE_FLAGS_KERNEL_DEVICE);
+    }
+
+    // Map PL011 UART MMIO — physical 0x09000000, one page (4KB).
+    // QEMU virt machine: first UART at this address (hw/arm/virt.c).
+    virtual_memory_map(kernel_table,
+                       hhdm_offset + 0x09000000ULL,
+                       0x09000000ULL,
+                       PAGE_FLAGS_KERNEL_DEVICE);
+
     // --- Step 4: activate our page table ---
     kernel_page_table = kernel_table;
     virtual_memory_activate(kernel_table);
@@ -148,6 +192,23 @@ void kernel_main(void) {
 
     // --- Step 6: install exception vector table ---
     exceptions_init();
+
+    // --- Step 7: initialize scheduler, timer, and UART ---
+    // Timer must init first — it sets up the GIC distributor and CPU interface.
+    // UART init depends on a working GIC to register IRQ 33.
+    scheduler_init();
+    timer_init();
+
+    uart_init();
+    uart_puts("UART: ok\n");
+    console_println("UART: ok");
+
+    // Create two test processes to verify the scheduler works
+    scheduler_create_process(process_a);
+    scheduler_create_process(process_b);
+
+    console_println("Starting scheduler...");
+    scheduler_start();  // does not return
 
     console_println("Kernel initialized. Halting.");
     for (;;) __asm__("wfe");

@@ -84,29 +84,48 @@ void virtual_memory_map(uint64_t *level0_table, uint64_t virtual_addr,
 }
 
 void virtual_memory_activate(uint64_t *kernel_table) {
-    // MAIR_EL1: Memory Attribute Indirection Register.
+    // MAIR_EL1: Memory Attribute Indirection Register — ARM ARM D13.2.97
     // Defines memory type attributes referenced by the AttrIdx field in page entries.
-    // Index 0 = Normal memory, write-back cacheable (0xFF)
-    // Index 1 = Device memory, nGnRnE — strictly ordered, no caching (0x00)
+    // Attr0 (byte 0) = 0xFF: Normal memory, Inner/Outer Write-Back Non-Transient,
+    //                         Read-Allocate + Write-Allocate
+    // Attr1 (byte 1) = 0x00: Device-nGnRnE (no Gathering, no Reordering, no Early ack)
     uint64_t mair = (0xFFULL << 0) | (0x00ULL << 8);
 
-    // TCR_EL1: Translation Control Register.
-    // T1SZ=16 → TTBR1 covers the top 2^(64-16) = 2^48 of address space (0xFFFF...)
-    // TG1=10  → 4KB granule for TTBR1
-    // SH1=11  → inner shareable
-    // ORGN1=01, IRGN1=01 → write-back, read-allocate cacheable
-    uint64_t tcr = (16ULL << 16) |  // T1SZ
-                   (2ULL  << 30) |  // TG1: 4KB granule
-                   (3ULL  << 28) |  // SH1: inner shareable
-                   (1ULL  << 26) |  // ORGN1: write-back cacheable
-                   (1ULL  << 24);   // IRGN1: write-back cacheable
+    // Read the physical address size supported by this CPU.
+    // ARM ARM D13.2.52: ID_AA64MMFR0_EL1.PARange [3:0] encodes the PA width.
+    // We copy this value into TCR_EL1.IPS so the MMU knows the PA output size.
+    uint64_t mmfr0;
+    __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
+    uint64_t pa_range = mmfr0 & 0xF;
+
+    // TCR_EL1: Translation Control Register — ARM ARM D13.2.120
+    //
+    // WARNING: this register is written in full. Any fields left as zero take
+    // effect — we must explicitly configure or disable both TTBR0 and TTBR1.
+    uint64_t tcr =
+        // TTBR0 region (user space) — disabled, no page table walks.
+        // EPD0=1 causes any TTBR0-range access to fault immediately
+        // without a table walk. We set T0SZ=16 to define the 48-bit
+        // boundary even though walks are disabled.
+        (16ULL << 0)   |  // T0SZ  [5:0]   = 16 → 48-bit VA split
+        (1ULL  << 7)   |  // EPD0  [7]     = 1  → disable TTBR0 walks
+
+        // TTBR1 region (kernel space) — active.
+        (16ULL << 16)  |  // T1SZ  [21:16] = 16 → 48-bit VA (2^48 kernel range)
+        (1ULL  << 24)  |  // IRGN1 [25:24] = 01 → inner write-back, write-allocate
+        (1ULL  << 26)  |  // ORGN1 [27:26] = 01 → outer write-back, write-allocate
+        (3ULL  << 28)  |  // SH1   [29:28] = 11 → inner shareable
+        (2ULL  << 30)  |  // TG1   [31:30] = 10 → 4KB granule
+
+        // IPS: Intermediate Physical Address Size — must match hardware.
+        (pa_range << 32); // IPS [34:32] = from ID_AA64MMFR0_EL1.PARange
 
     uint64_t physical_table = VIRTUAL_TO_PHYSICAL(kernel_table);
 
     __asm__ volatile (
         "msr mair_el1, %0\n"    // Set memory attribute types
-        "msr tcr_el1,  %1\n"    // Set address space size and caching policy
-        "isb\n"                  // Ensure both registers are visible before loading table
+        "msr tcr_el1,  %1\n"    // Set translation control (address widths, caching)
+        "isb\n"                  // Ensure system register writes are visible
         "msr ttbr1_el1, %2\n"   // Load kernel page table (physical address)
         "isb\n"
         "tlbi vmalle1\n"         // Invalidate all TLB entries for EL1

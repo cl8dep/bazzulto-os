@@ -5,6 +5,7 @@
 // CPU register state saved on the stack when an exception occurs.
 // The exception entry code pushes all general-purpose registers before
 // calling the C handler, and restores them on return.
+// Total size: 36 × 8 = 288 bytes (16-byte aligned).
 struct exception_frame {
     uint64_t x0,  x1,  x2,  x3;
     uint64_t x4,  x5,  x6,  x7;
@@ -14,6 +15,7 @@ struct exception_frame {
     uint64_t x20, x21, x22, x23;
     uint64_t x24, x25, x26, x27;
     uint64_t x28, x29, x30;  // x29=frame pointer, x30=link register
+    uint64_t sp;     // Stack pointer at time of exception (before frame push)
     uint64_t elr;    // Exception Link Register: address of the faulting instruction
     uint64_t spsr;   // Saved Program Status Register: CPU flags at time of exception
     uint64_t esr;    // Exception Syndrome Register: encodes the exception cause
