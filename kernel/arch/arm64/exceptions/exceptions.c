@@ -4,7 +4,7 @@
 #include "../../../../include/bazzulto/scheduler.h"
 #include "../../../../include/bazzulto/timer.h"
 #include "../../../../include/bazzulto/uart.h"
-#include "../../../../include/bazzulto/syscall.h"
+#include "../../../../include/bazzulto/systemcall.h"
 
 // Defined in exception_vectors.S — the Assembly table we install.
 extern void exception_vectors(void);
@@ -112,7 +112,7 @@ void exception_handler_sync_el1(struct exception_frame *frame) {
             console_println("KERNEL PANIC: instruction abort");
             break;
         case EC_SVC_AARCH64:
-            console_println("WARNING: SVC from EL1 (unexpected syscall in kernel)");
+            console_println("WARNING: SVC from EL1 (unexpected system call in kernel)");
             return;
         default:
             console_println("KERNEL PANIC: unhandled synchronous exception");
@@ -140,7 +140,7 @@ void exception_handler_sync_el0(struct exception_frame *frame) {
 
     switch (ec) {
     case EC_SVC_AARCH64:
-        syscall_dispatch(frame);
+        systemcall_dispatch(frame);
         return;
     case EC_DATA_ABORT_EL0:
         uart_puts("[kernel] killed pid: data abort from EL0\n");

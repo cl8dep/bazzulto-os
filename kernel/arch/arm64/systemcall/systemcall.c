@@ -1,4 +1,4 @@
-#include "../../../../include/bazzulto/syscall.h"
+#include "../../../../include/bazzulto/systemcall.h"
 #include "../../../../include/bazzulto/uart.h"
 #include "../../../../include/bazzulto/scheduler.h"
 #include "../../../../include/bazzulto/console.h"
@@ -54,7 +54,7 @@ static int64_t sys_yield(void) {
 
 // --- Dispatch ---
 
-void syscall_dispatch(struct exception_frame *frame) {
+void systemcall_dispatch(struct exception_frame *frame) {
 	uint32_t nr = ESR_SVC_IMM(frame->esr);
 
 	switch (nr) {

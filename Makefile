@@ -30,7 +30,7 @@ C_SOURCES := \
     kernel/scheduler/scheduler.c \
     kernel/scheduler/waitqueue.c \
     kernel/arch/arm64/timer.c \
-    kernel/arch/arm64/syscall/syscall.c \
+    kernel/arch/arm64/systemcall/systemcall.c \
     kernel/drivers/uart/uart.c
 
 ASM_SOURCES := \
