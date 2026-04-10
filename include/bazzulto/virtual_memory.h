@@ -35,6 +35,10 @@
 // For EL1&0 stage 1: prevents EL0 from executing this page
 #define PAGE_UXN           (1ULL << 54)
 
+// Bits [7:6]: AP for user-accessible pages — ARM ARM D5.4.4, Table D5-39
+#define PAGE_USER_RW       (1ULL << 6)   // AP[2:1]=01: EL1+EL0 read/write
+#define PAGE_USER_RO       (3ULL << 6)   // AP[2:1]=11: EL1+EL0 read-only
+
 // --- Composite flags for common mappings ---
 
 // Kernel code (.text): executable by EL1, not by EL0
@@ -54,6 +58,16 @@
     (PAGE_VALID | PAGE_TABLE | PAGE_ACCESS_FLAG | PAGE_KERNEL_RW | \
      PAGE_ATTR_DEVICE | PAGE_SH_OUTER | PAGE_PXN | PAGE_UXN)
 
+// User code (.text): executable by EL0, not by EL1. Read-only from both.
+#define PAGE_FLAGS_USER_CODE \
+    (PAGE_VALID | PAGE_TABLE | PAGE_ACCESS_FLAG | PAGE_USER_RO | \
+     PAGE_ATTR_NORMAL | PAGE_SH_INNER | PAGE_PXN)
+
+// User data (stack, heap): read-write, not executable by anyone.
+#define PAGE_FLAGS_USER_DATA \
+    (PAGE_VALID | PAGE_TABLE | PAGE_ACCESS_FLAG | PAGE_USER_RW | \
+     PAGE_ATTR_NORMAL | PAGE_SH_INNER | PAGE_PXN | PAGE_UXN)
+
 // Create a new, empty page table. Returns a virtual address pointer to it.
 uint64_t *virtual_memory_create_table(void);
 
@@ -64,3 +78,11 @@ void virtual_memory_map(uint64_t *table, uint64_t virtual_addr, uint64_t physica
 // Activate a page table by writing it into TTBR1_EL1 (kernel address space).
 // After this call, the CPU uses this table for all 0xFFFF... addresses.
 void virtual_memory_activate(uint64_t *kernel_table);
+
+// Enable TTBR0 page table walks in TCR_EL1 (clears EPD0).
+// Must be called once before any user process runs.
+void virtual_memory_enable_user(void);
+
+// Switch the user-space page table (TTBR0_EL1) to a new process's table.
+// Flushes the TLB to ensure the new mappings take effect.
+void virtual_memory_switch_ttbr0(uint64_t *user_table);

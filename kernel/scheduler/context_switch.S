@@ -48,7 +48,7 @@ context_switch:
 
     ret
 
-// Entry trampoline for processes that have never run before.
+// Entry trampoline for KERNEL threads that have never run before.
 // scheduler_create_process sets: x30 = process_entry_trampoline,
 //                                x19 = real entry point.
 // context_switch ret → here → enable IRQs → jump to entry.
@@ -56,3 +56,49 @@ context_switch:
 process_entry_trampoline:
     msr  daifclr, #2   // unmask IRQs (the process must be preemptible)
     br   x19            // jump to the real entry point (saved in callee-saved x19)
+
+// Entry trampoline for USER processes (EL0).
+// scheduler_create_user_process sets: x30 = process_entry_trampoline_user,
+//                                     x19 = user entry point VA,
+//                                     x20 = user stack top VA.
+// context_switch ret → here → set ELR/SPSR/SP_EL0 → eret to EL0.
+.global process_entry_trampoline_user
+process_entry_trampoline_user:
+    msr  elr_el1, x19         // return address = user entry point
+    msr  spsr_el1, xzr        // SPSR = 0 = EL0t, IRQs unmasked, flags clear
+    msr  sp_el0, x20           // set user stack pointer
+
+    // Zero all general-purpose registers to prevent kernel data leakage.
+    // After eret, the user sees only zeros in x0-x30.
+    mov  x0,  #0
+    mov  x1,  #0
+    mov  x2,  #0
+    mov  x3,  #0
+    mov  x4,  #0
+    mov  x5,  #0
+    mov  x6,  #0
+    mov  x7,  #0
+    mov  x8,  #0
+    mov  x9,  #0
+    mov  x10, #0
+    mov  x11, #0
+    mov  x12, #0
+    mov  x13, #0
+    mov  x14, #0
+    mov  x15, #0
+    mov  x16, #0
+    mov  x17, #0
+    mov  x18, #0
+    mov  x19, #0
+    mov  x20, #0
+    mov  x21, #0
+    mov  x22, #0
+    mov  x23, #0
+    mov  x24, #0
+    mov  x25, #0
+    mov  x26, #0
+    mov  x27, #0
+    mov  x28, #0
+    mov  x29, #0
+    mov  x30, #0
+    eret                       // → EL0: PC=ELR, PSTATE=SPSR

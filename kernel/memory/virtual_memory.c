@@ -123,16 +123,68 @@ void virtual_memory_activate(uint64_t *kernel_table) {
     uint64_t physical_table = VIRTUAL_TO_PHYSICAL(kernel_table);
 
     __asm__ volatile (
-        "msr mair_el1, %0\n"    // Set memory attribute types
-        "msr tcr_el1,  %1\n"    // Set translation control (address widths, caching)
-        "isb\n"                  // Ensure system register writes are visible
-        "msr ttbr1_el1, %2\n"   // Load kernel page table (physical address)
+        "msr mair_el1, %0\n"
+        "msr tcr_el1,  %1\n"
         "isb\n"
-        "tlbi vmalle1\n"         // Invalidate all TLB entries for EL1
-        "dsb sy\n"               // Wait for TLB invalidation to complete
+        "msr ttbr1_el1, %2\n"
+        "isb\n"
+        "tlbi vmalle1\n"
+        "dsb sy\n"
         "isb\n"
         :
         : "r"(mair), "r"(tcr), "r"(physical_table)
+        : "memory"
+    );
+}
+
+void virtual_memory_enable_user(void) {
+    // Rewrite TCR_EL1 with EPD0=0 to enable TTBR0 page table walks.
+    // Also configure TTBR0 cacheability/shareability (must match MAIR Attr0).
+    // Called once from kernel_main before any user process is created.
+    uint64_t mmfr0;
+    __asm__ volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
+    uint64_t pa_range = mmfr0 & 0xF;
+
+    uint64_t tcr =
+        // TTBR0 region — NOW ENABLED for user space
+        (16ULL << 0)   |  // T0SZ  [5:0]   = 16 → 48-bit user VA
+        // EPD0 = 0 (absent) → TTBR0 walks ENABLED
+        (0ULL  << 14)  |  // TG0   [15:14] = 00 → 4KB granule
+        (1ULL  << 8)   |  // IRGN0 [9:8]   = 01 → inner write-back, write-allocate
+        (1ULL  << 10)  |  // ORGN0 [11:10] = 01 → outer write-back, write-allocate
+        (3ULL  << 12)  |  // SH0   [13:12] = 11 → inner shareable
+
+        // TTBR1 region — unchanged
+        (16ULL << 16)  |  // T1SZ
+        (1ULL  << 24)  |  // IRGN1
+        (1ULL  << 26)  |  // ORGN1
+        (3ULL  << 28)  |  // SH1
+        (2ULL  << 30)  |  // TG1 = 4KB
+
+        (pa_range << 32); // IPS
+
+    __asm__ volatile(
+        "msr tcr_el1, %0\n"
+        "isb\n"
+        "tlbi vmalle1\n"
+        "dsb ish\n"
+        "isb\n"
+        :
+        : "r"(tcr)
+        : "memory"
+    );
+}
+
+void virtual_memory_switch_ttbr0(uint64_t *user_table) {
+    uint64_t physical = VIRTUAL_TO_PHYSICAL(user_table);
+    __asm__ volatile(
+        "msr ttbr0_el1, %0\n"
+        "isb\n"
+        "tlbi vmalle1\n"     // flush all TLB entries (ASID optimization later)
+        "dsb ish\n"
+        "isb\n"
+        :
+        : "r"(physical)
         : "memory"
     );
 }

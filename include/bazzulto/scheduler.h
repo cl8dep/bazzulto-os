@@ -36,9 +36,14 @@ struct process {
 // Initialize the scheduler. Must be called after heap and exceptions are ready.
 void scheduler_init(void);
 
-// Create a new process that will start executing at `entry_point`.
+// Create a new kernel thread that will start executing at `entry_point`.
 // Returns the new process, or NULL on allocation failure.
 process_t *scheduler_create_process(void (*entry_point)(void));
+
+// Create a new user-mode process. Copies `code_size` bytes from `code`
+// into a new address space mapped at 0x00400000, allocates a user stack,
+// and configures the process to eret to EL0 on first switch.
+process_t *scheduler_create_user_process(const void *code, size_t code_size);
 
 // Called from the timer IRQ handler on every tick.
 // Saves the current process state and switches to the next one.

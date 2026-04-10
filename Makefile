@@ -30,6 +30,7 @@ C_SOURCES := \
     kernel/scheduler/scheduler.c \
     kernel/scheduler/waitqueue.c \
     kernel/arch/arm64/timer.c \
+    kernel/arch/arm64/syscall/syscall.c \
     kernel/drivers/uart/uart.c
 
 ASM_SOURCES := \
@@ -37,7 +38,9 @@ ASM_SOURCES := \
     kernel/arch/arm64/exceptions/exception_vectors.S \
     kernel/scheduler/context_switch.S
 
-OBJECTS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.S=.o)
+USER_SOURCES := user/test_program.S user/echo.S
+
+OBJECTS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.S=.o) $(USER_SOURCES:.S=.o)
 
 # --- Targets ---
 .PHONY: all clean

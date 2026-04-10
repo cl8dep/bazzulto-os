@@ -1,10 +1,18 @@
 #include "../../include/bazzulto/scheduler.h"
 #include "../../include/bazzulto/heap.h"
 #include "../../include/bazzulto/console.h"
+#include "../../include/bazzulto/physical_memory.h"
+#include "../../include/bazzulto/virtual_memory.h"
+#include "../../include/bazzulto/kernel.h"
 
 // Defined in context_switch.S
 extern void context_switch(cpu_context_t *from, cpu_context_t *to);
 extern void process_entry_trampoline(void);
+extern void process_entry_trampoline_user(void);
+
+// User-space address layout
+#define USER_TEXT_BASE   0x00400000ULL
+#define USER_STACK_TOP   0x7FFFFFF000ULL
 
 #define KERNEL_STACK_SIZE 16384  // 16KB — must handle process + IRQ exception frame + full call chain
 
@@ -74,6 +82,93 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     return process;
 }
 
+static void memory_copy(void *dst, const void *src, size_t n) {
+    uint8_t *d = dst;
+    const uint8_t *s = src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+}
+
+static void memory_zero(void *dst, size_t n) {
+    uint8_t *d = dst;
+    for (size_t i = 0; i < n; i++) d[i] = 0;
+}
+
+process_t *scheduler_create_user_process(const void *code, size_t code_size) {
+    process_t *process = (process_t *)kmalloc(sizeof(process_t));
+    if (!process) return NULL;
+
+    uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
+    if (!kstack) { kfree(process); return NULL; }
+
+    process->pid          = next_pid++;
+    process->state        = PROCESS_STATE_READY;
+    process->kernel_stack = kstack;
+    process->next         = NULL;
+    process->wait_next    = NULL;
+
+    // --- Create per-process page table (TTBR0) ---
+    uint64_t *user_table = virtual_memory_create_table();
+    if (!user_table) { kfree(kstack); kfree(process); return NULL; }
+    process->page_table = user_table;
+
+    // --- Map user code at USER_TEXT_BASE ---
+    size_t pages_needed = (code_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (size_t i = 0; i < pages_needed; i++) {
+        void *phys = physical_memory_alloc();
+        if (!phys) { kfree(kstack); kfree(process); return NULL; }
+        uint8_t *virt = PHYSICAL_TO_VIRTUAL(phys);
+        size_t offset = i * PAGE_SIZE;
+        size_t chunk = code_size - offset;
+        if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
+        memory_copy(virt, (const uint8_t *)code + offset, chunk);
+        if (chunk < PAGE_SIZE) memory_zero(virt + chunk, PAGE_SIZE - chunk);
+        virtual_memory_map(user_table, USER_TEXT_BASE + offset,
+                           (uint64_t)phys, PAGE_FLAGS_USER_CODE);
+    }
+
+    // --- Map user stack (one page below USER_STACK_TOP) ---
+    void *stack_phys = physical_memory_alloc();
+    if (!stack_phys) { kfree(kstack); kfree(process); return NULL; }
+    memory_zero(PHYSICAL_TO_VIRTUAL(stack_phys), PAGE_SIZE);
+    virtual_memory_map(user_table, USER_STACK_TOP - PAGE_SIZE,
+                       (uint64_t)stack_phys, PAGE_FLAGS_USER_DATA);
+
+    // --- Set initial context for EL0 entry ---
+    uint64_t kstack_top = (uint64_t)(kstack + KERNEL_STACK_SIZE) & ~(uint64_t)15;
+    process->context.x19 = USER_TEXT_BASE;       // user entry point
+    process->context.x20 = USER_STACK_TOP;       // user stack top
+    process->context.x21 = 0;
+    process->context.x22 = 0;
+    process->context.x23 = 0;
+    process->context.x24 = 0;
+    process->context.x25 = 0;
+    process->context.x26 = 0;
+    process->context.x27 = 0;
+    process->context.x28 = 0;
+    process->context.x29 = 0;
+    process->context.x30 = (uint64_t)process_entry_trampoline_user;
+    process->context.sp  = kstack_top;           // kernel stack for exceptions
+
+    // Append to circular run queue
+    if (!run_queue) {
+        run_queue = process;
+        process->next = process;
+    } else {
+        process_t *last = run_queue;
+        while (last->next != run_queue) last = last->next;
+        last->next    = process;
+        process->next = run_queue;
+    }
+
+    return process;
+}
+
+// Switch TTBR0 if the next process has a different page table.
+static void switch_address_space(process_t *prev, process_t *next) {
+    if (next->page_table && next->page_table != prev->page_table)
+        virtual_memory_switch_ttbr0(next->page_table);
+}
+
 void scheduler_tick(void) {
     if (!current || !current->next) return;
 
@@ -92,6 +187,7 @@ void scheduler_tick(void) {
     previous->state = PROCESS_STATE_READY;
     current->state  = PROCESS_STATE_RUNNING;
 
+    switch_address_space(previous, current);
     context_switch(&previous->context, &current->context);
 }
 
@@ -132,6 +228,7 @@ void scheduler_yield(void) {
 
     current = next;
     current->state = PROCESS_STATE_RUNNING;
+    switch_address_space(prev, current);
     context_switch(&prev->context, &current->context);
     // Returns here when `prev` is eventually switched back to.
 }

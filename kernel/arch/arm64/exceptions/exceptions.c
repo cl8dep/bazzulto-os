@@ -4,6 +4,7 @@
 #include "../../../../include/bazzulto/scheduler.h"
 #include "../../../../include/bazzulto/timer.h"
 #include "../../../../include/bazzulto/uart.h"
+#include "../../../../include/bazzulto/syscall.h"
 
 // Defined in exception_vectors.S — the Assembly table we install.
 extern void exception_vectors(void);
@@ -47,13 +48,31 @@ static const char *decode_fault(uint32_t fsc) {
     return "unknown";
 }
 
+// Print a hex value to UART for serial debugging.
+static void uart_print_hex64(uint64_t val) {
+    char buf[17];
+    for (int i = 15; i >= 0; i--) {
+        buf[i] = "0123456789ABCDEF"[val & 0xF];
+        val >>= 4;
+    }
+    buf[16] = '\0';
+    uart_puts(buf);
+}
+
 static void print_exception_info(struct exception_frame *frame) {
+    // Print to both framebuffer and UART for debugging.
     console_print("  ELR=0x"); print_hex64(frame->elr);
     console_print("  SP=0x");  print_hex64(frame->sp);
     console_println("");
     console_print("  ESR=0x"); print_hex64(frame->esr);
     console_print("  FAR=0x"); print_hex64(frame->far);
     console_println("");
+
+    uart_puts("  ELR=0x"); uart_print_hex64(frame->elr);
+    uart_puts(" SP=0x");   uart_print_hex64(frame->sp);
+    uart_puts(" ESR=0x");  uart_print_hex64(frame->esr);
+    uart_puts(" FAR=0x");  uart_print_hex64(frame->far);
+    uart_puts("\n");
 
     // Decode ESR fields
     uint32_t ec   = ESR_EC(frame->esr);
@@ -102,6 +121,50 @@ void exception_handler_sync_el1(struct exception_frame *frame) {
 
     print_exception_info(frame);
     for (;;) __asm__("wfe");
+}
+
+// --- EL0 exception handlers (user space) ---
+
+// Kill the current process and yield to the next one.
+// The dead process remains in the circular queue but is skipped by the scheduler.
+static void process_kill_current(void) {
+    process_t *p = scheduler_get_current();
+    p->state = PROCESS_STATE_DEAD;
+    // TODO: free user page table and physical pages
+    scheduler_yield();
+    // Never returns — the process is DEAD and will never be scheduled again.
+}
+
+void exception_handler_sync_el0(struct exception_frame *frame) {
+    uint32_t ec = ESR_EC(frame->esr);
+
+    switch (ec) {
+    case EC_SVC_AARCH64:
+        syscall_dispatch(frame);
+        return;
+    case EC_DATA_ABORT_EL0:
+        uart_puts("[kernel] killed pid: data abort from EL0\n");
+        print_exception_info(frame);
+        process_kill_current();
+        return;
+    case EC_INSN_ABORT_EL0:
+        uart_puts("[kernel] killed pid: instruction abort from EL0\n");
+        print_exception_info(frame);
+        process_kill_current();
+        return;
+    default:
+        uart_puts("[kernel] killed pid: unhandled exception from EL0\n");
+        print_exception_info(frame);
+        process_kill_current();
+        return;
+    }
+}
+
+void exception_handler_irq_el0(struct exception_frame *frame) {
+    // IRQ dispatch is identical regardless of which EL was preempted.
+    // The eret at the end restores SPSR_EL1 which has M=EL0t,
+    // so the CPU returns to user mode automatically.
+    exception_handler_irq_el1(frame);
 }
 
 void exception_handler_irq_el1(struct exception_frame *frame) {

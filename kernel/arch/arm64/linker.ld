@@ -14,7 +14,7 @@ SECTIONS {
     /* --- Executable region: mapped with PAGE_FLAGS_KERNEL_CODE --- */
     _text_start = .;
     .text : {
-        *(.text .text.*)
+        EXCLUDE_FILE(user/test_program.o user/echo.o) *(.text .text.*)
     }
 
     /* Page-align between code and data so they can have different
@@ -49,6 +49,23 @@ SECTIONS {
         *(.bss .bss.*)
         *(COMMON)
     }
+
+    /* Embedded user-mode programs (copied into per-process page tables at runtime).
+       Stored in the kernel image, mapped at USER_TEXT_BASE (0x00400000) at runtime. */
+    . = ALIGN(4096);
+    _user_text_start = .;
+    .user_text : {
+        . = ALIGN(4);
+        _user_hello_start = .;
+        user/test_program.o(.text)
+        _user_hello_end = .;
+
+        . = ALIGN(4);
+        _user_echo_start = .;
+        user/echo.o(.text)
+        _user_echo_end = .;
+    }
+    _user_text_end = .;
 
     . = ALIGN(4096);
     _kernel_end = .;

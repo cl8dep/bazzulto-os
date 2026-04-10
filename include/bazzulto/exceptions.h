@@ -31,5 +31,11 @@ void exception_handler_sync_el1(struct exception_frame *frame);
 // Called from Assembly for EL1 IRQ (timer, hardware interrupts)
 void exception_handler_irq_el1(struct exception_frame *frame);
 
+// Called from Assembly for EL0 synchronous exceptions (syscalls, page faults)
+void exception_handler_sync_el0(struct exception_frame *frame);
+
+// Called from Assembly for EL0 IRQ (timer preempting user process)
+void exception_handler_irq_el0(struct exception_frame *frame);
+
 // Called from Assembly for unexpected exceptions (groups A, D, FIQ, SError)
 void exception_handler_unexpected(struct exception_frame *frame);

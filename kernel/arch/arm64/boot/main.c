@@ -203,9 +203,24 @@ void kernel_main(void) {
     uart_puts("UART: ok\n");
     console_println("UART: ok");
 
-    // Create two test processes to verify the scheduler works
+    // Enable TTBR0 page table walks for user-space processes.
+    virtual_memory_enable_user();
+
+    // Create kernel threads
     scheduler_create_process(process_a);
     scheduler_create_process(process_b);
+
+    // Create user-mode processes from embedded programs.
+    extern char _user_hello_start[], _user_hello_end[];
+    extern char _user_echo_start[], _user_echo_end[];
+
+    scheduler_create_user_process(_user_hello_start,
+                                  _user_hello_end - _user_hello_start);
+    console_println("User process [hello]: created");
+
+    scheduler_create_user_process(_user_echo_start,
+                                  _user_echo_end - _user_echo_start);
+    console_println("User process [echo]: created");
 
     console_println("Starting scheduler...");
     scheduler_start();  // does not return
