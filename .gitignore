@@ -1,5 +1,13 @@
+# Build artifacts
 *.o
+*.d
 *.elf
-*.iso
-*.img
-build/
+bazzulto.elf
+esp/bazzulto.elf
+uart.log
+qemu_debug.log
+
+# Editor / tool files
+.mcp.json
+invocation_reasons.yaml
+memory/

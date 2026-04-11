@@ -7,6 +7,8 @@
 #include "../../../../include/bazzulto/kernel.h"
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
+#include "../../../../include/bazzulto/ramfs.h"
+#include "../../../../include/bazzulto/elf_loader.h"
 #include "../../../../limine/limine.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -62,24 +64,7 @@ static void print_number(size_t n) {
     console_print(digits);
 }
 
-static void process_a(void) {
-    for (;;) {
-        console_println("[A] tick");
-        uart_puts("[A] tick\n");
-        timer_delay_ms(1000);
-    }
-}
 
-static void process_b(void) {
-    uart_puts("[B] UART echo ready — type something:\n");
-    for (;;) {
-        char c = uart_getc();   // blocks until a character arrives via IRQ
-        uart_putc(c);           // echo back
-        if (c == '\r') {
-            uart_putc('\n');    // terminal sends \r on Enter
-        }
-    }
-}
 
 // The kernel's page table — exposed so other subsystems can map new pages.
 uint64_t *kernel_page_table = NULL;
@@ -190,10 +175,13 @@ void kernel_main(void) {
     heap_init();
     console_println("Heap: ok");
 
-    // --- Step 6: install exception vector table ---
+    // --- Step 6: initialize ramfs ---
+    ramfs_init();
+
+    // --- Step 7: install exception vector table ---
     exceptions_init();
 
-    // --- Step 7: initialize scheduler, timer, and UART ---
+    // --- Step 8: initialize scheduler, timer, and UART ---
     // Timer must init first — it sets up the GIC distributor and CPU interface.
     // UART init depends on a working GIC to register IRQ 33.
     scheduler_init();
@@ -206,21 +194,32 @@ void kernel_main(void) {
     // Enable TTBR0 page table walks for user-space processes.
     virtual_memory_enable_user();
 
-    // Create kernel threads
-    scheduler_create_process(process_a);
-    scheduler_create_process(process_b);
+    // Register all ELF programs in ramfs.
+    extern char _user_hello_elf_start[], _user_hello_elf_end[];
+    extern char _user_shell_elf_start[], _user_shell_elf_end[];
+    extern char _user_ls_elf_start[],    _user_ls_elf_end[];
+    extern char _user_help_elf_start[],  _user_help_elf_end[];
+    extern char _user_echo_elf_start[],  _user_echo_elf_end[];
 
-    // Create user-mode processes from embedded programs.
-    extern char _user_hello_start[], _user_hello_end[];
-    extern char _user_echo_start[], _user_echo_end[];
+    ramfs_register("/bin/hello", _user_hello_elf_start,
+                   _user_hello_elf_end - _user_hello_elf_start);
+    ramfs_register("/bin/shell", _user_shell_elf_start,
+                   _user_shell_elf_end - _user_shell_elf_start);
+    ramfs_register("/bin/ls", _user_ls_elf_start,
+                   _user_ls_elf_end - _user_ls_elf_start);
+    ramfs_register("/bin/help", _user_help_elf_start,
+                   _user_help_elf_end - _user_help_elf_start);
+    ramfs_register("/bin/echo", _user_echo_elf_start,
+                   _user_echo_elf_end - _user_echo_elf_start);
 
-    scheduler_create_user_process(_user_hello_start,
-                                  _user_hello_end - _user_hello_start);
-    console_println("User process [hello]: created");
-
-    scheduler_create_user_process(_user_echo_start,
-                                  _user_echo_end - _user_echo_start);
-    console_println("User process [echo]: created");
+    // Launch the shell as the initial user-mode process.
+    if (elf_loader_load(_user_shell_elf_start,
+                        _user_shell_elf_end - _user_shell_elf_start,
+                        NULL, 0)) {
+        console_println("Shell: launched");
+    } else {
+        console_println("FATAL: failed to load shell");
+    }
 
     console_println("Starting scheduler...");
     scheduler_start();  // does not return

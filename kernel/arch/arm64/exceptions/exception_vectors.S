@@ -98,9 +98,9 @@
     mov  x0, sp
 .endm
 
-// Restore all registers and return from exception.
-// Works for both EL1→EL1 and EL1→EL0 returns: eret atomically restores
-// PC from ELR_EL1 and PSTATE from SPSR_EL1 (including the target EL).
+// Restore all registers and return from EL1→EL1 exception.
+// PC is restored from ELR_EL1, PSTATE from SPSR_EL1.
+// SP_EL0 is NOT restored here — EL1 exceptions never change SP_EL0.
 .macro restore_exception_frame
     ldp  x9,  x10, [sp, #256]
     msr  elr_el1,  x9
@@ -110,6 +110,43 @@
     ldp  x4,  x5,  [sp, #32]
     ldp  x6,  x7,  [sp, #48]
     ldp  x8,  x9,  [sp, #64]
+    ldp  x10, x11, [sp, #80]
+    ldp  x12, x13, [sp, #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x19, [sp, #144]
+    ldp  x20, x21, [sp, #160]
+    ldp  x22, x23, [sp, #176]
+    ldp  x24, x25, [sp, #192]
+    ldp  x26, x27, [sp, #208]
+    ldp  x28, x29, [sp, #224]
+    ldr  x30,      [sp, #240]
+    add  sp, sp, #288
+    eret
+.endm
+
+// Restore all registers and return from EL1→EL0 exception.
+//
+// Identical to restore_exception_frame except we also restore SP_EL0 from
+// the saved frame (offset 248). This is required because a context switch
+// may have occurred between the save and restore: if another user process
+// ran at EL0 while the current process was descheduled, SP_EL0 holds that
+// other process's stack pointer. Without this restore, the returning process
+// gets the wrong user stack pointer and corrupts its own stack frame.
+//
+// ARM ARM D1.10.1: SP_EL0 is not changed by exception entry or exit —
+// the kernel must save and restore it explicitly across context switches.
+.macro restore_exception_frame_el0
+    ldp  x9,  x10, [sp, #256]
+    msr  elr_el1,  x9
+    msr  spsr_el1, x10
+    ldr  x9,       [sp, #248]    // saved SP_EL0 (user stack pointer at SVC/fault site)
+    msr  sp_el0,   x9            // restore user stack before any GPR clobbers x9
+    ldp  x0,  x1,  [sp, #0]
+    ldp  x2,  x3,  [sp, #16]
+    ldp  x4,  x5,  [sp, #32]
+    ldp  x6,  x7,  [sp, #48]
+    ldp  x8,  x9,  [sp, #64]    // x9 overwritten here — sp_el0 already written above
     ldp  x10, x11, [sp, #80]
     ldp  x12, x13, [sp, #96]
     ldp  x14, x15, [sp, #112]
@@ -197,13 +234,15 @@ __handle_irq_el1:
     restore_exception_frame
 
 // EL0 handlers (user space exceptions) — use save_exception_frame_el0
-// to capture SP_EL0 (user stack) instead of SP_EL1 (kernel stack).
+// to capture SP_EL0 (user stack) instead of SP_EL1 (kernel stack), and
+// restore_exception_frame_el0 to restore SP_EL0 before eret (so that a
+// context switch between save and restore does not corrupt the user SP).
 __handle_sync_el0:
     save_exception_frame_el0
     bl exception_handler_sync_el0
-    restore_exception_frame
+    restore_exception_frame_el0
 
 __handle_irq_el0:
     save_exception_frame_el0
     bl exception_handler_irq_el0
-    restore_exception_frame
+    restore_exception_frame_el0

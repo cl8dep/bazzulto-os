@@ -4,6 +4,7 @@
 #include "../../include/bazzulto/physical_memory.h"
 #include "../../include/bazzulto/virtual_memory.h"
 #include "../../include/bazzulto/kernel.h"
+#include "../../include/bazzulto/virtual_file_system.h"
 
 // Defined in context_switch.S
 extern void context_switch(cpu_context_t *from, cpu_context_t *to);
@@ -37,11 +38,14 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     uint8_t *stack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
     if (!stack) { kfree(process); return NULL; }
 
-    process->pid          = next_pid++;
-    process->state        = PROCESS_STATE_READY;
-    process->page_table   = NULL;  // shares kernel page table for now
-    process->kernel_stack = stack;
-    process->next         = NULL;
+    process->pid              = next_pid++;
+    process->state            = PROCESS_STATE_READY;
+    process->page_table       = NULL;  // shares kernel page table for now
+    process->kernel_stack     = stack;
+    process->next             = NULL;
+    process->wait_next        = NULL;
+    process->waiting_for_pid  = 0;
+    virtual_file_system_init_fds(process->fds);
 
     // Set up the initial context so that when context_switch restores it,
     // execution begins at process_entry_trampoline (defined in context_switch.S).
@@ -100,11 +104,13 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
     if (!kstack) { kfree(process); return NULL; }
 
-    process->pid          = next_pid++;
-    process->state        = PROCESS_STATE_READY;
-    process->kernel_stack = kstack;
-    process->next         = NULL;
-    process->wait_next    = NULL;
+    process->pid             = next_pid++;
+    process->state           = PROCESS_STATE_READY;
+    process->kernel_stack    = kstack;
+    process->next            = NULL;
+    process->wait_next       = NULL;
+    process->waiting_for_pid = 0;
+    virtual_file_system_init_fds(process->fds);
 
     // --- Create per-process page table (TTBR0) ---
     uint64_t *user_table = virtual_memory_create_table();
@@ -148,6 +154,56 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     process->context.x29 = 0;
     process->context.x30 = (uint64_t)process_entry_trampoline_user;
     process->context.sp  = kstack_top;           // kernel stack for exceptions
+
+    // Append to circular run queue
+    if (!run_queue) {
+        run_queue = process;
+        process->next = process;
+    } else {
+        process_t *last = run_queue;
+        while (last->next != run_queue) last = last->next;
+        last->next    = process;
+        process->next = run_queue;
+    }
+
+    return process;
+}
+
+process_t *scheduler_create_user_process_from_image(uint64_t *page_table,
+                                                     uint64_t entry_point,
+                                                     uint64_t user_stack_top) {
+    process_t *process = (process_t *)kmalloc(sizeof(process_t));
+    if (!process) return NULL;
+
+    uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
+    if (!kstack) { kfree(process); return NULL; }
+
+    process->pid             = next_pid++;
+    process->state           = PROCESS_STATE_READY;
+    process->page_table      = page_table;
+    process->kernel_stack    = kstack;
+    process->next            = NULL;
+    process->wait_next       = NULL;
+    process->waiting_for_pid = 0;
+    virtual_file_system_init_fds(process->fds);
+
+    // Set initial context for EL0 entry via process_entry_trampoline_user.
+    // The trampoline writes ELR_EL1 = x19, SPSR_EL1 = 0 (EL0t), SP_EL0 = x20,
+    // zeroes all GPRs, then performs eret.
+    uint64_t kstack_top = (uint64_t)(kstack + KERNEL_STACK_SIZE) & ~(uint64_t)15;
+    process->context.x19 = entry_point;
+    process->context.x20 = user_stack_top;
+    process->context.x21 = 0;
+    process->context.x22 = 0;
+    process->context.x23 = 0;
+    process->context.x24 = 0;
+    process->context.x25 = 0;
+    process->context.x26 = 0;
+    process->context.x27 = 0;
+    process->context.x28 = 0;
+    process->context.x29 = 0;
+    process->context.x30 = (uint64_t)process_entry_trampoline_user;
+    process->context.sp  = kstack_top;
 
     // Append to circular run queue
     if (!run_queue) {
@@ -233,6 +289,32 @@ void scheduler_yield(void) {
     // Returns here when `prev` is eventually switched back to.
 }
 
+process_t *scheduler_find_process(uint32_t pid)
+{
+    if (!run_queue) return NULL;
+
+    process_t *p = run_queue;
+    do {
+        if (p->pid == pid) return p;
+        p = p->next;
+    } while (p != run_queue);
+
+    return NULL;
+}
+
+void scheduler_wake_waiters(uint32_t pid)
+{
+    if (!run_queue) return;
+
+    process_t *p = run_queue;
+    do {
+        if (p->state == PROCESS_STATE_WAITING && p->waiting_for_pid == pid) {
+            p->state = PROCESS_STATE_READY;
+        }
+        p = p->next;
+    } while (p != run_queue);
+}
+
 void scheduler_start(void) {
     if (!run_queue) {
         console_println("Scheduler: no processes to run");
@@ -241,6 +323,12 @@ void scheduler_start(void) {
 
     current        = run_queue;
     current->state = PROCESS_STATE_RUNNING;
+
+    // If the first process is a user process, load its TTBR0 page table now.
+    // scheduler_tick/scheduler_yield call switch_address_space, but the very
+    // first context_switch has no "previous" process — so we must switch here.
+    if (current->page_table)
+        virtual_memory_switch_ttbr0(current->page_table);
 
     // Switch from the bootstrap context into the first process.
     // context_switch will enable IRQs (msr daifclr, #2) before ret.

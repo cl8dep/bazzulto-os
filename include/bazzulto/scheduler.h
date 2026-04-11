@@ -2,12 +2,14 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "virtual_file_system.h"
 
 // Process states
 typedef enum {
     PROCESS_STATE_READY,    // waiting to be scheduled
     PROCESS_STATE_RUNNING,  // currently executing on the CPU
     PROCESS_STATE_BLOCKED,  // waiting for I/O or an event
+    PROCESS_STATE_WAITING,  // blocked in wait() until a specific child exits
     PROCESS_STATE_DEAD,     // finished, waiting to be cleaned up
 } process_state_t;
 
@@ -26,11 +28,13 @@ typedef struct process process_t;
 struct process {
     uint32_t        pid;
     process_state_t state;
-    cpu_context_t   context;       // saved registers when not running
-    uint64_t       *page_table;    // this process's virtual address space
-    uint8_t        *kernel_stack;  // kernel stack base (allocated on creation)
-    process_t      *next;          // next process in the circular run queue
-    process_t      *wait_next;     // next process in a wait queue (NULL if not waiting)
+    cpu_context_t   context;            // saved registers when not running
+    uint64_t       *page_table;         // this process's virtual address space
+    uint8_t        *kernel_stack;       // kernel stack base (allocated on creation)
+    file_descriptor_t fds[VIRTUAL_FILE_SYSTEM_MAX_FDS]; // per-process file descriptor table
+    uint32_t        waiting_for_pid;    // PID this process is blocked on (0 = not waiting)
+    process_t      *next;               // next process in the circular run queue
+    process_t      *wait_next;          // next process in a wait queue (NULL if not waiting)
 };
 
 // Initialize the scheduler. Must be called after heap and exceptions are ready.
@@ -44,6 +48,17 @@ process_t *scheduler_create_process(void (*entry_point)(void));
 // into a new address space mapped at 0x00400000, allocates a user stack,
 // and configures the process to eret to EL0 on first switch.
 process_t *scheduler_create_user_process(const void *code, size_t code_size);
+
+// Create a user-mode process from a pre-built page table.
+// Used by the ELF loader, which maps segments and the user stack itself.
+// The caller provides:
+//   page_table       — fully populated TTBR0 table (code + stack already mapped)
+//   entry_point      — virtual address where execution begins (ELF e_entry)
+//   user_stack_top   — top of the user stack (mapped by the caller)
+// Returns the new process, or NULL on allocation failure.
+process_t *scheduler_create_user_process_from_image(uint64_t *page_table,
+                                                     uint64_t entry_point,
+                                                     uint64_t user_stack_top);
 
 // Called from the timer IRQ handler on every tick.
 // Saves the current process state and switches to the next one.
@@ -60,3 +75,11 @@ process_t *scheduler_get_current(void);
 // The caller must have set current->state to BLOCKED before calling.
 // IRQs must be disabled by the caller.
 void scheduler_yield(void);
+
+// Search the run queue for a process with the given PID.
+// Returns a pointer to the process, or NULL if not found.
+process_t *scheduler_find_process(uint32_t pid);
+
+// Wake all processes that are blocked in PROCESS_STATE_WAITING for `pid`.
+// Called by sys_exit when a process dies so its waiters can be rescheduled.
+void scheduler_wake_waiters(uint32_t pid);
