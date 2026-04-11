@@ -97,12 +97,57 @@
 
 /// Replace the current process image with a new ELF binary from ramfs.
 /// x0 = path (user string, max 256 bytes).
+/// x1 = argv (user pointer to NULL-terminated string array, or NULL).
+///      If NULL, the new process receives only argv[0] = path.
 /// On success: does not return to the caller — execution restarts at the new
 ///             ELF entry point with a fresh stack.
 /// On failure: returns -1.
 #define SYSTEMCALL_EXEC     16
 
-#define NR_SYSTEMCALLS 17
+/// Return the PID index of the calling process.
+/// No arguments. Returns PID >= 1.
+#define SYSTEMCALL_GETPID   17
+
+/// Return the PID index of the calling process's parent.
+/// No arguments. Returns parent PID >= 0 (0 = no parent / orphan).
+#define SYSTEMCALL_GETPPID  18
+
+/// Read the current time from the specified clock.
+/// x0 = clock_id (0 = CLOCK_REALTIME/monotonic, 1 = CLOCK_MONOTONIC).
+/// x1 = pointer to struct timespec (user) to receive the result.
+/// Returns 0 on success, -1 on error.
+#define SYSTEMCALL_CLOCK_GETTIME 19
+
+/// Sleep for at least the time given in *req.
+/// x0 = pointer to const struct timespec (requested duration).
+/// x1 = pointer to struct timespec (remaining time on interrupt, may be NULL).
+/// Returns 0 on success, -1 on error.
+#define SYSTEMCALL_NANOSLEEP 20
+
+/// Register a signal handler for the given signal number.
+/// x0 = signum (1–31).
+/// x1 = handler VA (0 = SIG_DFL/default action, 1 = SIG_IGN/ignore).
+/// Returns 0 on success, -1 on invalid signum.
+#define SYSTEMCALL_SIGACTION 21
+
+/// Send a signal to a process.
+/// x0 = target PID index.
+/// x1 = signal number (1–31).
+/// Returns 0 on success, -1 if the target process is not found.
+#define SYSTEMCALL_KILL      22
+
+/// Restore the CPU state saved before a signal handler was invoked.
+/// Called by the signal trampoline page after the user handler returns.
+/// Pops the struct signal_frame from the user stack and eret's to the
+/// original interrupted context. No explicit arguments.
+#define SYSTEMCALL_SIGRETURN 23
+
+#define NR_SYSTEMCALLS 24
+
+// Deliver any pending signals to the current process before returning to EL0.
+// Called at the end of systemcall_dispatch and exception_handler_irq_el0.
+// Modifies frame->elr / frame->sp if a signal is delivered to user space.
+void systemcall_deliver_pending_signals(struct exception_frame *frame);
 
 // Dispatch a system call from the exception frame.
 // Called from exception_handler_sync_el0 when EC = EC_SVC_AARCH64.

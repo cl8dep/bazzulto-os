@@ -108,7 +108,51 @@ fork:
     svc #15
     ret
 
+// exec(path): x0=path, x1 must be 0 (no argv — kernel uses {path}).
+// Without the explicit zero, x1 contains whatever the caller had, which the
+// kernel would misinterpret as a user argv pointer.
 .global exec
 exec:
+    mov x1, #0
     svc #16
+    ret
+
+// execv(path, argv): x0=path, x1=argv (NULL-terminated string array).
+.global execv
+execv:
+    svc #16
+    ret
+
+.global getpid
+getpid:
+    svc #17
+    ret
+
+.global getppid
+getppid:
+    svc #18
+    ret
+
+// clock_gettime(clock_id, tp): x0=clock_id, x1=tp.
+.global clock_gettime
+clock_gettime:
+    svc #19
+    ret
+
+// nanosleep(req, rem): x0=req, x1=rem.
+.global nanosleep
+nanosleep:
+    svc #20
+    ret
+
+// sigaction(signum, handler): x0=signum, x1=handler_va.
+.global sigaction
+sigaction:
+    svc #21
+    ret
+
+// kill(pid, signum): x0=pid, x1=signum.
+.global kill
+kill:
+    svc #22
     ret

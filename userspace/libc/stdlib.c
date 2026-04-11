@@ -1,8 +1,11 @@
 #include "stdlib.h"
+#include "string.h"
 
-// exit() is provided by userspace/library/systemcall.h; forward-declare here
-// so abort() can call it without pulling in the full syscall header.
-extern void exit(int status) __attribute__((noreturn));
+// exit() and mmap()/munmap() are provided by userspace/library/systemcall.S;
+// forward-declare here to avoid pulling in the full syscall header.
+extern void  exit(int status) __attribute__((noreturn));
+extern void *mmap(size_t length);
+extern int   munmap(void *addr);
 
 // ---------------------------------------------------------------------------
 // Core conversion — strtoull
@@ -229,6 +232,165 @@ static void insertion_sort(char *base, size_t nmemb, size_t size,
             j--;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// malloc — first-fit allocator backed by mmap
+//
+// Block header layout (32 bytes, keeps returned pointers 32-byte aligned):
+//
+//   offset  0: size_t usable_size  — bytes available after this header
+//   offset  8: size_t flags        — bit 0: 1=free, 0=allocated
+//   offset 16: struct malloc_block *next_free  — next in free list (NULL if end)
+//   offset 24: (reserved / padding to 32 bytes)
+//
+// The free list is singly linked (next_free). Allocation uses first-fit.
+// On malloc, if the found free block is large enough, it is split if the
+// leftover is >= MALLOC_HEADER_SIZE + MALLOC_MIN_USABLE bytes.
+// On free, the block is prepended to the free list (no coalescing — simple
+// but correct; fragmentation grows over time but is acceptable for a hobby OS).
+// New memory is requested from the kernel via mmap() in MALLOC_SLAB_PAGES
+// increments (currently 16 pages = 64 KB per slab request).
+// ---------------------------------------------------------------------------
+
+typedef struct malloc_block {
+    size_t                usable_size;  // caller-usable bytes following this header
+    size_t                flags;        // bit 0: MALLOC_FLAG_FREE
+    struct malloc_block  *next_free;    // next free block, NULL if tail
+    size_t                _reserved;    // padding to 32 bytes
+} malloc_block_t;
+
+#define MALLOC_FLAG_FREE      1u
+#define MALLOC_HEADER_SIZE    sizeof(malloc_block_t)  // 32 bytes
+#define MALLOC_MIN_USABLE     32u    // minimum usable bytes in a split-off block
+#define MALLOC_SLAB_PAGES     16u    // pages per mmap slab (64 KB)
+#define PAGE_SIZE_BYTES       4096u
+
+static malloc_block_t *malloc_free_head = (malloc_block_t *)0;
+
+static void *malloc_new_slab(size_t minimum_total)
+{
+    size_t slab_bytes = MALLOC_SLAB_PAGES * PAGE_SIZE_BYTES;
+    if (minimum_total > slab_bytes)
+        slab_bytes = ((minimum_total + PAGE_SIZE_BYTES - 1) /
+                      PAGE_SIZE_BYTES) * PAGE_SIZE_BYTES;
+    return mmap(slab_bytes);
+}
+
+void *malloc(size_t size)
+{
+    if (size == 0)
+        return (void *)0;
+
+    // Round up to 32-byte alignment so every allocation is 32-byte aligned.
+    size = (size + 31u) & ~(size_t)31u;
+
+    // Search the free list for a first-fit block.
+    malloc_block_t *prev = (malloc_block_t *)0;
+    malloc_block_t *block = malloc_free_head;
+    while (block) {
+        if ((block->flags & MALLOC_FLAG_FREE) && block->usable_size >= size) {
+            // Found a fit.  Unlink from free list.
+            if (prev)
+                prev->next_free = block->next_free;
+            else
+                malloc_free_head = block->next_free;
+            block->next_free = (malloc_block_t *)0;
+
+            // Split if the remainder is large enough to be useful.
+            size_t remainder = block->usable_size - size;
+            if (remainder >= MALLOC_HEADER_SIZE + MALLOC_MIN_USABLE) {
+                malloc_block_t *split = (malloc_block_t *)
+                    ((char *)block + MALLOC_HEADER_SIZE + size);
+                split->usable_size = remainder - MALLOC_HEADER_SIZE;
+                split->flags       = MALLOC_FLAG_FREE;
+                split->next_free   = malloc_free_head;
+                split->_reserved   = 0;
+                malloc_free_head   = split;
+                block->usable_size = size;
+            }
+
+            block->flags = 0;  // mark allocated
+            return (char *)block + MALLOC_HEADER_SIZE;
+        }
+        prev  = block;
+        block = block->next_free;
+    }
+
+    // No suitable block — request a new slab from the kernel.
+    size_t slab_bytes = MALLOC_SLAB_PAGES * PAGE_SIZE_BYTES;
+    size_t needed     = MALLOC_HEADER_SIZE + size;
+    if (needed > slab_bytes)
+        slab_bytes = ((needed + PAGE_SIZE_BYTES - 1) / PAGE_SIZE_BYTES) *
+                     PAGE_SIZE_BYTES;
+
+    void *raw = malloc_new_slab(slab_bytes);
+    if (!raw || raw == (void *)-1)
+        return (void *)0;
+
+    // Carve a free block out of the slab and allocate from it.
+    malloc_block_t *new_block = (malloc_block_t *)raw;
+    new_block->usable_size = slab_bytes - MALLOC_HEADER_SIZE;
+    new_block->flags       = MALLOC_FLAG_FREE;
+    new_block->next_free   = malloc_free_head;
+    new_block->_reserved   = 0;
+    malloc_free_head       = new_block;
+
+    // Recurse once — the new slab is now in the free list.
+    return malloc(size);
+}
+
+void free(void *ptr)
+{
+    if (!ptr)
+        return;
+
+    malloc_block_t *block = (malloc_block_t *)((char *)ptr - MALLOC_HEADER_SIZE);
+
+    // Guard against double-free (best-effort — no canonical free list check).
+    if (block->flags & MALLOC_FLAG_FREE)
+        return;
+
+    block->flags     = MALLOC_FLAG_FREE;
+    block->next_free = malloc_free_head;
+    malloc_free_head = block;
+}
+
+void *calloc(size_t nmemb, size_t size)
+{
+    // Check for multiplication overflow.
+    if (nmemb && size > (size_t)-1 / nmemb)
+        return (void *)0;
+    size_t total = nmemb * size;
+    void *ptr = malloc(total);
+    if (ptr)
+        memset(ptr, 0, total);
+    return ptr;
+}
+
+void *realloc(void *ptr, size_t new_size)
+{
+    if (!ptr)
+        return malloc(new_size);
+    if (new_size == 0) {
+        free(ptr);
+        return (void *)0;
+    }
+
+    malloc_block_t *block = (malloc_block_t *)((char *)ptr - MALLOC_HEADER_SIZE);
+    size_t rounded = (new_size + 31u) & ~(size_t)31u;
+
+    // Current block is large enough — reuse it.
+    if (block->usable_size >= rounded)
+        return ptr;
+
+    // Need a bigger block — allocate, copy, free old.
+    void *new_ptr = malloc(new_size);
+    if (!new_ptr)
+        return (void *)0;
+    memcpy(new_ptr, ptr, block->usable_size < new_size ? block->usable_size : new_size);
+    free(ptr);
+    return new_ptr;
 }
 
 void qsort(void *base, size_t nmemb, size_t size,

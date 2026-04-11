@@ -6,6 +6,15 @@
 #include "../../include/bazzulto/kernel.h"
 #include "../../include/bazzulto/uart.h"
 
+// Signal return trampoline — mapped read+execute at this VA in every user process.
+// Contains a single `svc #SYSTEMCALL_SIGRETURN` instruction (number 23).
+// ARM ARM C6.2.326: svc #N encoding = 0xD4000001 | (N << 5).
+//   SYSTEMCALL_SIGRETURN = 23 → svc #23 = 0xD4000001 | (23 << 5) = 0xD40002E1.
+// When a signal handler returns (via LR = SIGNAL_TRAMPOLINE_VA), the CPU
+// executes this instruction which invokes sys_sigreturn to restore context.
+#define SIGNAL_TRAMPOLINE_VA    0x1000ULL
+#define SIGNAL_TRAMPOLINE_INSN  0xD40002E1U  // svc #23
+
 // User stack: mapped below this base address.
 // The actual stack top is varied per process by ASLR (see aslr_stack_offset()).
 #define USER_STACK_BASE  0x7FFFF00000ULL
@@ -295,6 +304,23 @@ int elf_loader_build_image(const void *data, size_t size,
 	*argc_slot = (uint64_t)argc;
 
 	user_sp &= ~(uint64_t)15;
+
+	// --- Map the signal return trampoline ---
+	//
+	// One read+execute page at SIGNAL_TRAMPOLINE_VA (0x1000), safely below
+	// the ELF load address (0x400000). The page contains a single instruction:
+	//   svc #SYSTEMCALL_SIGRETURN
+	// Signal handlers return via this address (placed in LR at delivery time).
+	void *trampoline_phys = physical_memory_alloc();
+	if (!trampoline_phys) {
+		uart_puts("[elf_loader] trampoline allocation failed\n");
+		return -1;
+	}
+	memset(PHYSICAL_TO_VIRTUAL(trampoline_phys), 0, PAGE_SIZE);
+	uint32_t *trampoline_code = (uint32_t *)PHYSICAL_TO_VIRTUAL(trampoline_phys);
+	trampoline_code[0] = SIGNAL_TRAMPOLINE_INSN;
+	virtual_memory_map(page_table, SIGNAL_TRAMPOLINE_VA,
+	                   (uint64_t)trampoline_phys, PAGE_FLAGS_USER_CODE);
 
 	*page_table_out = page_table;
 	*entry_out      = header->e_entry;

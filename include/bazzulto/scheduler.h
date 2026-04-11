@@ -58,6 +58,10 @@ struct process {
     // Anonymous mmap regions. Bump-pointer within user VA space starting at MMAP_USER_BASE.
     mmap_region_t   mmap_regions[PROCESS_MMAP_MAX_REGIONS];
     uint64_t        mmap_next_vaddr;    // next free VA for anonymous mmap allocations
+    // Signal state. pending_signals is a bitmask; bit N set = signal N is pending.
+    // signal_handlers[N]: 0 = SIG_DFL (default), 1 = SIG_IGN, else = user handler VA.
+    uint64_t        pending_signals;
+    uint64_t        signal_handlers[32];
     process_t      *next;               // next process in the circular run queue
     process_t      *wait_next;          // next process in a wait queue (NULL if not waiting)
 };

@@ -7,7 +7,14 @@
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
 #include "../../../../include/bazzulto/kernel.h"
+#include "../../../../include/bazzulto/timer.h"
 #include <string.h>
+
+// Signal return trampoline VA — a single `svc #SYSTEMCALL_SIGRETURN` instruction
+// mapped read+execute at this address in every user process by elf_loader_build_image.
+// The signal handler's LR is set to this address so returning from the handler
+// automatically invokes sys_sigreturn.
+#define SIGNAL_TRAMPOLINE_VA 0x1000ULL
 
 // Extract the SVC immediate from ESR_EL1.
 // ARM ARM D13.2.36: for EC=0x15 (SVC AArch64), ISS[15:0] = imm16.
@@ -395,7 +402,10 @@ static int64_t sys_munmap(uint64_t vaddr)
 // sys_exec — replace the calling process image with a new ELF from ramfs
 // ---------------------------------------------------------------------------
 
-static int64_t sys_exec(const char *path, struct exception_frame *frame)
+// sys_exec — replace current process image with a new ELF from ramfs.
+// user_argv: optional NULL-terminated argv array in user space (NULL = {path}).
+static int64_t sys_exec(const char *path, const char *const *user_argv,
+                         struct exception_frame *frame)
 {
 	char safe_path[256];
 	if (!validate_user_string((uint64_t)path, sizeof(safe_path)))
@@ -412,15 +422,40 @@ static int64_t sys_exec(const char *path, struct exception_frame *frame)
 	if (!file)
 		return -1;
 
+	// Parse user argv (same logic as sys_spawn).
+	char arg_storage[SPAWN_MAX_ARGC][SPAWN_MAX_ARG_LEN];
+	const char *kargv[SPAWN_MAX_ARGC + 1];
+	int argc = 0;
+
+	if (user_argv) {
+		for (int i = 0; i < SPAWN_MAX_ARGC; i++) {
+			uint64_t ptr_addr = (uint64_t)&user_argv[i];
+			if (!validate_user_buffer(ptr_addr, sizeof(char *)))
+				break;
+			const char *str = user_argv[i];
+			if (!str)
+				break;
+			if (!validate_user_string((uint64_t)str, SPAWN_MAX_ARG_LEN))
+				break;
+			copy_user_string(arg_storage[i], str, SPAWN_MAX_ARG_LEN);
+			kargv[i] = arg_storage[i];
+			argc++;
+		}
+	}
+	if (argc == 0) {
+		kargv[0] = safe_path;
+		argc = 1;
+	}
+	kargv[argc] = NULL;
+
 	process_t *process = scheduler_get_current();
 
 	uint64_t *new_table = NULL;
 	uint64_t  new_entry = 0;
 	uint64_t  new_sp    = 0;
 
-	const char *argv[2] = { safe_path, NULL };
 	if (elf_loader_build_image(file->data, file->size,
-	                            argv, 1,
+	                            kargv, argc,
 	                            &new_table, &new_entry, &new_sp) < 0)
 		return -1;
 
@@ -470,6 +505,220 @@ static int64_t sys_fork(struct exception_frame *frame)
 	if (child_pid == 0)
 		return -1;
 	return (int64_t)child_pid;
+}
+
+// ---------------------------------------------------------------------------
+// sys_getpid / sys_getppid
+// ---------------------------------------------------------------------------
+
+static int64_t sys_getpid(void)
+{
+	return (int64_t)scheduler_get_current()->pid.index;
+}
+
+static int64_t sys_getppid(void)
+{
+	return (int64_t)scheduler_get_current()->parent_pid;
+}
+
+// ---------------------------------------------------------------------------
+// sys_clock_gettime — read monotonic time from the architected timer
+//
+// clock_id is ignored (both CLOCK_REALTIME and CLOCK_MONOTONIC return the
+// same monotonic counter since boot — no wall-clock epoch is available).
+// ARM ARM D11.2: CNTPCT_EL0 counts at CNTFRQ_EL0 ticks per second.
+// ---------------------------------------------------------------------------
+
+static int64_t sys_clock_gettime(int clock_id, struct timespec *user_tp)
+{
+	(void)clock_id;
+	if (!validate_user_buffer((uint64_t)user_tp, sizeof(struct timespec)))
+		return -1;
+
+	uint64_t freq  = timer_read_cntfrq();
+	uint64_t count = timer_read_cntpct();
+
+	user_tp->tv_sec  = (int64_t)(count / freq);
+	user_tp->tv_nsec = (int64_t)((count % freq) * 1000000000ULL / freq);
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_nanosleep — sleep for at least *req time
+//
+// Implemented as a yield-loop: the process gives up the CPU on each tick
+// and checks the deadline after each reschedule. This avoids wasting cycles
+// in a tight spin while still honouring the requested duration within one
+// scheduler tick (TIMER_TICK_MS = 10 ms).
+// ---------------------------------------------------------------------------
+
+static int64_t sys_nanosleep(const struct timespec *user_req,
+                               struct timespec *user_rem)
+{
+	if (!validate_user_buffer((uint64_t)user_req, sizeof(struct timespec)))
+		return -1;
+
+	uint64_t freq  = timer_read_cntfrq();
+	uint64_t ticks = (uint64_t)user_req->tv_sec * freq +
+	                 (uint64_t)user_req->tv_nsec * freq / 1000000000ULL;
+	uint64_t deadline = timer_read_cntpct() + ticks;
+
+	while (timer_read_cntpct() < deadline)
+		scheduler_yield();
+
+	if (user_rem && validate_user_buffer((uint64_t)user_rem, sizeof(struct timespec))) {
+		user_rem->tv_sec  = 0;
+		user_rem->tv_nsec = 0;
+	}
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_sigaction — register a signal handler
+//
+// handler_va: 0 = SIG_DFL (default action), 1 = SIG_IGN, else user function VA.
+// ---------------------------------------------------------------------------
+
+static int64_t sys_sigaction(int signum, uint64_t handler_va)
+{
+	if (signum < 1 || signum > 31)
+		return -1;
+	// SIGKILL (9) and SIGSTOP (19) cannot be caught or ignored.
+	if (signum == 9 || signum == 19)
+		return -1;
+	scheduler_get_current()->signal_handlers[signum] = handler_va;
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_kill — send a signal to a process
+// ---------------------------------------------------------------------------
+
+static int64_t sys_kill(int pid, int signum)
+{
+	if (signum < 1 || signum > 31)
+		return -1;
+	process_t *target = scheduler_find_process((uint16_t)pid);
+	if (!target)
+		return -1;
+	target->pending_signals |= ((uint64_t)1 << signum);
+	// If target is blocked, make it runnable so it can handle the signal.
+	if (target->state == PROCESS_STATE_BLOCKED ||
+	    target->state == PROCESS_STATE_WAITING)
+		target->state = PROCESS_STATE_READY;
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sys_sigreturn — restore CPU state after a signal handler returns
+//
+// The signal delivery path pushed a struct signal_frame onto the user stack
+// before invoking the handler. This syscall pops that frame and restores
+// the original exception_frame so the eret goes back to the interrupted code.
+//
+// struct signal_frame layout (matches signal delivery in
+// systemcall_deliver_pending_signals below):
+//   offset  0: struct exception_frame saved_frame  (288 bytes)
+//   offset 288: uint64_t signum_saved               (8 bytes)
+//   offset 296: uint64_t _padding                   (8 bytes)
+//   total: 304 bytes (16-byte aligned)
+// ---------------------------------------------------------------------------
+#define SIGNAL_FRAME_SIZE 304
+
+static int64_t sys_sigreturn(struct exception_frame *frame)
+{
+	// frame->sp is the user SP after signal delivery, pointing at the sigframe.
+	if (!validate_user_buffer(frame->sp, SIGNAL_FRAME_SIZE))
+		return -1;
+
+	// The saved exception_frame is at the start of the sigframe.
+	const struct exception_frame *saved =
+		(const struct exception_frame *)frame->sp;
+
+	// Restore original frame in-place.
+	*frame = *saved;
+	// frame->sp is now the original user SP (restored from saved_frame.sp).
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// systemcall_deliver_pending_signals — deliver one pending signal before eret
+//
+// Called after every syscall and every IRQ that preempts EL0.
+// If a signal is pending and has an installed handler, this function:
+//   1. Pushes a struct signal_frame onto the user stack (saves the frame).
+//   2. Redirects frame->elr to the handler.
+//   3. Sets frame->x0 = signum (argument to the handler).
+//   4. Sets frame->x30 = SIGNAL_TRAMPOLINE_VA (return address → svc sigreturn).
+// The next eret then runs the signal handler instead of returning to the
+// original code. When the handler returns it hits the trampoline and calls
+// sys_sigreturn, which restores the saved frame and erets back to the original.
+//
+// Only one signal is delivered per return to EL0; remaining signals are
+// delivered on subsequent returns.
+// ---------------------------------------------------------------------------
+
+void systemcall_deliver_pending_signals(struct exception_frame *frame)
+{
+	process_t *process = scheduler_get_current();
+	if (!process || !process->pending_signals)
+		return;
+
+	for (int signum = 1; signum <= 31; signum++) {
+		if (!(process->pending_signals & ((uint64_t)1 << signum)))
+			continue;
+
+		// Clear the pending bit before delivery so re-entry is safe.
+		process->pending_signals &= ~((uint64_t)1 << signum);
+
+		uint64_t handler = process->signal_handlers[signum];
+
+		if (handler == 0) {
+			// SIG_DFL: default action.
+			// SIGCHLD (17): ignore by default.
+			if (signum == 17)
+				continue;
+			// All other signals: terminate the process.
+			// sys_exit calls scheduler_yield and never returns.
+			sys_exit(-signum);
+		}
+
+		if (handler == 1) {
+			// SIG_IGN: silently discard.
+			continue;
+		}
+
+		// Deliver to the user handler by pushing a sigframe and redirecting eret.
+		// struct signal_frame is 304 bytes (16-byte aligned).
+		uint64_t new_sp = (frame->sp - SIGNAL_FRAME_SIZE) & ~(uint64_t)15;
+
+		if (!validate_user_buffer(new_sp, SIGNAL_FRAME_SIZE)) {
+			// User stack exhausted — terminate rather than silently drop signal.
+			sys_exit(-signum);
+		}
+
+		// The signal_frame is a plain struct on the user stack.
+		// Since TTBR0 is active while in EL1 exception handlers, user VAs are
+		// accessible directly (no PAN in this kernel).
+		struct {
+			struct exception_frame saved_frame;
+			uint64_t               signum_saved;
+			uint64_t               padding;
+		} *sigframe = (void *)new_sp;
+
+		sigframe->saved_frame  = *frame;
+		sigframe->signum_saved = (uint64_t)signum;
+		sigframe->padding      = 0;
+
+		// Redirect the eret to the signal handler.
+		frame->sp   = new_sp;
+		frame->elr  = handler;
+		frame->spsr = 0;  // EL0t, all flags clear, DAIF=0
+		frame->x0   = (uint64_t)signum;
+		frame->x30  = SIGNAL_TRAMPOLINE_VA;  // handler returns via svc #sigreturn
+		// Note: only one signal per eret; remaining signals delivered next return.
+		break;
+	}
 }
 
 // --- Dispatch ---
@@ -537,10 +786,43 @@ void systemcall_dispatch(struct exception_frame *frame)
 		frame->x0 = (uint64_t)sys_fork(frame);
 		break;
 	case SYSTEMCALL_EXEC:
-		frame->x0 = (uint64_t)sys_exec((const char *)frame->x0, frame);
+		frame->x0 = (uint64_t)sys_exec((const char *)frame->x0,
+		                                (const char *const *)frame->x1,
+		                                frame);
 		break;
+	case SYSTEMCALL_GETPID:
+		frame->x0 = (uint64_t)sys_getpid();
+		break;
+	case SYSTEMCALL_GETPPID:
+		frame->x0 = (uint64_t)sys_getppid();
+		break;
+	case SYSTEMCALL_CLOCK_GETTIME:
+		frame->x0 = (uint64_t)sys_clock_gettime((int)frame->x0,
+		                                          (struct timespec *)frame->x1);
+		break;
+	case SYSTEMCALL_NANOSLEEP:
+		frame->x0 = (uint64_t)sys_nanosleep((const struct timespec *)frame->x0,
+		                                     (struct timespec *)frame->x1);
+		break;
+	case SYSTEMCALL_SIGACTION:
+		frame->x0 = (uint64_t)sys_sigaction((int)frame->x0, frame->x1);
+		break;
+	case SYSTEMCALL_KILL:
+		frame->x0 = (uint64_t)sys_kill((int)frame->x0, (int)frame->x1);
+		break;
+	case SYSTEMCALL_SIGRETURN:
+		// sys_sigreturn restores the frame in-place; the return value written
+		// to frame->x0 here is immediately overwritten by the restored frame.
+		sys_sigreturn(frame);
+		// Do NOT deliver signals after sigreturn — the restored frame already
+		// represents the original interrupted context; deliver on next return.
+		return;
 	default:
 		frame->x0 = (uint64_t)-1;  // unknown syscall
 		break;
 	}
+
+	// Deliver any pending signals before returning to EL0.
+	// This handles signals sent by kill() from within the same syscall path.
+	systemcall_deliver_pending_signals(frame);
 }

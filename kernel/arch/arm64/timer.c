@@ -3,13 +3,13 @@
 #include "../../../include/bazzulto/gic.h"
 
 // ARM Generic Timer system register accessors — ARM ARM D11.2
-static inline uint64_t read_cntfrq(void) {
+uint64_t timer_read_cntfrq(void) {
 	uint64_t val;
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(val));
 	return val;
 }
 
-static inline uint64_t read_cntpct(void) {
+uint64_t timer_read_cntpct(void) {
 	uint64_t val;
 	__asm__ volatile("mrs %0, cntpct_el0" : "=r"(val));
 	return val;
@@ -48,21 +48,21 @@ void timer_init(void) {
 	GICC_CTLR = 1;
 
 	// Configure the ARM Generic Timer — ARM ARM D11.2.4
-	ticks_per_ms = read_cntfrq() / 1000;
-	write_cntp_cval(read_cntpct() + ticks_per_ms * TIMER_TICK_MS);
+	ticks_per_ms = timer_read_cntfrq() / 1000;
+	write_cntp_cval(timer_read_cntpct() + ticks_per_ms * TIMER_TICK_MS);
 	write_cntp_ctl(1);  // ENABLE=1, IMASK=0
 
 	console_println("Timer: ok");
 }
 
 void timer_delay_ms(uint32_t ms) {
-	uint64_t target = read_cntpct() + ticks_per_ms * ms;
-	while (read_cntpct() < target)
+	uint64_t target = timer_read_cntpct() + ticks_per_ms * ms;
+	while (timer_read_cntpct() < target)
 		;
 }
 
 void timer_handle_irq(void) {
 	// Program the next tick. Called from the IRQ dispatcher — GICC_IAR/EOIR
 	// are handled by the dispatcher, not here.
-	write_cntp_cval(read_cntpct() + ticks_per_ms * TIMER_TICK_MS);
+	write_cntp_cval(timer_read_cntpct() + ticks_per_ms * TIMER_TICK_MS);
 }

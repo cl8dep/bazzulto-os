@@ -77,3 +77,55 @@ int fork(void);
 // On success: does not return — execution restarts at the new entry point.
 // On failure: returns -1.
 int exec(const char *path);
+
+// Replace the current process image with the ELF at `path`, passing `argv`.
+// `argv` must be a NULL-terminated array of C strings; argv[0] is the program name.
+// On success: does not return. On failure: returns -1.
+int execv(const char *path, const char *const argv[]);
+
+// Return the PID of the calling process.
+int getpid(void);
+
+// Return the PID of the calling process's parent (0 if no parent).
+int getppid(void);
+
+// POSIX-compatible time specification.
+struct timespec {
+    long long tv_sec;   // seconds
+    long long tv_nsec;  // nanoseconds [0, 999999999]
+};
+
+// Clock identifiers for clock_gettime.
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+// Read the current time into *tp. clock_id: CLOCK_REALTIME or CLOCK_MONOTONIC.
+// Returns 0 on success, -1 on error.
+int clock_gettime(int clock_id, struct timespec *tp);
+
+// Sleep for at least the duration given in *req.
+// On completion sets *rem to zero (no interrupt support).
+// Returns 0 on success, -1 on error.
+int nanosleep(const struct timespec *req, struct timespec *rem);
+
+// Signal numbers (POSIX subset).
+#define SIGHUP   1
+#define SIGINT   2
+#define SIGQUIT  3
+#define SIGKILL  9
+#define SIGTERM 15
+#define SIGCHLD 17
+#define SIGSTOP 19
+
+// Special handler values for sigaction().
+#define SIG_DFL  ((void (*)(int))0)   // default action
+#define SIG_IGN  ((void (*)(int))1)   // ignore
+
+// Register a signal handler for signal `signum`.
+// `handler`: SIG_DFL, SIG_IGN, or a user function pointer.
+// Returns 0 on success, -1 on invalid signum or uncatchable signal.
+int sigaction(int signum, void (*handler)(int));
+
+// Send signal `signum` to the process with the given PID.
+// Returns 0 on success, -1 if the process is not found or signum is invalid.
+int kill(int pid, int signum);

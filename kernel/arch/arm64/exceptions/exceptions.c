@@ -198,6 +198,9 @@ void exception_handler_irq_el0(struct exception_frame *frame) {
     // The eret at the end restores SPSR_EL1 which has M=EL0t,
     // so the CPU returns to user mode automatically.
     exception_handler_irq_el1(frame);
+    // Deliver any pending signals before returning to EL0.
+    // Timer preemption is a natural delivery point for async signals.
+    systemcall_deliver_pending_signals(frame);
 }
 
 void exception_handler_irq_el1(struct exception_frame *frame) {

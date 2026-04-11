@@ -54,6 +54,8 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     process->zombie_count     = 0;
     memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
     process->mmap_next_vaddr  = MMAP_USER_BASE;
+    process->pending_signals  = 0;
+    memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
     virtual_file_system_init_fds(process->fds);
 
     // Set up the initial context so that when context_switch restores it,
@@ -203,6 +205,8 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     process->zombie_count    = 0;
     memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
     process->mmap_next_vaddr = MMAP_USER_BASE;
+    process->pending_signals = 0;
+    memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
     virtual_file_system_init_fds(process->fds);
 
     // --- Create per-process page table (TTBR0) ---
@@ -284,6 +288,8 @@ process_t *scheduler_create_user_process_from_image(uint64_t *page_table,
     process->zombie_count    = 0;
     memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
     process->mmap_next_vaddr = MMAP_USER_BASE;
+    process->pending_signals = 0;
+    memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
     virtual_file_system_init_fds(process->fds);
 
     // Set initial context for EL0 entry via process_entry_trampoline_user.
@@ -535,6 +541,11 @@ uint16_t scheduler_fork_process(struct exception_frame *parent_frame)
 
     // Copy the mmap region table so the child tracks its own mappings.
     memcpy(child->mmap_regions, parent->mmap_regions, sizeof(parent->mmap_regions));
+
+    // Copy signal state: child inherits parent's handlers, starts with no pending signals.
+    child->pending_signals = 0;
+    memcpy(child->signal_handlers, parent->signal_handlers,
+           sizeof(parent->signal_handlers));
 
     // Copy file descriptor table (pipes get their ref_count incremented).
     for (int i = 0; i < VIRTUAL_FILE_SYSTEM_MAX_FDS; i++) {

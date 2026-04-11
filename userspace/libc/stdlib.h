@@ -34,3 +34,11 @@ void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
               int (*compare)(const void *, const void *));
 void  qsort(void *base, size_t nmemb, size_t size,
             int (*compare)(const void *, const void *));
+
+// Dynamic memory allocation — C11 §7.22.3
+// Backed by the mmap syscall. NULL is returned on allocation failure.
+// Returned pointers are 32-byte aligned (satisfies max_align_t on AArch64).
+void *malloc(size_t size);
+void *calloc(size_t nmemb, size_t size);
+void *realloc(void *ptr, size_t new_size);
+void  free(void *ptr);
