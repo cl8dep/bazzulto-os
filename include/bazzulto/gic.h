@@ -33,6 +33,10 @@
 #define IRQ_UART0           33   // First PL011 UART SPI (QEMU virt: SPI 1 = INTID 33)
 #define IRQ_SPURIOUS        1023 // Spurious interrupt — do NOT write EOIR
 
+// virtio-mmio IRQ base — QEMU virt wires slot N to SPI (16+N) = INTID (48+N).
+// Source: QEMU hw/arm/virt.c, VIRT_MMIO first IRQ = GIC_SPI(16), INTID = 32+16 = 48.
+#define IRQ_VIRTIO_MMIO_BASE  48
+
 // Enable an SPI (INTID >= 32) and route it to CPU 0.
 // For PPIs (INTID 16-31), routing is fixed — do not call this.
 static inline void gic_enable_spi(uint32_t intid) {

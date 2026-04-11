@@ -12,7 +12,7 @@ LD      := aarch64-elf-ld
 # -Wall -Wextra: catch common mistakes early
 CFLAGS  := -std=c11 -ffreestanding -fno-stack-protector -fno-pic \
            -mgeneral-regs-only -Wall -Wextra \
-           -I./include
+           -I./include -I./include/libc
 
 ASFLAGS := -ffreestanding
 
@@ -21,7 +21,8 @@ LDFLAGS := -nostdlib -static \
 
 # --- User-space flags ---
 USER_CFLAGS  := -std=c11 -ffreestanding -fno-stack-protector -fno-pic \
-                -mgeneral-regs-only -Wall -Wextra
+                -mgeneral-regs-only -Wall -Wextra \
+                -I./userspace/libc
 USER_LDFLAGS := -nostdlib -static -T userspace/library/linker.ld
 
 # --- Kernel sources ---
@@ -34,12 +35,20 @@ C_SOURCES := \
     kernel/memory/heap.c \
     kernel/scheduler/scheduler.c \
     kernel/scheduler/waitqueue.c \
+    kernel/scheduler/pid.c \
     kernel/arch/arm64/timer.c \
     kernel/arch/arm64/systemcall/systemcall.c \
     kernel/drivers/uart/uart.c \
     kernel/filesystem/ramfs.c \
     kernel/filesystem/virtual_file_system.c \
-    kernel/loader/elf_loader.c
+    kernel/loader/elf_loader.c \
+    kernel/drivers/input/input.c \
+    kernel/drivers/virtio/virtio_mmio.c \
+    kernel/drivers/keyboard/keyboard.c \
+    kernel/lib/string.c \
+    kernel/lib/stdio.c \
+    kernel/lib/stdlib.c \
+    kernel/arch/arm64/boot/splash.c
 
 ASM_SOURCES := \
     kernel/arch/arm64/boot/start.S \
@@ -50,29 +59,28 @@ ASM_SOURCES := \
 USER_RAW_SOURCES :=
 
 # --- User-space library ---
-USER_LIB_OBJECTS := userspace/library/startup.o userspace/library/systemcall.o
+USER_LIB_OBJECTS := userspace/library/startup.o userspace/library/systemcall.o \
+                    userspace/libc/string.o userspace/libc/stdio.o \
+                    userspace/libc/stdlib.o
 
 # --- User-space ELF programs ---
-# Each program: compile C → link with library → embed via .incbin into kernel.
-USER_ELF_PROGRAMS := userspace/hello/hello.elf \
-                     userspace/shell/shell.elf \
-                     userspace/ls/ls.elf \
-                     userspace/help/help.elf \
-                     userspace/echo/echo.elf
+# To add a new program: add its name here and create userspace/<name>/<name>.c
+# and userspace/<name>/<name>_embed.S — the rules are generated automatically.
+USER_PROGRAMS := hello shell ls help echo
 
-USER_ELF_EMBEDS := userspace/hello/hello_embed.o \
-                   userspace/shell/shell_embed.o \
-                   userspace/ls/ls_embed.o \
-                   userspace/help/help_embed.o \
-                   userspace/echo/echo_embed.o
+USER_ELF_PROGRAMS := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p).elf)
+USER_ELF_EMBEDS   := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p)_embed.o)
 
 KERNEL_OBJECTS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.S=.o) $(USER_RAW_SOURCES:.S=.o)
 OBJECTS := $(KERNEL_OBJECTS) $(USER_ELF_EMBEDS)
 
 # --- Targets ---
-.PHONY: all clean
+.PHONY: all clean test
 
 all: bazzulto.elf
+
+test:
+	./tests/runner.sh
 
 bazzulto.elf: $(OBJECTS)
 	$(LD) $(LDFLAGS) -o $@ $^
@@ -91,6 +99,16 @@ bazzulto.elf: $(OBJECTS)
 DEPENDENCY_FILES := $(KERNEL_OBJECTS:.o=.d)
 -include $(DEPENDENCY_FILES)
 
+# --- User-space libc ---
+userspace/libc/string.o: userspace/libc/string.c userspace/libc/string.h
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+
+userspace/libc/stdio.o: userspace/libc/stdio.c userspace/libc/stdio.h userspace/libc/string.h userspace/library/systemcall.h
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+
+userspace/libc/stdlib.o: userspace/libc/stdlib.c userspace/libc/stdlib.h
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+
 # --- User-space library ---
 userspace/library/startup.o: userspace/library/startup.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
@@ -99,56 +117,20 @@ userspace/library/systemcall.o: userspace/library/systemcall.S
 	$(AS) $(ASFLAGS) -c -o $@ $<
 
 # --- User-space programs ---
+# Rules are generated for every entry in USER_PROGRAMS.
+# Adding a new program only requires adding its name to that list.
+define userspace_program
+userspace/$(1)/$(1).o: userspace/$(1)/$(1).c userspace/library/systemcall.h
+	$$(CC) $$(USER_CFLAGS) -c -o $$@ $$<
 
-# hello
-userspace/hello/hello.o: userspace/hello/hello.c userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+userspace/$(1)/$(1).elf: $$(USER_LIB_OBJECTS) userspace/$(1)/$(1).o
+	$$(LD) $$(USER_LDFLAGS) -o $$@ $$^
 
-userspace/hello/hello.elf: $(USER_LIB_OBJECTS) userspace/hello/hello.o
-	$(LD) $(USER_LDFLAGS) -o $@ $^
+userspace/$(1)/$(1)_embed.o: userspace/$(1)/$(1)_embed.S userspace/$(1)/$(1).elf
+	$$(AS) $$(ASFLAGS) -c -o $$@ $$<
+endef
 
-userspace/hello/hello_embed.o: userspace/hello/hello_embed.S userspace/hello/hello.elf
-	$(AS) $(ASFLAGS) -c -o $@ $<
-
-# shell
-userspace/shell/shell.o: userspace/shell/shell.c userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
-
-userspace/shell/shell.elf: $(USER_LIB_OBJECTS) userspace/shell/shell.o
-	$(LD) $(USER_LDFLAGS) -o $@ $^
-
-userspace/shell/shell_embed.o: userspace/shell/shell_embed.S userspace/shell/shell.elf
-	$(AS) $(ASFLAGS) -c -o $@ $<
-
-# ls
-userspace/ls/ls.o: userspace/ls/ls.c userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
-
-userspace/ls/ls.elf: $(USER_LIB_OBJECTS) userspace/ls/ls.o
-	$(LD) $(USER_LDFLAGS) -o $@ $^
-
-userspace/ls/ls_embed.o: userspace/ls/ls_embed.S userspace/ls/ls.elf
-	$(AS) $(ASFLAGS) -c -o $@ $<
-
-# help
-userspace/help/help.o: userspace/help/help.c userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
-
-userspace/help/help.elf: $(USER_LIB_OBJECTS) userspace/help/help.o
-	$(LD) $(USER_LDFLAGS) -o $@ $^
-
-userspace/help/help_embed.o: userspace/help/help_embed.S userspace/help/help.elf
-	$(AS) $(ASFLAGS) -c -o $@ $<
-
-# echo
-userspace/echo/echo.o: userspace/echo/echo.c userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
-
-userspace/echo/echo.elf: $(USER_LIB_OBJECTS) userspace/echo/echo.o
-	$(LD) $(USER_LDFLAGS) -o $@ $^
-
-userspace/echo/echo_embed.o: userspace/echo/echo_embed.S userspace/echo/echo.elf
-	$(AS) $(ASFLAGS) -c -o $@ $<
+$(foreach p,$(USER_PROGRAMS),$(eval $(call userspace_program,$(p))))
 
 # --- QEMU targets ---
 QEMU        := qemu-system-aarch64
@@ -163,11 +145,11 @@ run: bazzulto.elf
 	    -bios $(UEFI_FW) \
 	    -drive file=fat:rw:esp,format=raw \
 	    -device ramfb \
+	    -device virtio-keyboard-device,bus=virtio-mmio-bus.0 \
 	    -display cocoa \
 	    -monitor none \
-	    -serial file:uart.log \
+	    -serial stdio \
 	    -parallel none &
-	@echo "UART output → uart.log (tail -f uart.log to watch)"
 
 run-serial: bazzulto.elf
 	cp bazzulto.elf esp/bazzulto.elf
@@ -219,11 +201,10 @@ gdb: bazzulto.elf
 	@echo "GDB stub listening on :1234"
 	@echo "Connect with: aarch64-elf-gdb -ex 'target remote :1234' -ex 'symbol-file bazzulto.elf'"
 
+USER_PROGRAM_OBJECTS := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p).o userspace/$(p)/$(p).elf)
+
 clean:
 	rm -f $(KERNEL_OBJECTS) $(USER_LIB_OBJECTS) $(USER_ELF_EMBEDS) \
-	      userspace/hello/hello.o userspace/hello/hello.elf \
-	      userspace/shell/shell.o userspace/shell/shell.elf \
-	      userspace/ls/ls.o userspace/ls/ls.elf \
-	      userspace/help/help.o userspace/help/help.elf \
-	      userspace/echo/echo.o userspace/echo/echo.elf \
+	      $(USER_PROGRAM_OBJECTS) \
+	      userspace/libc/string.o userspace/libc/stdio.o userspace/libc/stdlib.o \
 	      bazzulto.elf esp/bazzulto.elf qemu_debug.log

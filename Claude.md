@@ -131,14 +131,42 @@ facts or point to the QEMU source / DTB that defines them.
 - VBAR_EL1 is installed
 - A 16-entry AArch64 vector table exists
 - The asm entry path saves GP registers plus ELR/SPSR/ESR/FAR
-- The C side prints a minimal exception frame
+- The C side decodes EC (Exception Class) via `ec_name()` and prints the full frame
 
 ### Scheduler
 
-- Basic round-robin scheduler
-- Kernel threads only
-- No userspace yet
+- Round-robin scheduler with EL0 user processes
 - Context switch saves callee-saved registers and SP
+- `fork`: `scheduler_fork_process` deep-copies TTBR0 via `virtual_memory_deep_copy_table`;
+  child resumes via `fork_child_resume` asm trampoline
+- `exec`: `scheduler_free_user_address_space` frees old TTBR0; new image loaded
+  via `elf_loader_build_image`; exception frame patched in-place
+
+### VFS / File System
+
+- ramfs (read-only; 128 files, 255-byte names)
+- Per-process FD table (64 slots, fd 0-2 = stdin/stdout/stderr)
+- Kernel pipes: 4096-byte ring buffer, yield-spin blocking, ref-count lifetime
+- `dup` / `dup2` with pipe ref-count management
+- `close_all_fds` on process exit
+
+### Syscall Surface (17 syscalls)
+
+0=exit, 1=write, 2=read, 3=yield, 4=open, 5=close, 6=seek,
+7=spawn, 8=list, 9=wait, 10=pipe, 11=dup, 12=dup2,
+13=mmap, 14=munmap, 15=fork, 16=exec
+
+### User Memory
+
+- Stack ASLR: `aslr_stack_offset()` using `CNTPCT_EL0` + page table pointer, 0–255 pages
+- Stack guard page: unmapped page below the stack bottom
+- Anonymous mmap: bump-pointer from `MMAP_USER_BASE = 0x200000000`, up to 16 regions/process
+
+### Userspace libc
+
+- `string.h`: standard + `memchr`, `strstr`, `strspn`, `strcspn`, `strpbrk`, `strtok_r`, `strtok`
+- `stdlib.h`: `strtol`/`strtoll`/`strtoul`/`strtoull`, `atoi`/`atol`/`atoll`, `abs`/`labs`/`llabs`
+- `stdio.h`: `printf`, `sprintf`, `fprintf`, `puts`, `putchar`
 
 ### Timer / interrupts
 
@@ -160,40 +188,13 @@ treated as architecturally correct just because it compiles.
 
 ### Not yet fully verified against primary specs
 
-- Full `TCR_EL1` programming
-- Full page descriptor bit layout for leaf entries
-- MAIR/AttrIdx pairing beyond the currently intended meaning
-- Execute-never bit usage in page descriptors
-- Shareability bits in page descriptors
+- Full page descriptor bit layout for leaf entries (bits [11:0], [63:52] flags)
 - GICv2 programming details for PPIs vs SPIs
-- Timer interrupt routing assumptions
+- Timer interrupt routing assumptions (PPI INTID 30)
 - Exact boot-state assumptions inherited from Limine at entry
 
-Until these are checked against primary sources, treat them as provisional.
+Until the remaining items are checked against primary sources, treat them as provisional.
 
-## Known technical risks in the current tree
-
-These are the most important current caveats:
-
-1. The MMU setup is incomplete from a documentation standpoint.
-   `virtual_memory.c` writes `MAIR_EL1`, `TCR_EL1`, and `TTBR1_EL1`, but the
-   chosen fields are not yet exhaustively justified against DDI 0487.
-
-2. The kernel image mapping is still coarse.
-   `kernel_main()` maps a fixed 4 MiB range as kernel code, which is larger than
-   the actual ELF image and does not preserve section-level permissions.
-
-3. The generated ELF currently has an `RWE` load segment.
-   This is a real warning from the linker and means W^X is not enforced at the
-   ELF segment level.
-
-4. Exception diagnostics are minimal.
-   Current logs print `ELR`, `FAR`, and `ESR`, but do not decode `ISS`, classify
-   translation/access/permission faults, or correlate `ELR` with the disassembly.
-
-5. Observability is weaker than ideal for bring-up.
-   The current default run flow uses the framebuffer console and disables serial,
-   which makes low-level fault analysis harder.
 
 ## Documentation standards for this repo
 
@@ -231,6 +232,7 @@ Do not guess register meanings, descriptor layouts, or reset-state assumptions.
 - Keep assembly readable and conservative
 - Match header declarations and asm struct layouts exactly
 - When adding files, update `Makefile`
+- Always use full, verbose names for files, functions, macros, and variables. Never abbreviate.
 
 ## Practical guidance for future work
 

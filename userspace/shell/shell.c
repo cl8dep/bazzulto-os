@@ -1,19 +1,12 @@
 #include "../library/systemcall.h"
+#include "string.h"
 
 #define MAX_INPUT 128
 #define MAX_ARGS  16
 
-static size_t string_length(const char *s)
-{
-	size_t len = 0;
-	while (s[len])
-		len++;
-	return len;
-}
-
 static void print(const char *s)
 {
-	write(1, s, string_length(s));
+	write(1, s, strlen(s));
 }
 
 // Read a line from stdin into `buf`. Returns the number of characters read.
@@ -52,32 +45,87 @@ static size_t read_line(char *buf, size_t max)
 	return pos;
 }
 
-// Split `input` into tokens by spaces. Modifies `input` in place
-// (replaces spaces with '\0'). Fills `argv` with pointers to each token.
-// Returns argc (number of tokens).
+// Split `input` into tokens. Modifies `input` in place.
+// Fills `argv` with pointers into `input` for each token.
+// Returns argc on success, or -1 if an unterminated quote is found.
+//
+// Quote rules:
+//   "..."  — spaces inside are part of the token; quotes themselves are stripped.
+//   '...'  — identical behaviour (no variable interpolation in either form).
+//   Nested quotes of the other type are treated as literal characters:
+//     "it's" → it's    |    '"hi"' → "hi"
+//   Empty quotes ("" or '') produce a token that is an empty string.
+//   Unterminated quote → return -1.
+//
+// Implementation: dual read/write pointers into the same buffer.
+// The write pointer compacts the token in place (removing quote chars and
+// collapsing whitespace boundaries). Because characters are only removed —
+// never inserted — the write pointer never overtakes the read pointer.
 static int tokenize(char *input, const char **argv, int max_args)
 {
-	int argc = 0;
+	typedef enum {
+		TOKENIZE_STATE_NORMAL,
+		TOKENIZE_STATE_IN_DOUBLE_QUOTE,
+		TOKENIZE_STATE_IN_SINGLE_QUOTE,
+	} tokenize_state_t;
 
-	while (*input && argc < max_args) {
-		// Skip leading spaces.
-		while (*input == ' ')
-			input++;
-		if (*input == '\0')
+	int    argc      = 0;
+	char  *read_ptr  = input;
+	char  *write_ptr = input;
+
+	while (*read_ptr && argc < max_args) {
+		// Skip inter-token spaces.
+		while (*read_ptr == ' ')
+			read_ptr++;
+		if (*read_ptr == '\0')
 			break;
 
-		// Start of a token.
-		argv[argc++] = input;
+		// Record where the compacted token will start.
+		char *token_start  = write_ptr;
+		tokenize_state_t state = TOKENIZE_STATE_NORMAL;
+		int in_token       = 1;
 
-		// Find end of token.
-		while (*input && *input != ' ')
-			input++;
+		while (*read_ptr && in_token) {
+			char character = *read_ptr++;
 
-		// Null-terminate the token.
-		if (*input) {
-			*input = '\0';
-			input++;
+			switch (state) {
+			case TOKENIZE_STATE_NORMAL:
+				if (character == ' ') {
+					in_token = 0;
+				} else if (character == '"') {
+					state = TOKENIZE_STATE_IN_DOUBLE_QUOTE;
+				} else if (character == '\'') {
+					state = TOKENIZE_STATE_IN_SINGLE_QUOTE;
+				} else {
+					*write_ptr++ = character;
+				}
+				break;
+
+			case TOKENIZE_STATE_IN_DOUBLE_QUOTE:
+				if (character == '"') {
+					state = TOKENIZE_STATE_NORMAL;
+				} else {
+					*write_ptr++ = character;  // spaces and inner '\'' kept
+				}
+				break;
+
+			case TOKENIZE_STATE_IN_SINGLE_QUOTE:
+				if (character == '\'') {
+					state = TOKENIZE_STATE_NORMAL;
+				} else {
+					*write_ptr++ = character;  // spaces and inner '"' kept
+				}
+				break;
+			}
 		}
+
+		// A quote that was opened but never closed is a hard error.
+		if (state != TOKENIZE_STATE_NORMAL)
+			return -1;
+
+		// Null-terminate the compacted token and register it.
+		*write_ptr++ = '\0';
+		argv[argc++] = token_start;
 	}
 
 	return argc;
@@ -112,8 +160,12 @@ int main(void)
 		if (len == 0)
 			continue;
 
-		// Split input into tokens.
+		// Split input into tokens. -1 means an unterminated quote.
 		int argc = tokenize(input, argv, MAX_ARGS);
+		if (argc < 0) {
+			print("error: unterminated string\r\n");
+			continue;
+		}
 		if (argc == 0)
 			continue;
 

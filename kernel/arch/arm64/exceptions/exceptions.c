@@ -1,10 +1,13 @@
 #include "../../../../include/bazzulto/exceptions.h"
+#include <stdio.h>
 #include "../../../../include/bazzulto/console.h"
 #include "../../../../include/bazzulto/gic.h"
 #include "../../../../include/bazzulto/scheduler.h"
+#include "../../../../include/bazzulto/pid.h"
 #include "../../../../include/bazzulto/timer.h"
 #include "../../../../include/bazzulto/uart.h"
 #include "../../../../include/bazzulto/systemcall.h"
+#include "../../../../include/bazzulto/keyboard.h"
 
 // Defined in exception_vectors.S — the Assembly table we install.
 extern void exception_vectors(void);
@@ -16,22 +19,39 @@ extern void exception_vectors(void);
 #define ESR_DFSC(esr)  ((esr) & 0x3F)           // Data Fault Status Code [5:0]
 
 // Exception Classes — ARM ARM D13.2.36, Table D13-3
-#define EC_DATA_ABORT_EL1   0x25
-#define EC_INSN_ABORT_EL1   0x21
-#define EC_DATA_ABORT_EL0   0x24
-#define EC_INSN_ABORT_EL0   0x20
+#define EC_UNKNOWN          0x00
+#define EC_WFX              0x01  // WFI/WFE trapped
+#define EC_ILLEGAL_STATE    0x0E  // Illegal execution state
 #define EC_SVC_AARCH64      0x15
+#define EC_MSR_MRS          0x18  // MSR/MRS/System instruction trap
+#define EC_INSN_ABORT_EL0   0x20
+#define EC_INSN_ABORT_EL1   0x21
+#define EC_PC_ALIGNMENT     0x22
+#define EC_DATA_ABORT_EL0   0x24
+#define EC_DATA_ABORT_EL1   0x25
+#define EC_SP_ALIGNMENT     0x26
+#define EC_SERROR           0x2F  // SError interrupt
 #define EC_BRK              0x3C
 
-// Print a 64-bit value as 16-digit hex.
-static void print_hex64(uint64_t val) {
-    char buf[17];
-    for (int i = 15; i >= 0; i--) {
-        buf[i] = "0123456789ABCDEF"[val & 0xF];
-        val >>= 4;
+// Return a short name for an Exception Class value.
+// ARM ARM D13.2.36, Table D13-3.
+static const char *ec_name(uint32_t ec) {
+    switch (ec) {
+        case EC_UNKNOWN:       return "Unknown";
+        case EC_WFX:           return "WFI/WFE trapped";
+        case EC_ILLEGAL_STATE: return "Illegal execution state";
+        case EC_SVC_AARCH64:   return "SVC (AArch64)";
+        case EC_MSR_MRS:       return "MSR/MRS/System trap";
+        case EC_INSN_ABORT_EL0:return "Instruction abort (EL0)";
+        case EC_INSN_ABORT_EL1:return "Instruction abort (EL1)";
+        case EC_PC_ALIGNMENT:  return "PC alignment fault";
+        case EC_DATA_ABORT_EL0:return "Data abort (EL0)";
+        case EC_DATA_ABORT_EL1:return "Data abort (EL1)";
+        case EC_SP_ALIGNMENT:  return "SP alignment fault";
+        case EC_SERROR:        return "SError interrupt";
+        case EC_BRK:           return "BRK instruction";
+        default:               return "EC unknown";
     }
-    buf[16] = '\0';
-    console_print(buf);
 }
 
 // Decode DFSC/IFSC fault type — ARM ARM D13.2.36, Table D13-5
@@ -48,74 +68,76 @@ static const char *decode_fault(uint32_t fsc) {
     return "unknown";
 }
 
-// Print a hex value to UART for serial debugging.
-static void uart_print_hex64(uint64_t val) {
-    char buf[17];
-    for (int i = 15; i >= 0; i--) {
-        buf[i] = "0123456789ABCDEF"[val & 0xF];
-        val >>= 4;
-    }
-    buf[16] = '\0';
-    uart_puts(buf);
+// Linker-exported section boundaries — defined in kernel/arch/arm64/linker.ld.
+// Used to classify ELR_EL1 without a runtime symbol table.
+extern char _text_start[], _text_end[], _kernel_end[];
+
+// Return a short description of where a virtual address lies.
+// Kernel ranges come from the linker script. User range is the TTBR0 half
+// (VAs below 2^48 = 0x0001000000000000) as defined by T0SZ=16 in TCR_EL1.
+// ARM ARM DDI 0487 D17.2.131: VAs [63:48] = 0 are TTBR0; = 1 are TTBR1.
+static const char *elr_region(uint64_t elr) {
+    if (elr >= (uint64_t)_text_start && elr < (uint64_t)_text_end)
+        return "kernel .text";
+    if (elr >= (uint64_t)_text_end && elr < (uint64_t)_kernel_end)
+        return "kernel .data/.bss";
+    if (elr < 0x0001000000000000ULL)
+        return "user space";
+    return "unknown kernel VA";
 }
 
 static void print_exception_info(struct exception_frame *frame) {
-    // Print to both framebuffer and UART for debugging.
-    console_print("  ELR=0x"); print_hex64(frame->elr);
-    console_print("  SP=0x");  print_hex64(frame->sp);
-    console_println("");
-    console_print("  ESR=0x"); print_hex64(frame->esr);
-    console_print("  FAR=0x"); print_hex64(frame->far);
-    console_println("");
+    char line_buf[128];
 
-    uart_puts("  ELR=0x"); uart_print_hex64(frame->elr);
-    uart_puts(" SP=0x");   uart_print_hex64(frame->sp);
-    uart_puts(" ESR=0x");  uart_print_hex64(frame->esr);
-    uart_puts(" FAR=0x");  uart_print_hex64(frame->far);
-    uart_puts("\n");
+    // Print register values to both framebuffer and UART.
+    // ELR region identifies which part of the address space faulted without
+    // requiring an embedded symbol table.
+    ksnprintf(line_buf, sizeof(line_buf),
+              "  ELR=0x%lx [%s]  SP=0x%lx",
+              frame->elr, elr_region(frame->elr), frame->sp);
+    console_println(line_buf);
+    uart_puts(line_buf); uart_puts("\n");
 
-    // Decode ESR fields
+    ksnprintf(line_buf, sizeof(line_buf),
+              "  ESR=0x%lx  FAR=0x%lx", frame->esr, frame->far);
+    console_println(line_buf);
+    uart_puts(line_buf); uart_puts("\n");
+
+    // Decode ESR fields.
     uint32_t ec   = ESR_EC(frame->esr);
     uint32_t dfsc = ESR_DFSC(frame->esr);
 
-    console_print("  EC=0x");
-    char ecbuf[3];
-    ecbuf[0] = "0123456789ABCDEF"[(ec >> 4) & 0xF];
-    ecbuf[1] = "0123456789ABCDEF"[ec & 0xF];
-    ecbuf[2] = '\0';
-    console_print(ecbuf);
-
     if (ec == EC_DATA_ABORT_EL1 || ec == EC_DATA_ABORT_EL0) {
-        console_print(ESR_WNR(frame->esr) ? " WRITE " : " READ ");
-        console_print(decode_fault(dfsc));
-        console_print(" L");
-        char lvl = '0' + (dfsc & 0x3);
-        console_print((char[]){lvl, '\0'});
+        ksnprintf(line_buf, sizeof(line_buf), "  EC=0x%02x [%s] %s %s L%u",
+                  ec, ec_name(ec),
+                  ESR_WNR(frame->esr) ? "WRITE" : "READ",
+                  decode_fault(dfsc),
+                  dfsc & 0x3u);
     } else if (ec == EC_INSN_ABORT_EL1 || ec == EC_INSN_ABORT_EL0) {
-        console_print(" IFETCH ");
-        console_print(decode_fault(dfsc));
-        console_print(" L");
-        char lvl = '0' + (dfsc & 0x3);
-        console_print((char[]){lvl, '\0'});
+        ksnprintf(line_buf, sizeof(line_buf), "  EC=0x%02x [%s] IFETCH %s L%u",
+                  ec, ec_name(ec), decode_fault(dfsc), dfsc & 0x3u);
+    } else {
+        ksnprintf(line_buf, sizeof(line_buf), "  EC=0x%02x [%s]",
+                  ec, ec_name(ec));
     }
-    console_println("");
+    console_println(line_buf);
+    uart_puts(line_buf); uart_puts("\n");
 }
 
 void exception_handler_sync_el1(struct exception_frame *frame) {
     uint32_t ec = ESR_EC(frame->esr);
+    char panic_buf[80];
 
     switch (ec) {
-        case EC_DATA_ABORT_EL1:
-            console_println("KERNEL PANIC: data abort");
-            break;
-        case EC_INSN_ABORT_EL1:
-            console_println("KERNEL PANIC: instruction abort");
-            break;
         case EC_SVC_AARCH64:
+            uart_puts("WARNING: SVC from EL1 (unexpected system call in kernel)\n");
             console_println("WARNING: SVC from EL1 (unexpected system call in kernel)");
             return;
         default:
-            console_println("KERNEL PANIC: unhandled synchronous exception");
+            ksnprintf(panic_buf, sizeof(panic_buf),
+                      "KERNEL PANIC: %s", ec_name(ec));
+            console_println(panic_buf);
+            uart_puts(panic_buf); uart_puts("\n");
             break;
     }
 
@@ -127,12 +149,23 @@ void exception_handler_sync_el1(struct exception_frame *frame) {
 
 // Kill the current process and yield to the next one.
 // The dead process remains in the circular queue but is skipped by the scheduler.
+// Defined in systemcall.c — the PID of the init process that adopts orphans.
+extern uint16_t init_process_pid;
+
 static void process_kill_current(void) {
     process_t *p = scheduler_get_current();
-    p->state = PROCESS_STATE_DEAD;
-    // TODO: free user page table and physical pages
+
+    // Become a zombie (exit_status = -1 for abnormal termination).
+    // Memory is freed when the parent calls wait(), or by init if orphaned.
+    p->exit_status = -1;
+    p->state       = PROCESS_STATE_ZOMBIE;
+
+    if (init_process_pid != 0)
+        scheduler_reparent_children(p->pid.index, init_process_pid);
+
+    scheduler_wake_waiters(p->pid.index);
     scheduler_yield();
-    // Never returns — the process is DEAD and will never be scheduled again.
+    // Never returns.
 }
 
 void exception_handler_sync_el0(struct exception_frame *frame) {
@@ -186,6 +219,13 @@ void exception_handler_irq_el1(struct exception_frame *frame) {
     case IRQ_SPURIOUS:
         return;  // Do NOT write EOIR for spurious interrupts
     default:
+        // Route to the keyboard driver if the INTID matches the virtio-input
+        // device registered during keyboard_init(). The INTID is in the range
+        // IRQ_VIRTIO_MMIO_BASE..IRQ_VIRTIO_MMIO_BASE+31 (INTID 48-79).
+        // keyboard_get_irq_intid() returns 0 if no keyboard was found, so
+        // this comparison is safe on the run-serial target.
+        if (intid == keyboard_get_irq_intid())
+            keyboard_irq_handler();
         break;
     }
 

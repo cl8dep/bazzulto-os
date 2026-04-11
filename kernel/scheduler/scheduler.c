@@ -1,23 +1,25 @@
 #include "../../include/bazzulto/scheduler.h"
+#include <string.h>
 #include "../../include/bazzulto/heap.h"
 #include "../../include/bazzulto/console.h"
 #include "../../include/bazzulto/physical_memory.h"
 #include "../../include/bazzulto/virtual_memory.h"
 #include "../../include/bazzulto/kernel.h"
 #include "../../include/bazzulto/virtual_file_system.h"
+#include "../../include/bazzulto/pid.h"
 
 // Defined in context_switch.S
 extern void context_switch(cpu_context_t *from, cpu_context_t *to);
 extern void process_entry_trampoline(void);
 extern void process_entry_trampoline_user(void);
+extern void fork_child_resume(void);
 
 // User-space address layout
 #define USER_TEXT_BASE   0x00400000ULL
 #define USER_STACK_TOP   0x7FFFFFF000ULL
 
-#define KERNEL_STACK_SIZE 16384  // 16KB — must handle process + IRQ exception frame + full call chain
+#define KERNEL_STACK_SIZE 24576  // 24KB — handles process + IRQ exception frame + full call chain with margin
 
-static uint32_t   next_pid     = 1;
 static process_t *current      = NULL;  // process currently running
 static process_t *run_queue    = NULL;  // head of the circular ready list
 
@@ -28,6 +30,7 @@ static cpu_context_t bootstrap_context;
 void scheduler_init(void) {
     current   = NULL;
     run_queue = NULL;
+    pid_init(physical_memory_total_bytes());
     console_println("Scheduler: initialized");
 }
 
@@ -38,13 +41,19 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     uint8_t *stack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
     if (!stack) { kfree(process); return NULL; }
 
-    process->pid              = next_pid++;
+    process->pid              = pid_alloc();
+    if (process->pid.index == 0) { kfree(stack); kfree(process); return NULL; }
     process->state            = PROCESS_STATE_READY;
     process->page_table       = NULL;  // shares kernel page table for now
     process->kernel_stack     = stack;
     process->next             = NULL;
     process->wait_next        = NULL;
+    process->parent_pid       = 0;
     process->waiting_for_pid  = 0;
+    process->exit_status      = 0;
+    process->zombie_count     = 0;
+    memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
+    process->mmap_next_vaddr  = MMAP_USER_BASE;
     virtual_file_system_init_fds(process->fds);
 
     // Set up the initial context so that when context_switch restores it,
@@ -86,15 +95,93 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     return process;
 }
 
-static void memory_copy(void *dst, const void *src, size_t n) {
-    uint8_t *d = dst;
-    const uint8_t *s = src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+// ---------------------------------------------------------------------------
+// scheduler_free_user_process — release all memory held by a dead user process
+//
+// Walks the process's TTBR0 page table (L0→L1→L2→L3) and frees every mapped
+// physical page, then frees every intermediate table page, then frees the
+// kernel stack and the process struct itself.
+//
+// ARM ARM D5.2: a 4-level (L0-L3) table walk. Intermediate entries that are
+// valid table descriptors have bits [1:0] = 0b11. Leaf (L3) entries have the
+// same encoding but are reached at depth 3 — we free the physical page they
+// point to. Intermediate table entries point to the physical address of the
+// next-level table, which we also free after walking it.
+//
+// Only called for user processes (page_table != NULL). Kernel threads share
+// the kernel page table and must never be passed here.
+// ---------------------------------------------------------------------------
+#define PAGE_TABLE_ENTRY_COUNT 512
+#define PAGE_DESCRIPTOR_VALID  (1ULL << 0)
+#define PAGE_DESCRIPTOR_TABLE  (1ULL << 1)
+#define ENTRY_PHYSICAL_ADDRESS(e) ((e) & 0x0000FFFFFFFFF000ULL)
+
+// Walk and free the user page table (L0-L3 + all mapped physical pages).
+// Does NOT free the kernel stack or the process struct.
+// Called by scheduler_free_user_address_space and scheduler_free_user_process.
+static void free_user_page_table(uint64_t *l0_table)
+{
+    for (int l0 = 0; l0 < PAGE_TABLE_ENTRY_COUNT; l0++) {
+        uint64_t l0_entry = l0_table[l0];
+        if (!(l0_entry & PAGE_DESCRIPTOR_VALID))
+            continue;
+
+        uint64_t *l1_table = (uint64_t *)PHYSICAL_TO_VIRTUAL(
+                                 ENTRY_PHYSICAL_ADDRESS(l0_entry));
+
+        for (int l1 = 0; l1 < PAGE_TABLE_ENTRY_COUNT; l1++) {
+            uint64_t l1_entry = l1_table[l1];
+            if (!(l1_entry & PAGE_DESCRIPTOR_VALID))
+                continue;
+
+            uint64_t *l2_table = (uint64_t *)PHYSICAL_TO_VIRTUAL(
+                                     ENTRY_PHYSICAL_ADDRESS(l1_entry));
+
+            for (int l2 = 0; l2 < PAGE_TABLE_ENTRY_COUNT; l2++) {
+                uint64_t l2_entry = l2_table[l2];
+                if (!(l2_entry & PAGE_DESCRIPTOR_VALID))
+                    continue;
+
+                uint64_t *l3_table = (uint64_t *)PHYSICAL_TO_VIRTUAL(
+                                         ENTRY_PHYSICAL_ADDRESS(l2_entry));
+
+                for (int l3 = 0; l3 < PAGE_TABLE_ENTRY_COUNT; l3++) {
+                    uint64_t l3_entry = l3_table[l3];
+                    if (!(l3_entry & PAGE_DESCRIPTOR_VALID))
+                        continue;
+                    physical_memory_free((void *)ENTRY_PHYSICAL_ADDRESS(l3_entry));
+                }
+                physical_memory_free((void *)ENTRY_PHYSICAL_ADDRESS(l2_entry));
+            }
+            physical_memory_free((void *)ENTRY_PHYSICAL_ADDRESS(l1_entry));
+        }
+        physical_memory_free((void *)ENTRY_PHYSICAL_ADDRESS(l0_entry));
+    }
+    physical_memory_free((void *)VIRTUAL_TO_PHYSICAL(l0_table));
 }
 
-static void memory_zero(void *dst, size_t n) {
-    uint8_t *d = dst;
-    for (size_t i = 0; i < n; i++) d[i] = 0;
+void scheduler_free_user_address_space(process_t *process)
+{
+    if (!process || !process->page_table) return;
+    free_user_page_table(process->page_table);
+    process->page_table = NULL;
+}
+
+void scheduler_free_user_process(process_t *process) {
+    if (!process) return;
+
+    if (!process->page_table) {
+        // Kernel thread — no user page table to walk, just free stack + struct.
+        kfree(process->kernel_stack);
+        kfree(process);
+        return;
+    }
+
+    free_user_page_table(process->page_table);
+    process->page_table = NULL;
+
+    kfree(process->kernel_stack);
+    kfree(process);
 }
 
 process_t *scheduler_create_user_process(const void *code, size_t code_size) {
@@ -104,12 +191,18 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
     if (!kstack) { kfree(process); return NULL; }
 
-    process->pid             = next_pid++;
+    process->pid             = pid_alloc();
+    if (process->pid.index == 0) { kfree(kstack); kfree(process); return NULL; }
     process->state           = PROCESS_STATE_READY;
     process->kernel_stack    = kstack;
     process->next            = NULL;
     process->wait_next       = NULL;
+    process->parent_pid      = 0;
     process->waiting_for_pid = 0;
+    process->exit_status     = 0;
+    process->zombie_count    = 0;
+    memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
+    process->mmap_next_vaddr = MMAP_USER_BASE;
     virtual_file_system_init_fds(process->fds);
 
     // --- Create per-process page table (TTBR0) ---
@@ -126,8 +219,8 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
         size_t offset = i * PAGE_SIZE;
         size_t chunk = code_size - offset;
         if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
-        memory_copy(virt, (const uint8_t *)code + offset, chunk);
-        if (chunk < PAGE_SIZE) memory_zero(virt + chunk, PAGE_SIZE - chunk);
+        memcpy(virt, (const uint8_t *)code + offset, chunk);
+        if (chunk < PAGE_SIZE) memset(virt + chunk, 0, PAGE_SIZE - chunk);
         virtual_memory_map(user_table, USER_TEXT_BASE + offset,
                            (uint64_t)phys, PAGE_FLAGS_USER_CODE);
     }
@@ -135,7 +228,7 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     // --- Map user stack (one page below USER_STACK_TOP) ---
     void *stack_phys = physical_memory_alloc();
     if (!stack_phys) { kfree(kstack); kfree(process); return NULL; }
-    memory_zero(PHYSICAL_TO_VIRTUAL(stack_phys), PAGE_SIZE);
+    memset(PHYSICAL_TO_VIRTUAL(stack_phys), 0, PAGE_SIZE);
     virtual_memory_map(user_table, USER_STACK_TOP - PAGE_SIZE,
                        (uint64_t)stack_phys, PAGE_FLAGS_USER_DATA);
 
@@ -178,13 +271,19 @@ process_t *scheduler_create_user_process_from_image(uint64_t *page_table,
     uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
     if (!kstack) { kfree(process); return NULL; }
 
-    process->pid             = next_pid++;
+    process->pid             = pid_alloc();
+    if (process->pid.index == 0) { kfree(kstack); kfree(process); return NULL; }
     process->state           = PROCESS_STATE_READY;
     process->page_table      = page_table;
     process->kernel_stack    = kstack;
     process->next            = NULL;
     process->wait_next       = NULL;
+    process->parent_pid      = 0;
     process->waiting_for_pid = 0;
+    process->exit_status     = 0;
+    process->zombie_count    = 0;
+    memset(process->mmap_regions, 0, sizeof(process->mmap_regions));
+    process->mmap_next_vaddr = MMAP_USER_BASE;
     virtual_file_system_init_fds(process->fds);
 
     // Set initial context for EL0 entry via process_entry_trampoline_user.
@@ -231,7 +330,7 @@ void scheduler_tick(void) {
     process_t *previous = current;
     current = current->next;
 
-    // Skip processes that are not ready (blocked or dead)
+    // Skip processes that are not schedulable (blocked, waiting, zombie, dead).
     while (current->state != PROCESS_STATE_READY &&
            current->state != PROCESS_STATE_RUNNING) {
         current = current->next;
@@ -289,30 +388,207 @@ void scheduler_yield(void) {
     // Returns here when `prev` is eventually switched back to.
 }
 
-process_t *scheduler_find_process(uint32_t pid)
+process_t *scheduler_find_process(uint16_t pid_index)
 {
     if (!run_queue) return NULL;
 
     process_t *p = run_queue;
     do {
-        if (p->pid == pid) return p;
+        if (p->pid.index == pid_index) return p;
         p = p->next;
     } while (p != run_queue);
 
     return NULL;
 }
 
-void scheduler_wake_waiters(uint32_t pid)
+void scheduler_wake_waiters(uint16_t pid_index)
 {
     if (!run_queue) return;
 
     process_t *p = run_queue;
     do {
-        if (p->state == PROCESS_STATE_WAITING && p->waiting_for_pid == pid) {
-            p->state = PROCESS_STATE_READY;
+        if (p->state == PROCESS_STATE_WAITING) {
+            // Wake a process waiting for this specific PID.
+            if (p->waiting_for_pid == pid_index) {
+                p->state = PROCESS_STATE_READY;
+            }
+            // Wake a process waiting for ANY child (wait(-1) sentinel 0xFFFF)
+            // if the dying process is actually a child of the waiter.
+            else if (p->waiting_for_pid == 0xFFFF) {
+                process_t *dying = scheduler_find_process(pid_index);
+                if (dying && dying->parent_pid == p->pid.index)
+                    p->state = PROCESS_STATE_READY;
+            }
         }
         p = p->next;
     } while (p != run_queue);
+}
+
+process_t *scheduler_find_zombie_child(uint16_t parent_pid)
+{
+    if (!run_queue) return NULL;
+
+    process_t *p = run_queue;
+    do {
+        if (p->parent_pid == parent_pid && p->state == PROCESS_STATE_ZOMBIE)
+            return p;
+        p = p->next;
+    } while (p != run_queue);
+
+    return NULL;
+}
+
+int scheduler_has_child(uint16_t parent_pid)
+{
+    if (!run_queue) return 0;
+
+    process_t *p = run_queue;
+    do {
+        if (p->parent_pid == parent_pid)
+            return 1;
+        p = p->next;
+    } while (p != run_queue);
+
+    return 0;
+}
+
+void scheduler_reparent_children(uint16_t dying_pid, uint16_t init_pid)
+{
+    if (!run_queue) return;
+
+    // Reassign every process whose parent is the dying process to init (PID 1).
+    // This prevents their zombie entries from leaking when the dying process
+    // is reaped and no one else can call wait() for them.
+    process_t *p = run_queue;
+    do {
+        if (p->parent_pid == dying_pid)
+            p->parent_pid = init_pid;
+        p = p->next;
+    } while (p != run_queue);
+}
+
+void scheduler_reap_process(process_t *process)
+{
+    if (!process || !run_queue) return;
+
+    // Reaping the currently running process would corrupt the scheduler state —
+    // the caller must yield first (e.g. sys_exit sets ZOMBIE then calls
+    // scheduler_yield before any reaper can call scheduler_reap_process).
+    if (process == current) return;
+
+    // Remove process from the circular run queue.
+    if (process->next == process) {
+        // Only node — queue becomes empty.
+        run_queue = NULL;
+    } else {
+        // Find the predecessor and relink around process.
+        process_t *predecessor = process;
+        while (predecessor->next != process)
+            predecessor = predecessor->next;
+        predecessor->next = process->next;
+        if (run_queue == process)
+            run_queue = process->next;
+    }
+
+    // Release the PID index so it can be reused.
+    pid_free(process->pid);
+
+    // Free all memory (page tables, kernel stack, struct).
+    scheduler_free_user_process(process);
+}
+
+// ---------------------------------------------------------------------------
+// scheduler_fork_process — create a copy of the current process
+// ---------------------------------------------------------------------------
+
+uint16_t scheduler_fork_process(struct exception_frame *parent_frame)
+{
+    process_t *parent = current;
+
+    // Allocate child struct + kernel stack.
+    process_t *child = (process_t *)kmalloc(sizeof(process_t));
+    if (!child) return 0;
+
+    uint8_t *kstack = (uint8_t *)kmalloc(KERNEL_STACK_SIZE);
+    if (!kstack) { kfree(child); return 0; }
+
+    // Assign a new PID.
+    child->pid = pid_alloc();
+    if (child->pid.index == 0) { kfree(kstack); kfree(child); return 0; }
+
+    // Deep-copy the parent's user address space.
+    // Every L3 leaf page gets its own fresh physical page.
+    uint64_t *child_page_table = virtual_memory_deep_copy_table(parent->page_table);
+    if (!child_page_table) { pid_free(child->pid); kfree(kstack); kfree(child); return 0; }
+
+    // Copy parent's process fields.
+    child->state           = PROCESS_STATE_READY;
+    child->page_table      = child_page_table;
+    child->kernel_stack    = kstack;
+    child->parent_pid      = parent->pid.index;
+    child->waiting_for_pid = 0;
+    child->exit_status     = 0;
+    child->zombie_count    = 0;
+    child->mmap_next_vaddr = parent->mmap_next_vaddr;
+    child->next            = NULL;
+    child->wait_next       = NULL;
+
+    // Copy the mmap region table so the child tracks its own mappings.
+    memcpy(child->mmap_regions, parent->mmap_regions, sizeof(parent->mmap_regions));
+
+    // Copy file descriptor table (pipes get their ref_count incremented).
+    for (int i = 0; i < VIRTUAL_FILE_SYSTEM_MAX_FDS; i++) {
+        child->fds[i] = parent->fds[i];
+        if (child->fds[i].type == FD_TYPE_PIPE_READ ||
+            child->fds[i].type == FD_TYPE_PIPE_WRITE) {
+            if (child->fds[i].pipe)
+                child->fds[i].pipe->ref_count++;
+        }
+    }
+
+    // Copy the parent's exception frame onto the TOP of the child's kernel stack.
+    // The frame lives at kstack + KERNEL_STACK_SIZE - 288.
+    uint8_t *kstack_top = kstack + KERNEL_STACK_SIZE;
+    struct exception_frame *child_frame =
+        (struct exception_frame *)(kstack_top - sizeof(struct exception_frame));
+    memcpy(child_frame, parent_frame, sizeof(struct exception_frame));
+
+    // The child returns 0 from fork().
+    child_frame->x0 = 0;
+
+    // Set up the child's saved CPU context so that when context_switch
+    // switches to it for the first time:
+    //   - SP is restored to child_frame (bottom of the exception frame)
+    //   - x30 (LR / ret address) is fork_child_resume
+    //   - fork_child_resume expands restore_exception_frame_el0 → eret to EL0
+    child->context.sp  = (uint64_t)child_frame;
+    child->context.x30 = (uint64_t)fork_child_resume;
+
+    // Zero out callee-saved registers so the child starts with a clean kernel state.
+    child->context.x19 = 0;
+    child->context.x20 = 0;
+    child->context.x21 = 0;
+    child->context.x22 = 0;
+    child->context.x23 = 0;
+    child->context.x24 = 0;
+    child->context.x25 = 0;
+    child->context.x26 = 0;
+    child->context.x27 = 0;
+    child->context.x28 = 0;
+    child->context.x29 = 0;
+
+    // Add child to the run queue.
+    if (!run_queue) {
+        child->next = child;
+        run_queue = child;
+    } else {
+        process_t *tail = run_queue;
+        while (tail->next != run_queue) tail = tail->next;
+        tail->next  = child;
+        child->next = run_queue;
+    }
+
+    return child->pid.index;
 }
 
 void scheduler_start(void) {

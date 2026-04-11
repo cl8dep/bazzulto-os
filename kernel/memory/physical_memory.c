@@ -12,10 +12,31 @@ struct free_page {
     struct free_page *next;  // virtual address of next free page
 };
 
-static struct free_page *free_list_head = NULL;
-static size_t free_page_count = 0;
+static struct free_page *free_list_head  = NULL;
+static size_t            free_page_count  = 0;
+static uint64_t          total_ram_bytes  = 0;  // ceiling of physical address space
+static uint64_t          usable_ram_bytes = 0;  // sum of USABLE entry lengths
 
 void physical_memory_init(struct limine_memmap_response *memmap) {
+    // Pass 1: compute RAM metrics from the full memory map.
+    //
+    // total_ram_bytes  = max(base + length) across ALL entry types.
+    //   This is the physical address ceiling — the same approach Linux uses
+    //   for e820/devicetree. It reflects the full installed RAM range, not
+    //   just the usable portion, so it is correct for sizing kernel structures.
+    //
+    // usable_ram_bytes = sum of USABLE entry lengths.
+    //   Use this to report available RAM to users or calculate max processes.
+    for (uint64_t i = 0; i < memmap->entry_count; i++) {
+        struct limine_memmap_entry *entry = memmap->entries[i];
+        uint64_t entry_end = entry->base + entry->length;
+        if (entry_end > total_ram_bytes)
+            total_ram_bytes = entry_end;
+        if (entry->type == LIMINE_MEMMAP_USABLE)
+            usable_ram_bytes += entry->length;
+    }
+
+    // Pass 2: add all USABLE pages to the free list.
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *entry = memmap->entries[i];
 
@@ -57,4 +78,12 @@ void physical_memory_free(void *physical_page) {
 
 size_t physical_memory_free_page_count(void) {
     return free_page_count;
+}
+
+uint64_t physical_memory_total_bytes(void) {
+    return total_ram_bytes;
+}
+
+uint64_t physical_memory_usable_bytes(void) {
+    return usable_ram_bytes;
 }

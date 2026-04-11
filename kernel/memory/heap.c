@@ -1,7 +1,7 @@
 #include "../../include/bazzulto/heap.h"
-#include "../../include/bazzulto/kernel.h"
 #include "../../include/bazzulto/physical_memory.h"
 #include "../../include/bazzulto/virtual_memory.h"
+#include "../../include/bazzulto/console.h"
 
 // Every allocation is preceded by this header in memory.
 // The header itself is not visible to the caller — kmalloc returns the
@@ -33,14 +33,10 @@ static int heap_grow(void) {
         return 0;  // heap limit reached
     }
 
-    void *physical_page = physical_memory_alloc();
-    if (!physical_page) return 0;
-
-    // Map the new page into the heap's virtual address range.
-    virtual_memory_map(kernel_page_table,
-                       heap_current_end,
-                       (uint64_t)physical_page,
-                       PAGE_FLAGS_KERNEL_DATA);
+    // Allocate one physical page and map it into the heap's virtual range.
+    // kernel_vm_alloc handles both allocation and mapping atomically.
+    if (kernel_vm_alloc(heap_current_end, 1, PAGE_FLAGS_KERNEL_DATA) < 0)
+        return 0;
 
     struct block_header *new_block = (struct block_header *)heap_current_end;
     new_block->size    = PAGE_SIZE - HEADER_SIZE;
@@ -117,6 +113,15 @@ void kfree(void *ptr) {
 
     struct block_header *block =
         (struct block_header *)((uint8_t *)ptr - HEADER_SIZE);
+
+    // Double-free detection: if the block is already marked free, the caller
+    // has a use-after-free or double-free bug. Panic immediately so the error
+    // is caught at the source rather than silently corrupting the free list.
+    if (block->is_free) {
+        console_println("PANIC: kfree: double-free detected");
+        for (;;) {}
+    }
+
     block->is_free = 1;
 
     // Coalesce adjacent free blocks to prevent fragmentation.

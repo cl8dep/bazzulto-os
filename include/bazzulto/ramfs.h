@@ -5,10 +5,11 @@
 
 // Maximum number of files the ramfs can hold.
 // This is a boot-time filesystem — files are registered once and never removed.
-#define RAMFS_MAX_FILES 32
+#define RAMFS_MAX_FILES 128
 
 // Maximum file name length including null terminator.
-#define RAMFS_MAX_NAME  64
+// Matches the POSIX NAME_MAX + 1 convention (255 chars + null byte = 256).
+#define RAMFS_MAX_NAME  256
 
 // A single file entry in the ramfs.
 // The data pointer references memory in kernel space (typically the .user_text

@@ -169,6 +169,16 @@ void console_init(struct limine_framebuffer *fb) {
     }
 }
 
+void console_clear(void) {
+    uint32_t height = rows * CHAR_HEIGHT;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < framebuffer_width; x++)
+            framebuffer_address[y * framebuffer_pitch_in_pixels + x] = COLOR_BG;
+    }
+    cursor_x = 0;
+    cursor_y = 0;
+}
+
 void console_print(const char *str) {
     for (; *str; str++) {
         if (*str == '\n') {
@@ -193,4 +203,35 @@ void console_print(const char *str) {
 void console_println(const char *str) {
     console_print(str);
     console_print("\n");
+}
+
+void console_putc(char c) {
+    if (c == '\r') {
+        // Carriage return: move to column 0 without advancing the line.
+        cursor_x = 0;
+        return;
+    }
+    if (c == '\b') {
+        // Backspace (0x08): move cursor one column left without erasing.
+        // The shell sends "\b \b" — the space in the middle erases the character;
+        // the two \b calls move the cursor to and from the erase position.
+        if (cursor_x > 0)
+            cursor_x--;
+        return;
+    }
+    if (c == '\n') {
+        cursor_x = 0;
+        cursor_y++;
+    } else {
+        draw_char(c, cursor_x, cursor_y);
+        cursor_x++;
+        if (cursor_x >= columns) {
+            cursor_x = 0;
+            cursor_y++;
+        }
+    }
+    if (cursor_y >= rows) {
+        scroll_up();
+        cursor_y = rows - 1;
+    }
 }

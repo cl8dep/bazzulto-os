@@ -1,37 +1,36 @@
 #include "../../include/bazzulto/elf_loader.h"
+#include <string.h>
 #include "../../include/bazzulto/elf.h"
 #include "../../include/bazzulto/virtual_memory.h"
 #include "../../include/bazzulto/physical_memory.h"
 #include "../../include/bazzulto/kernel.h"
 #include "../../include/bazzulto/uart.h"
 
-// User stack: mapped below this address.
-#define USER_STACK_TOP   0x7FFFFFF000ULL
-#define USER_STACK_PAGES 4  // 16KB stack — enough for C programs with moderate locals
+// User stack: mapped below this base address.
+// The actual stack top is varied per process by ASLR (see aslr_stack_offset()).
+#define USER_STACK_BASE  0x7FFFF00000ULL
+#define USER_STACK_PAGES 4  // 16KB — enough for C programs with moderate call depth
 
-// --- Helpers (no libc) ---
+// Guard page: the PAGE_SIZE region immediately below the bottom stack page is
+// intentionally left unmapped. Any stack overflow will fault here before
+// touching the heap or other data. No extra code needed — the guard is implicit
+// because we only map USER_STACK_PAGES pages above the guard address.
+#define USER_STACK_GUARD_PAGES 1
 
-static void memory_copy(void *dst, const void *src, size_t n)
+// ---------------------------------------------------------------------------
+// Stack ASLR — ARM ARM D13.2.14: CNTPCT_EL0 is readable from EL1 and above.
+// We mix the timer counter with the page table pointer to get per-process
+// entropy. This randomizes the stack position by 0–255 pages (0–1020 KB)
+// on top of USER_STACK_BASE. Full text-segment ASLR requires PIE compilation.
+// ---------------------------------------------------------------------------
+static uint64_t aslr_stack_offset(const void *page_table_seed)
 {
-	uint8_t *d = dst;
-	const uint8_t *s = src;
-	for (size_t i = 0; i < n; i++)
-		d[i] = s[i];
-}
-
-static void memory_zero(void *dst, size_t n)
-{
-	uint8_t *d = dst;
-	for (size_t i = 0; i < n; i++)
-		d[i] = 0;
-}
-
-static size_t string_length(const char *s)
-{
-	size_t len = 0;
-	while (s[len])
-		len++;
-	return len;
+    uint64_t count;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(count));
+    // Mix timer bits with a pointer-derived value so even processes that start
+    // at the same tick get different offsets.
+    uint64_t mixed = count ^ ((uint64_t)(uintptr_t)page_table_seed >> 12);
+    return (mixed & 0xFF) * PAGE_SIZE;  // 0-255 pages above guard
 }
 
 // --- ELF validation ---
@@ -133,7 +132,7 @@ static int map_segment(uint64_t *page_table,
 			return -1;
 
 		uint8_t *page_virt = (uint8_t *)PHYSICAL_TO_VIRTUAL(phys);
-		memory_zero(page_virt, PAGE_SIZE);
+		memset(page_virt, 0, PAGE_SIZE);
 
 		// Calculate which bytes of this page overlap with the file data
 		// region [p_vaddr, p_vaddr + p_filesz).
@@ -151,7 +150,7 @@ static int map_segment(uint64_t *page_table,
 			size_t dst_offset  = copy_start - page_start;
 			size_t src_offset  = phdr->p_offset + (copy_start - seg_file_start);
 			size_t copy_size   = copy_end - copy_start;
-			memory_copy(page_virt + dst_offset, file_data + src_offset, copy_size);
+			memcpy(page_virt + dst_offset, file_data + src_offset, copy_size);
 		}
 		// Bytes outside [p_vaddr, p_vaddr + p_filesz) but within
 		// [p_vaddr, p_vaddr + p_memsz) are already zeroed (the .bss region).
@@ -164,35 +163,39 @@ static int map_segment(uint64_t *page_table,
 
 // --- Public API ---
 
-process_t *elf_loader_load(const void *data, size_t size,
-                            const char *const *argv, int argc)
+// Build an ELF image: validate, map segments, allocate stack, push argv.
+// Does NOT create a scheduler process — just returns the page table, entry
+// point, and user SP. This is the shared core used by both elf_loader_load
+// (spawn) and sys_exec (replace current process image).
+int elf_loader_build_image(const void *data, size_t size,
+                            const char *const *argv, int argc,
+                            uint64_t **page_table_out,
+                            uint64_t  *entry_out,
+                            uint64_t  *stack_top_out)
 {
 	const uint8_t *file_data = (const uint8_t *)data;
 
-	// The file must be large enough to contain the ELF header.
 	if (size < sizeof(elf64_header_t)) {
 		uart_puts("[elf_loader] file too small\n");
-		return NULL;
+		return -1;
 	}
 
 	const elf64_header_t *header = (const elf64_header_t *)file_data;
 
 	if (validate_elf_header(header, size) < 0)
-		return NULL;
+		return -1;
 
 	if (header->e_phnum == 0) {
 		uart_puts("[elf_loader] no program headers\n");
-		return NULL;
+		return -1;
 	}
 
-	// Create a per-process page table.
 	uint64_t *page_table = virtual_memory_create_table();
 	if (!page_table) {
 		uart_puts("[elf_loader] page table allocation failed\n");
-		return NULL;
+		return -1;
 	}
 
-	// Iterate program headers and map all PT_LOAD segments.
 	const uint8_t *phdr_base = file_data + header->e_phoff;
 	for (uint16_t i = 0; i < header->e_phnum; i++) {
 		const elf64_program_header_t *phdr =
@@ -203,36 +206,36 @@ process_t *elf_loader_load(const void *data, size_t size,
 
 		if (phdr->p_offset + phdr->p_filesz > size) {
 			uart_puts("[elf_loader] segment file data out of bounds\n");
-			return NULL;
+			return -1;
 		}
 
 		if (phdr->p_memsz < phdr->p_filesz) {
 			uart_puts("[elf_loader] p_memsz < p_filesz\n");
-			return NULL;
+			return -1;
 		}
 
 		if (phdr->p_vaddr + phdr->p_memsz > 0x0001000000000000ULL) {
 			uart_puts("[elf_loader] segment vaddr out of user range\n");
-			return NULL;
+			return -1;
 		}
 
 		if (map_segment(page_table, file_data, phdr) < 0) {
 			uart_puts("[elf_loader] segment mapping failed\n");
-			return NULL;
+			return -1;
 		}
 	}
 
-	// --- Allocate user stack pages ---
-	// Keep a reference to the top page so we can write argv data via HHDM.
+	uint64_t stack_top = USER_STACK_BASE - aslr_stack_offset(page_table);
+
 	void *top_page_phys = NULL;
 	for (int i = 0; i < USER_STACK_PAGES; i++) {
 		void *stack_phys = physical_memory_alloc();
 		if (!stack_phys) {
 			uart_puts("[elf_loader] stack allocation failed\n");
-			return NULL;
+			return -1;
 		}
-		memory_zero(PHYSICAL_TO_VIRTUAL(stack_phys), PAGE_SIZE);
-		uint64_t stack_vaddr = USER_STACK_TOP - (uint64_t)(i + 1) * PAGE_SIZE;
+		memset(PHYSICAL_TO_VIRTUAL(stack_phys), 0, PAGE_SIZE);
+		uint64_t stack_vaddr = stack_top - (uint64_t)(i + 1) * PAGE_SIZE;
 		virtual_memory_map(page_table, stack_vaddr,
 		                   (uint64_t)stack_phys, PAGE_FLAGS_USER_DATA);
 		if (i == 0)
@@ -253,56 +256,65 @@ process_t *elf_loader_load(const void *data, size_t size,
 	//   ├── argc (uint64_t)
 	//   └── SP (16-byte aligned per AAPCS64)
 	//
-	// The top stack page covers [USER_STACK_TOP - PAGE_SIZE, USER_STACK_TOP).
+	// The top stack page covers [stack_top - PAGE_SIZE, stack_top).
 	// We write via HHDM: user addr X maps to top_page_virt + (X - page_base).
 
 	uint8_t *top_page_virt = (uint8_t *)PHYSICAL_TO_VIRTUAL(top_page_phys);
-	uint64_t page_base = USER_STACK_TOP - PAGE_SIZE;
-	uint64_t user_sp = USER_STACK_TOP;
+	uint64_t page_base = stack_top - PAGE_SIZE;
+	uint64_t user_sp = stack_top;
 
 	if (argv && argc > 0) {
-		// 1. Copy strings to top of stack, growing downward.
-		uint64_t str_user_addrs[64]; // user-space addresses of each string
+		uint64_t str_user_addrs[64];
 		for (int i = argc - 1; i >= 0; i--) {
-			size_t len = string_length(argv[i]) + 1; // include '\0'
+			size_t len = strlen(argv[i]) + 1;
 			user_sp -= len;
-			memory_copy(top_page_virt + (user_sp - page_base), argv[i], len);
+			memcpy(top_page_virt + (user_sp - page_base), argv[i], len);
 			str_user_addrs[i] = user_sp;
 		}
 
-		// 2. Align down to 8 bytes for the pointer array.
 		user_sp &= ~(uint64_t)7;
 
-		// 3. Write NULL terminator for argv array.
 		user_sp -= 8;
 		uint64_t *slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
 		*slot = 0;
 
-		// 4. Write argv pointers (in reverse so argv[0] is at lowest address).
 		for (int i = argc - 1; i >= 0; i--) {
 			user_sp -= 8;
 			slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
 			*slot = str_user_addrs[i];
 		}
 	} else {
-		// No arguments: write argv[0] = NULL.
 		user_sp &= ~(uint64_t)7;
 		user_sp -= 8;
 		uint64_t *slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
 		*slot = 0;
 	}
 
-	// 5. Write argc.
 	user_sp -= 8;
 	uint64_t *argc_slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
 	*argc_slot = (uint64_t)argc;
 
-	// 6. Align SP to 16 bytes (AAPCS64 requirement).
 	user_sp &= ~(uint64_t)15;
 
-	// Create the process with the prepared page table and adjusted SP.
+	*page_table_out = page_table;
+	*entry_out      = header->e_entry;
+	*stack_top_out  = user_sp;
+	return 0;
+}
+
+process_t *elf_loader_load(const void *data, size_t size,
+                            const char *const *argv, int argc)
+{
+	uint64_t *page_table = NULL;
+	uint64_t  entry      = 0;
+	uint64_t  user_sp    = 0;
+
+	if (elf_loader_build_image(data, size, argv, argc,
+	                            &page_table, &entry, &user_sp) < 0)
+		return NULL;
+
 	process_t *process = scheduler_create_user_process_from_image(
-		page_table, header->e_entry, user_sp);
+		page_table, entry, user_sp);
 
 	if (!process) {
 		uart_puts("[elf_loader] process creation failed\n");

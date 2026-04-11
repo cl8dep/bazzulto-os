@@ -35,3 +35,22 @@
 //   or allocation failure.
 process_t *elf_loader_load(const void *data, size_t size,
                             const char *const *argv, int argc);
+
+// Build a user address space from an ELF image without creating a process.
+// Performs the same steps as elf_loader_load (validate, map segments, allocate
+// stack, push argv) but returns the components needed for exec() instead of
+// spawning a new scheduler entry.
+//
+// On success, fills:
+//   *page_table_out  — the new TTBR0 page table (ready to load into TTBR0_EL1)
+//   *entry_out       — the ELF entry point virtual address
+//   *stack_top_out   — user SP after argv setup (16-byte aligned)
+//
+// Returns 0 on success, -1 on any validation or allocation failure.
+// On failure the caller must NOT free partial state — the function leaks
+// it (same policy as elf_loader_load on partial failure).
+int elf_loader_build_image(const void *data, size_t size,
+                            const char *const *argv, int argc,
+                            uint64_t **page_table_out,
+                            uint64_t  *entry_out,
+                            uint64_t  *stack_top_out);

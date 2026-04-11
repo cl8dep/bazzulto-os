@@ -18,6 +18,13 @@
 //   SYSTEMCALL_SPAWN = 7
 //   SYSTEMCALL_LIST  = 8
 //   SYSTEMCALL_WAIT  = 9
+//   SYSTEMCALL_PIPE  = 10
+//   SYSTEMCALL_DUP   = 11
+//   SYSTEMCALL_DUP2  = 12
+//   SYSTEMCALL_MMAP  = 13
+//   SYSTEMCALL_MUNMAP= 14
+//   SYSTEMCALL_FORK  = 15
+//   SYSTEMCALL_EXEC  = 16
 
 .text
 
@@ -69,4 +76,39 @@ list:
 .global wait
 wait:
     svc #9
+    ret
+
+.global pipe
+pipe:
+    svc #10
+    ret
+
+.global dup
+dup:
+    svc #11
+    ret
+
+.global dup2
+dup2:
+    svc #12
+    ret
+
+.global mmap
+mmap:
+    svc #13
+    ret
+
+.global munmap
+munmap:
+    svc #14
+    ret
+
+.global fork
+fork:
+    svc #15
+    ret
+
+.global exec
+exec:
+    svc #16
     ret

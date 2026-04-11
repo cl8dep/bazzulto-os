@@ -71,6 +71,17 @@
 // Create a new, empty page table. Returns a virtual address pointer to it.
 uint64_t *virtual_memory_create_table(void);
 
+// Allocate n_pages physical pages and map them contiguously starting at vaddr
+// in the kernel page table (kernel_page_table) with the given flags.
+// Returns 0 on success, -1 if any physical allocation fails.
+int kernel_vm_alloc(uint64_t vaddr, uint64_t n_pages, uint64_t flags);
+
+// Unmap a contiguous range of n_pages pages starting at vaddr in the given
+// page table, freeing the underlying physical pages. TLB entries are
+// invalidated for each page. Table intermediate pages are NOT freed.
+void virtual_memory_unmap_range(uint64_t *page_table,
+                                uint64_t vaddr, uint64_t n_pages);
+
 // Map a virtual address to a physical address in the given page table.
 // Intermediate table levels are allocated automatically via physical_memory_alloc.
 void virtual_memory_map(uint64_t *table, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
@@ -86,3 +97,10 @@ void virtual_memory_enable_user(void);
 // Switch the user-space page table (TTBR0_EL1) to a new process's table.
 // Flushes the TLB to ensure the new mappings take effect.
 void virtual_memory_switch_ttbr0(uint64_t *user_table);
+
+// Deep-copy a user page table: allocate fresh intermediate tables and fresh
+// physical pages for every L3 leaf in src_table. Each leaf page is copied
+// byte-for-byte. Only the lower-half VA range (TTBR0, < 2^48) is processed.
+// Returns a pointer to the new L0 table (HHDM virtual address), or NULL on
+// failure. On failure the partial copy leaks physical pages (no rollback).
+uint64_t *virtual_memory_deep_copy_table(const uint64_t *src_table);

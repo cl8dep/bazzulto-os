@@ -2,6 +2,7 @@
 #include "../../../include/bazzulto/gic.h"
 #include "../../../include/bazzulto/kernel.h"
 #include "../../../include/bazzulto/waitqueue.h"
+#include "../../../include/bazzulto/input.h"
 
 // ---------------------------------------------------------------------------
 // PL011 UART register map — ARM DDI 0183G (PL011 Technical Reference Manual)
@@ -132,6 +133,9 @@ void uart_irq_handler(void) {
 			rx_buf[rx_head] = c;
 			rx_head = next_head;
 		}
+		// Feed the character to the input layer so stdin consumers (VFS fd 0)
+		// receive serial input regardless of whether a keyboard is also present.
+		input_emit_char(c);
 	}
 
 	// Clear both RX and timeout interrupts AFTER draining the FIFO.

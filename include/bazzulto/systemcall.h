@@ -62,10 +62,55 @@
 /// Returns 0 when the child has exited, or -1 if the PID is not found.
 #define SYSTEMCALL_WAIT     9
 
-#define NR_SYSTEMCALLS 10
+/// Create a kernel pipe and return two file descriptors.
+/// x0 = pointer to int[2] (user): [0] = read fd, [1] = write fd.
+/// Returns 0 on success, -1 on error.
+#define SYSTEMCALL_PIPE     10
+
+/// Duplicate a file descriptor to the lowest free slot >= 3.
+/// x0 = oldfd.
+/// Returns new fd >= 0, or -1 on error.
+#define SYSTEMCALL_DUP      11
+
+/// Duplicate a file descriptor to a specific slot.
+/// x0 = oldfd, x1 = newfd.
+/// Closes newfd first if it is already open.
+/// Returns newfd on success, -1 on error.
+#define SYSTEMCALL_DUP2     12
+
+/// Allocate anonymous memory (readable + writable, zeroed).
+/// x0 = length in bytes (rounded up to page boundary).
+/// Returns user virtual address on success, (uint64_t)-1 on error.
+#define SYSTEMCALL_MMAP     13
+
+/// Release memory previously returned by SYSTEMCALL_MMAP.
+/// x0 = address (must match a value previously returned by mmap).
+/// Returns 0 on success, -1 if the address is not a known mmap allocation.
+#define SYSTEMCALL_MUNMAP   14
+
+/// Fork the calling process.
+/// Creates a copy of the current process with a deep-copied address space.
+/// In the parent: returns the child PID (> 0).
+/// In the child:  returns 0.
+/// Returns -1 on failure.
+#define SYSTEMCALL_FORK     15
+
+/// Replace the current process image with a new ELF binary from ramfs.
+/// x0 = path (user string, max 256 bytes).
+/// On success: does not return to the caller — execution restarts at the new
+///             ELF entry point with a fresh stack.
+/// On failure: returns -1.
+#define SYSTEMCALL_EXEC     16
+
+#define NR_SYSTEMCALLS 17
 
 // Dispatch a system call from the exception frame.
 // Called from exception_handler_sync_el0 when EC = EC_SVC_AARCH64.
 // Arguments are in frame->x0 through frame->x5.
 // Return value is written to frame->x0 (restored by eret).
 void systemcall_dispatch(struct exception_frame *frame);
+
+// Register the init process (PID 1 equivalent).
+// Must be called by kernel_main after launching the first user process so that
+// orphaned children are reparented to it when their parent exits.
+void systemcall_set_init_process(uint16_t pid_index);

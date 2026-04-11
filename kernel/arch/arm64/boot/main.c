@@ -1,4 +1,5 @@
 #include "../../../../include/bazzulto/console.h"
+#include <stdio.h>
 #include "../../../../include/bazzulto/exceptions.h"
 #include "../../../../include/bazzulto/heap.h"
 #include "../../../../include/bazzulto/scheduler.h"
@@ -9,6 +10,11 @@
 #include "../../../../include/bazzulto/virtual_memory.h"
 #include "../../../../include/bazzulto/ramfs.h"
 #include "../../../../include/bazzulto/elf_loader.h"
+#include "../../../../include/bazzulto/systemcall.h"
+#include "../../../../include/bazzulto/input.h"
+#include "../../../../include/bazzulto/virtio_mmio.h"
+#include "../../../../include/bazzulto/keyboard.h"
+#include "../../../../include/bazzulto/splash.h"
 #include "../../../../limine/limine.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -51,20 +57,6 @@ static volatile LIMINE_REQUESTS_END_MARKER;
 
 uint64_t hhdm_offset = 0;
 
-// Print a size_t as decimal — temporary until we have console_printf.
-static void print_number(size_t n) {
-    char digits[20];
-    int length = 0;
-    if (n == 0) { digits[length++] = '0'; }
-    else { while (n > 0) { digits[length++] = '0' + (n % 10); n /= 10; } }
-    for (int a = 0, b = length - 1; a < b; a++, b--) {
-        char tmp = digits[a]; digits[a] = digits[b]; digits[b] = tmp;
-    }
-    digits[length] = '\0';
-    console_print(digits);
-}
-
-
 
 // The kernel's page table — exposed so other subsystems can map new pages.
 uint64_t *kernel_page_table = NULL;
@@ -99,9 +91,11 @@ void kernel_main(void) {
         for (;;) __asm__("wfe");
     }
     physical_memory_init(memmap_request.response);
-    console_print("Physical memory: ");
-    print_number(physical_memory_free_page_count());
-    console_println(" pages free");
+    char physical_memory_message[64];
+    ksnprintf(physical_memory_message, sizeof(physical_memory_message),
+              "Physical memory: %lu pages free",
+              (unsigned long)physical_memory_free_page_count());
+    console_println(physical_memory_message);
 
     // --- Step 3: build our own kernel page table ---
     if (!kernel_address_request.response) {
@@ -166,6 +160,17 @@ void kernel_main(void) {
                        0x09000000ULL,
                        PAGE_FLAGS_KERNEL_DEVICE);
 
+    // Map virtio-mmio slots as device memory — physical 0x0A000000, 32 slots
+    // of 0x200 bytes each = 0x4000 bytes total = 4 pages.
+    // QEMU virt: virtio-mmio region at 0x0A000000, size 0x4000 (hw/arm/virt.c).
+    for (uint64_t page = 0; page < 4; page++) {
+        uint64_t virtio_page = VIRTIO_MMIO_BASE + page * PAGE_SIZE;
+        virtual_memory_map(kernel_table,
+                           hhdm_offset + virtio_page,
+                           virtio_page,
+                           PAGE_FLAGS_KERNEL_DEVICE);
+    }
+
     // --- Step 4: activate our page table ---
     kernel_page_table = kernel_table;
     virtual_memory_activate(kernel_table);
@@ -191,6 +196,17 @@ void kernel_main(void) {
     uart_puts("UART: ok\n");
     console_println("UART: ok");
 
+    // Initialize the input abstraction layer before any driver that feeds it.
+    input_init();
+
+    // Enumerate virtio-mmio devices so keyboard_init() can find the input device.
+    virtio_mmio_enumerate();
+
+    // Initialize the virtio-input keyboard driver. Safe to call when no
+    // keyboard device is present (QEMU run-serial target) — logs a warning
+    // and continues with serial-only input via the UART IRQ path.
+    keyboard_init();
+
     // Enable TTBR0 page table walks for user-space processes.
     virtual_memory_enable_user();
 
@@ -212,16 +228,24 @@ void kernel_main(void) {
     ramfs_register("/bin/echo", _user_echo_elf_start,
                    _user_echo_elf_end - _user_echo_elf_start);
 
-    // Launch the shell as the initial user-mode process.
-    if (elf_loader_load(_user_shell_elf_start,
-                        _user_shell_elf_end - _user_shell_elf_start,
-                        NULL, 0)) {
-        console_println("Shell: launched");
-    } else {
-        console_println("FATAL: failed to load shell");
+    // Launch the shell as the initial user-mode process (the init process).
+    // Register its PID as the orphan reaper before starting the scheduler so
+    // that any process that dies before the shell spawns a child is reparented
+    // correctly rather than leaking as a permanent zombie.
+    uint16_t shell_pid = 0;
+    {
+        process_t *shell = elf_loader_load(_user_shell_elf_start,
+                                           _user_shell_elf_end - _user_shell_elf_start,
+                                           NULL, 0);
+        if (shell) {
+            systemcall_set_init_process(shell->pid.index);
+            shell_pid = shell->pid.index;
+        } else {
+            console_println("FATAL: failed to load shell");
+        }
     }
 
-    console_println("Starting scheduler...");
+    splash_display(shell_pid, keyboard_get_irq_intid());
     scheduler_start();  // does not return
 
     console_println("Kernel initialized. Halting.");

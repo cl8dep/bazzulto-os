@@ -46,5 +46,34 @@ int spawn(const char *path, const char *const argv[]);
 int64_t list(int index, char *name_buf, size_t buf_len);
 
 // Block until the process with the given PID exits.
-// Returns 0 when the child has exited, or -1 if the PID is not found.
-int wait(int pid);
+// Returns the child's exit status (>= 0), or -1 if the PID is not found.
+int64_t wait(int pid);
+
+// Create a kernel pipe. Fills fds[0] (read end) and fds[1] (write end).
+// Returns 0 on success, -1 on error.
+int pipe(int fds[2]);
+
+// Duplicate a file descriptor to the lowest free slot >= 3.
+// Returns the new fd, or -1 on error.
+int dup(int oldfd);
+
+// Duplicate oldfd to newfd, closing newfd first if open.
+// Returns newfd on success, -1 on error.
+int dup2(int oldfd, int newfd);
+
+// Allocate `length` bytes of anonymous, zeroed memory.
+// Returns a user virtual address on success, or (void *)-1 on error.
+void *mmap(size_t length);
+
+// Release memory previously returned by mmap.
+// Returns 0 on success, -1 if the address is not a known mmap allocation.
+int munmap(void *addr);
+
+// Fork the calling process.
+// Returns the child PID (> 0) in the parent, 0 in the child, -1 on error.
+int fork(void);
+
+// Replace the current process image with the ELF at `path`.
+// On success: does not return — execution restarts at the new entry point.
+// On failure: returns -1.
+int exec(const char *path);

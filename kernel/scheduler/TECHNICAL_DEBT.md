@@ -1,42 +1,33 @@
 # Technical Debt — Scheduler
 
-## Round Robin → Multi-Level Feedback Queue (MLFQ)
+## Zombie Count Limit — DONE
+`process_t.zombie_count` (uint16_t) tracks un-reaped zombie children.
+`sys_spawn` refuses with -1 when count reaches `ZOMBIE_COUNT_MAX = 64`.
+`sys_exit` increments parent's count; `sys_wait` decrements it.
 
-**Current implementation:** simple Round Robin — all processes share equal CPU time
-in fixed-size time slices, cycling through a circular list.
+## wait(-1) / Any Child — DONE
+`sys_wait` accepts -1 as a sentinel meaning "wait for any child".
+`scheduler_find_zombie_child` and `scheduler_has_child` support this.
+`waiting_for_pid = 0xFFFF` is the in-process sentinel for "waiting for any child".
 
-**Why migrate:** Round Robin treats all processes equally, but in practice processes
-have different needs:
-- Interactive processes (UI, shell) need low latency — they should preempt quickly
-- Background processes (compilation, compression) are CPU-bound — latency matters less
-- Real-time processes (audio, sensors) need guaranteed response times
+## fork() — DONE
+`scheduler_fork_process(parent_frame)` deep-copies the user address space
+(all L3 leaf pages) via `virtual_memory_deep_copy_table`, copies the exception
+frame onto the child's kernel stack with x0=0, and sets context.x30 to
+`fork_child_resume` (asm: expands `restore_exception_frame_el0` → eret to EL0).
 
-**Target: MLFQ** (as used by macOS/XNU and early Windows NT)
+## exec() — DONE
+`scheduler_free_user_address_space` frees the TTBR0 without touching the kernel
+stack or process struct. `sys_exec` calls `elf_loader_build_image`, installs the
+new page table, and rewrites the exception frame (ELR, SP_EL0, SPSR) so that
+the eret returns to the new entry point.
 
-How it works:
-- Multiple queues, each with a different priority level (e.g. 0=realtime, 1=high,
-  2=normal, 3=background)
-- New processes start at high priority
-- If a process uses its full time slice without blocking, it moves DOWN one level
-  (signal: it's CPU-bound, less urgent)
-- If a process blocks early (waiting for I/O, input), it stays at high priority
-  (signal: it's interactive, needs responsiveness)
-- The scheduler always picks from the highest non-empty queue
+## Round Robin → MLFQ — OPEN
+Scheduler is still round-robin. MLFQ (multi-level feedback queue) is needed
+for interactive responsiveness. `process_t` would gain `priority` and
+`ticks_used` fields; the run queue becomes an array of priority queues.
 
-**What needs to change:**
-- `struct process` gains a `priority` field and a `ticks_used` counter
-- The ready list becomes an array of lists, one per priority level
-- `scheduler_tick` checks ticks_used and demotes the process if it exhausted its slice
-- `scheduler_unblock` (called when I/O completes) bumps priority back up
-
-**Migration effort:** medium. The context switch mechanism stays identical.
-Only the data structure and selection logic change.
-
-## Single-core only
-
-The current scheduler assumes one CPU. Supporting multiple cores (SMP) requires:
-- Per-core run queues to avoid lock contention
-- A load balancer that migrates processes between cores
-- Spinlocks on all shared scheduler state
-
-This is a significant redesign. Implement after the single-core scheduler is stable.
+## SMP — OPEN
+Single-core only. Multi-core support requires per-core run queues, a load
+balancer, and spinlocks on all shared scheduler state. Implement after the
+single-core scheduler is stable and correct under load.

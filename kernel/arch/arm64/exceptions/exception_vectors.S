@@ -246,3 +246,19 @@ __handle_irq_el0:
     save_exception_frame_el0
     bl exception_handler_irq_el0
     restore_exception_frame_el0
+
+// -----------------------------------------------------------------------
+// fork_child_resume — entry point for forked child processes
+//
+// When the scheduler context-switches to a newly forked child for the first
+// time, context_switch restores SP to the bottom of the copied exception
+// frame on the child's kernel stack and rets here (via the saved x30).
+//
+// SP therefore points to a fully populated exception_frame_el0 copy with
+// x0 already set to 0 (the child's fork() return value).  We simply expand
+// restore_exception_frame_el0, which restores all registers including
+// SP_EL0 and ELR_EL1, then erets back to EL0.
+// -----------------------------------------------------------------------
+.global fork_child_resume
+fork_child_resume:
+    restore_exception_frame_el0
