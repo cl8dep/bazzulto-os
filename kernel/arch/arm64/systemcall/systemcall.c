@@ -7,7 +7,8 @@
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
 #include "../../../../include/bazzulto/kernel.h"
-#include "../../../../include/bazzulto/timer.h"
+#include "../../../../include/bazzulto/hal/hal_timer.h"
+#include "errno.h"
 #include <string.h>
 
 // Signal return trampoline VA — a single `svc #SYSTEMCALL_SIGRETURN` instruction
@@ -61,6 +62,11 @@ static int64_t sys_exit(int status)
 {
 	process_t *dying = scheduler_get_current();
 
+	// Close all file descriptors before becoming a zombie.
+	// This is critical for pipes: the write-end ref_count must be
+	// decremented so that readers see EOF once all writers have exited.
+	virtual_file_system_close_all_fds(dying->fds);
+
 	// Save exit status and become a zombie — memory is NOT freed yet.
 	// The parent will read the status via sys_wait and then reap us.
 	dying->exit_status = status;
@@ -111,7 +117,7 @@ static int64_t sys_wait(int64_t raw_pid)
 
 			// No zombie children yet. If no children exist at all, give up.
 			if (!scheduler_has_child(caller->pid.index))
-				return -1;
+				return -ECHILD;
 
 			// At least one child still running — block until any child exits.
 			// 0xFFFF is the sentinel meaning "waiting for any child".
@@ -129,7 +135,7 @@ static int64_t sys_wait(int64_t raw_pid)
 	// Find the target — it may already be a zombie.
 	process_t *target = scheduler_find_process(target_pid_index);
 	if (target == NULL)
-		return -1;  // no such process
+		return -ECHILD;  // no such child process
 
 	// If not yet a zombie, block until it exits.
 	if (target->state != PROCESS_STATE_ZOMBIE) {
@@ -144,7 +150,7 @@ static int64_t sys_wait(int64_t raw_pid)
 	// not freed until reaped here).
 	target = scheduler_find_process(target_pid_index);
 	if (target == NULL || target->state != PROCESS_STATE_ZOMBIE)
-		return -1;
+		return -ECHILD;
 
 	int64_t exit_status = (int64_t)target->exit_status;
 	scheduler_reap_process(target);
@@ -156,14 +162,14 @@ static int64_t sys_wait(int64_t raw_pid)
 
 static int64_t sys_write(int fd, const char *buf, size_t len)
 {
-	if (!validate_user_buffer((uint64_t)buf, len)) return -1;
+	if (!validate_user_buffer((uint64_t)buf, len)) return -EFAULT;
 	process_t *p = scheduler_get_current();
 	return virtual_file_system_write(p->fds, fd, buf, len);
 }
 
 static int64_t sys_read(int fd, char *buf, size_t len)
 {
-	if (!validate_user_buffer((uint64_t)buf, len)) return -1;
+	if (!validate_user_buffer((uint64_t)buf, len)) return -EFAULT;
 	if (len == 0) return 0;
 	process_t *p = scheduler_get_current();
 	return virtual_file_system_read(p->fds, fd, buf, len);
@@ -177,7 +183,7 @@ static int64_t sys_yield(void)
 
 static int64_t sys_open(const char *path)
 {
-	if (!validate_user_string((uint64_t)path, 256)) return -1;
+	if (!validate_user_string((uint64_t)path, 256)) return -EFAULT;
 	process_t *p = scheduler_get_current();
 	return virtual_file_system_open(p->fds, path);
 }
@@ -213,16 +219,16 @@ static size_t copy_user_string(char *dst, const char *src, size_t max)
 
 static int64_t sys_spawn(const char *path, const char *const *user_argv)
 {
-	if (!validate_user_string((uint64_t)path, SPAWN_MAX_ARG_LEN)) return -1;
+	if (!validate_user_string((uint64_t)path, SPAWN_MAX_ARG_LEN)) return -EFAULT;
 
 	// Enforce the zombie cap: if this process already has ZOMBIE_COUNT_MAX
 	// un-reaped children, refuse to spawn more until the parent calls wait().
 	process_t *spawner = scheduler_get_current();
 	if (spawner->zombie_count >= ZOMBIE_COUNT_MAX)
-		return -1;
+		return -EAGAIN;
 
 	const struct ramfs_file *file = ramfs_lookup(path);
-	if (!file) return -1;
+	if (!file) return -ENOENT;
 
 	// Copy argv from the caller's user space into kernel memory.
 	// We read the argv array and strings while the caller's TTBR0 is active.
@@ -253,21 +259,33 @@ static int64_t sys_spawn(const char *path, const char *const *user_argv)
 
 	process_t *p = elf_loader_load(file->data, file->size,
 	                                argc > 0 ? kargv : NULL, argc);
-	if (!p) return -1;
+	if (!p) return -ENOMEM;
 
 	// Record the parent so the child's zombie can be reaped by sys_wait.
 	p->parent_pid = scheduler_get_current()->pid.index;
+
+	// Set the process name to the basename of path (last '/' component).
+	const char *basename = path;
+	for (const char *scan = path; *scan; scan++)
+		if (*scan == '/')
+			basename = scan + 1;
+	size_t name_len = 0;
+	while (basename[name_len] && name_len < sizeof(p->name) - 1) {
+		p->name[name_len] = basename[name_len];
+		name_len++;
+	}
+	p->name[name_len] = '\0';
 
 	return (int64_t)p->pid.index;
 }
 
 static int64_t sys_list(int index, char *name_buf, size_t buf_len)
 {
-	if (!validate_user_buffer((uint64_t)name_buf, buf_len)) return -1;
-	if (buf_len == 0) return -1;
+	if (!validate_user_buffer((uint64_t)name_buf, buf_len)) return -EFAULT;
+	if (buf_len == 0) return -EINVAL;
 
 	const struct ramfs_file *file = ramfs_file_at(index);
-	if (!file) return -1;
+	if (!file) return -ENOENT;
 
 	// Copy file name into user buffer (truncate if needed).
 	const char *name = file->name;
@@ -289,14 +307,14 @@ static int64_t sys_pipe(uint64_t user_fds_ptr)
 {
 	// user_fds_ptr must point to a writable int[2] in user space.
 	if (!validate_user_buffer(user_fds_ptr, 2 * sizeof(int)))
-		return -1;
+		return -EFAULT;
 
 	process_t *process = scheduler_get_current();
 	int read_fd = -1, write_fd = -1;
 
 	if (virtual_file_system_pipe(process->fds,
 	                              &read_fd, &write_fd) < 0)
-		return -1;
+		return -EMFILE;
 
 	int *out = (int *)user_fds_ptr;
 	out[0] = read_fd;
@@ -395,7 +413,7 @@ static int64_t sys_munmap(uint64_t vaddr)
 		}
 	}
 
-	return -1;  // address not found in this process's mmap table
+	return -EINVAL;  // address not found in this process's mmap table
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +427,7 @@ static int64_t sys_exec(const char *path, const char *const *user_argv,
 {
 	char safe_path[256];
 	if (!validate_user_string((uint64_t)path, sizeof(safe_path)))
-		return -1;
+		return -EFAULT;
 
 	size_t path_len = 0;
 	while (path_len < sizeof(safe_path) - 1 && path[path_len]) {
@@ -420,7 +438,7 @@ static int64_t sys_exec(const char *path, const char *const *user_argv,
 
 	const struct ramfs_file *file = ramfs_lookup(safe_path);
 	if (!file)
-		return -1;
+		return -ENOENT;
 
 	// Parse user argv (same logic as sys_spawn).
 	char arg_storage[SPAWN_MAX_ARGC][SPAWN_MAX_ARG_LEN];
@@ -457,14 +475,13 @@ static int64_t sys_exec(const char *path, const char *const *user_argv,
 	if (elf_loader_build_image(file->data, file->size,
 	                            kargv, argc,
 	                            &new_table, &new_entry, &new_sp) < 0)
-		return -1;
+		return -ENOMEM;
 
 	// Replace the address space.  Free the old TTBR0 and reset mmap state.
 	scheduler_free_user_address_space(process);
 
-	// Close all fds and reset mmap regions so the new image starts fresh.
-	virtual_file_system_close_all_fds(process->fds);
-	virtual_file_system_init_fds(process->fds);
+	// File descriptors are inherited across exec (POSIX semantics).
+	// Only the mmap regions are reset because the address space is replaced.
 	for (int i = 0; i < PROCESS_MMAP_MAX_REGIONS; i++) {
 		process->mmap_regions[i].vaddr   = 0;
 		process->mmap_regions[i].n_pages = 0;
@@ -472,6 +489,18 @@ static int64_t sys_exec(const char *path, const char *const *user_argv,
 	process->mmap_next_vaddr = MMAP_USER_BASE;
 
 	process->page_table = new_table;
+
+	// Update the process name to the new binary's basename.
+	const char *exec_basename = safe_path;
+	for (const char *scan = safe_path; *scan; scan++)
+		if (*scan == '/')
+			exec_basename = scan + 1;
+	size_t exec_name_len = 0;
+	while (exec_basename[exec_name_len] && exec_name_len < sizeof(process->name) - 1) {
+		process->name[exec_name_len] = exec_basename[exec_name_len];
+		exec_name_len++;
+	}
+	process->name[exec_name_len] = '\0';
 
 	// Install the new page table immediately.
 	virtual_memory_switch_ttbr0(new_table);
@@ -503,7 +532,7 @@ static int64_t sys_fork(struct exception_frame *frame)
 {
 	uint16_t child_pid = scheduler_fork_process(frame);
 	if (child_pid == 0)
-		return -1;
+		return -ENOMEM;
 	return (int64_t)child_pid;
 }
 
@@ -533,10 +562,10 @@ static int64_t sys_clock_gettime(int clock_id, struct timespec *user_tp)
 {
 	(void)clock_id;
 	if (!validate_user_buffer((uint64_t)user_tp, sizeof(struct timespec)))
-		return -1;
+		return -EFAULT;
 
-	uint64_t freq  = timer_read_cntfrq();
-	uint64_t count = timer_read_cntpct();
+	uint64_t freq  = hal_timer_read_frequency();
+	uint64_t count = hal_timer_read_counter();
 
 	user_tp->tv_sec  = (int64_t)(count / freq);
 	user_tp->tv_nsec = (int64_t)((count % freq) * 1000000000ULL / freq);
@@ -556,14 +585,14 @@ static int64_t sys_nanosleep(const struct timespec *user_req,
                                struct timespec *user_rem)
 {
 	if (!validate_user_buffer((uint64_t)user_req, sizeof(struct timespec)))
-		return -1;
+		return -EFAULT;
 
-	uint64_t freq  = timer_read_cntfrq();
+	uint64_t freq  = hal_timer_read_frequency();
 	uint64_t ticks = (uint64_t)user_req->tv_sec * freq +
 	                 (uint64_t)user_req->tv_nsec * freq / 1000000000ULL;
-	uint64_t deadline = timer_read_cntpct() + ticks;
+	uint64_t deadline = hal_timer_read_counter() + ticks;
 
-	while (timer_read_cntpct() < deadline)
+	while (hal_timer_read_counter() < deadline)
 		scheduler_yield();
 
 	if (user_rem && validate_user_buffer((uint64_t)user_rem, sizeof(struct timespec))) {
@@ -582,10 +611,10 @@ static int64_t sys_nanosleep(const struct timespec *user_req,
 static int64_t sys_sigaction(int signum, uint64_t handler_va)
 {
 	if (signum < 1 || signum > 31)
-		return -1;
+		return -EINVAL;
 	// SIGKILL (9) and SIGSTOP (19) cannot be caught or ignored.
 	if (signum == 9 || signum == 19)
-		return -1;
+		return -EINVAL;
 	scheduler_get_current()->signal_handlers[signum] = handler_va;
 	return 0;
 }
@@ -597,10 +626,10 @@ static int64_t sys_sigaction(int signum, uint64_t handler_va)
 static int64_t sys_kill(int pid, int signum)
 {
 	if (signum < 1 || signum > 31)
-		return -1;
+		return -EINVAL;
 	process_t *target = scheduler_find_process((uint16_t)pid);
 	if (!target)
-		return -1;
+		return -ESRCH;
 	target->pending_signals |= ((uint64_t)1 << signum);
 	// If target is blocked, make it runnable so it can handle the signal.
 	if (target->state == PROCESS_STATE_BLOCKED ||
@@ -629,7 +658,7 @@ static int64_t sys_sigreturn(struct exception_frame *frame)
 {
 	// frame->sp is the user SP after signal delivery, pointing at the sigframe.
 	if (!validate_user_buffer(frame->sp, SIGNAL_FRAME_SIZE))
-		return -1;
+		return -EFAULT;
 
 	// The saved exception_frame is at the start of the sigframe.
 	const struct exception_frame *saved =
@@ -719,6 +748,61 @@ void systemcall_deliver_pending_signals(struct exception_frame *frame)
 		// Note: only one signal per eret; remaining signals delivered next return.
 		break;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// sys_creat / sys_unlink / sys_fstat
+// ---------------------------------------------------------------------------
+
+static int64_t sys_creat(const char *path)
+{
+	if (!validate_user_string((uint64_t)path, 256)) return -EFAULT;
+	char safe_path[256];
+	copy_user_string(safe_path, path, sizeof(safe_path));
+
+	process_t *process = scheduler_get_current();
+	return (int64_t)virtual_file_system_creat(process->fds, safe_path);
+}
+
+static int64_t sys_unlink(const char *path)
+{
+	if (!validate_user_string((uint64_t)path, 256)) return -EFAULT;
+	char safe_path[256];
+	copy_user_string(safe_path, path, sizeof(safe_path));
+	return (int64_t)virtual_file_system_unlink(safe_path);
+}
+
+static int64_t sys_fstat(int fd, struct vfs_stat *user_stat)
+{
+	if (!validate_user_buffer((uint64_t)user_stat, sizeof(struct vfs_stat)))
+		return -EFAULT;
+	process_t *process = scheduler_get_current();
+	return (int64_t)virtual_file_system_fstat(process->fds, fd, user_stat);
+}
+
+// Disk info structure — must match the user-space struct disk_info.
+typedef struct {
+    uint64_t capacity_sectors;
+    uint64_t free_clusters;
+    uint64_t total_clusters;
+    uint64_t bytes_per_cluster;
+    int      ready;
+} kernel_disk_info_t;
+
+extern int fs_disk_info(kernel_disk_info_t *out);
+
+static int64_t sys_disk_info(kernel_disk_info_t *user_info)
+{
+	if (!validate_user_buffer((uint64_t)user_info, sizeof(kernel_disk_info_t)))
+		return -EFAULT;
+
+	kernel_disk_info_t info;
+	if (fs_disk_info(&info) < 0)
+		return -ENOSYS;
+
+	// Copy to user space.
+	memcpy(user_info, &info, sizeof(kernel_disk_info_t));
+	return 0;
 }
 
 // --- Dispatch ---
@@ -817,8 +901,25 @@ void systemcall_dispatch(struct exception_frame *frame)
 		// Do NOT deliver signals after sigreturn — the restored frame already
 		// represents the original interrupted context; deliver on next return.
 		return;
+	case SYSTEMCALL_CREAT:
+		frame->x0 = (uint64_t)sys_creat((const char *)frame->x0);
+		break;
+	case SYSTEMCALL_UNLINK:
+		frame->x0 = (uint64_t)sys_unlink((const char *)frame->x0);
+		break;
+	case SYSTEMCALL_FSTAT:
+		frame->x0 = (uint64_t)sys_fstat((int)frame->x0,
+		                                 (struct vfs_stat *)frame->x1);
+		break;
+	case SYSTEMCALL_SETFGPID:
+		scheduler_set_foreground_pid((uint16_t)frame->x0);
+		frame->x0 = 0;
+		break;
+	case SYSTEMCALL_DISK_INFO:
+		frame->x0 = (uint64_t)sys_disk_info((kernel_disk_info_t *)frame->x0);
+		break;
 	default:
-		frame->x0 = (uint64_t)-1;  // unknown syscall
+		frame->x0 = (uint64_t)-ENOSYS;  // unknown syscall
 		break;
 	}
 

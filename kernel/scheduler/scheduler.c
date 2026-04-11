@@ -18,7 +18,7 @@ extern void fork_child_resume(void);
 #define USER_TEXT_BASE   0x00400000ULL
 #define USER_STACK_TOP   0x7FFFFFF000ULL
 
-#define KERNEL_STACK_SIZE 24576  // 24KB — handles process + IRQ exception frame + full call chain with margin
+#define KERNEL_STACK_SIZE 32768  // 32KB — handles process + IRQ exception frame + full call chain with margin
 
 static process_t *current      = NULL;  // process currently running
 static process_t *run_queue    = NULL;  // head of the circular ready list
@@ -56,6 +56,7 @@ process_t *scheduler_create_process(void (*entry_point)(void)) {
     process->mmap_next_vaddr  = MMAP_USER_BASE;
     process->pending_signals  = 0;
     memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
+    memset(process->name, 0, sizeof(process->name));
     virtual_file_system_init_fds(process->fds);
 
     // Set up the initial context so that when context_switch restores it,
@@ -207,6 +208,7 @@ process_t *scheduler_create_user_process(const void *code, size_t code_size) {
     process->mmap_next_vaddr = MMAP_USER_BASE;
     process->pending_signals = 0;
     memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
+    memset(process->name, 0, sizeof(process->name));
     virtual_file_system_init_fds(process->fds);
 
     // --- Create per-process page table (TTBR0) ---
@@ -290,6 +292,7 @@ process_t *scheduler_create_user_process_from_image(uint64_t *page_table,
     process->mmap_next_vaddr = MMAP_USER_BASE;
     process->pending_signals = 0;
     memset(process->signal_handlers, 0, sizeof(process->signal_handlers));
+    memset(process->name, 0, sizeof(process->name));
     virtual_file_system_init_fds(process->fds);
 
     // Set initial context for EL0 entry via process_entry_trampoline_user.
@@ -360,6 +363,11 @@ void scheduler_yield(void) {
     if (!current) return;
 
     process_t *prev = current;
+    // Mark the yielding process as READY so it can be rescheduled.
+    // Without this, the process stays RUNNING and the scheduler never picks
+    // it up again — only READY processes are candidates for context switch.
+    if (prev->state == PROCESS_STATE_RUNNING)
+        prev->state = PROCESS_STATE_READY;
     process_t *next = current->next;
 
     // Find the next READY process in the circular list.
@@ -546,14 +554,18 @@ uint16_t scheduler_fork_process(struct exception_frame *parent_frame)
     child->pending_signals = 0;
     memcpy(child->signal_handlers, parent->signal_handlers,
            sizeof(parent->signal_handlers));
+    memcpy(child->name, parent->name, sizeof(parent->name));
 
-    // Copy file descriptor table (pipes get their ref_count incremented).
+    // Copy file descriptor table (pipes get their ref_counts incremented).
     for (int i = 0; i < VIRTUAL_FILE_SYSTEM_MAX_FDS; i++) {
         child->fds[i] = parent->fds[i];
         if (child->fds[i].type == FD_TYPE_PIPE_READ ||
             child->fds[i].type == FD_TYPE_PIPE_WRITE) {
-            if (child->fds[i].pipe)
+            if (child->fds[i].pipe) {
                 child->fds[i].pipe->ref_count++;
+                if (child->fds[i].type == FD_TYPE_PIPE_READ)
+                    child->fds[i].pipe->read_ref_count++;
+            }
         }
     }
 
@@ -623,4 +635,31 @@ void scheduler_start(void) {
     context_switch(&bootstrap_context, &current->context);
 
     // Never reached
+}
+
+// ---------------------------------------------------------------------------
+// Foreground PID — used by the terminal interrupt path to deliver Ctrl+C
+// ---------------------------------------------------------------------------
+
+static volatile uint16_t foreground_pid_global = 0;
+
+void scheduler_set_foreground_pid(uint16_t pid)
+{
+    foreground_pid_global = pid;
+}
+
+// Called from input_emit_char in IRQ context: set the signal pending bit
+// on the foreground process so it is delivered on the next return to EL0.
+void scheduler_send_signal_to_foreground(int signum)
+{
+    if (foreground_pid_global == 0)
+        return;
+    process_t *target = scheduler_find_process(foreground_pid_global);
+    if (!target)
+        return;
+    target->pending_signals |= ((uint64_t)1 << signum);
+    // Wake the process if it is blocked so it can act on the signal promptly.
+    if (target->state == PROCESS_STATE_BLOCKED ||
+        target->state == PROCESS_STATE_WAITING)
+        target->state = PROCESS_STATE_READY;
 }

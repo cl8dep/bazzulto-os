@@ -1,5 +1,6 @@
 #include "../library/systemcall.h"
 #include "string.h"
+// creat() declared in systemcall.h (syscall 24)
 
 #define MAX_INPUT           256
 #define MAX_ARGS            16
@@ -15,39 +16,18 @@ static void print(const char *s)
 }
 
 // Read a line from stdin into `buf`. Returns the number of characters read.
-// Echoes each character back and handles backspace.
+// The kernel TTY layer handles echo, backspace, and line editing — the shell
+// receives a complete line after the user presses Enter.
 static size_t read_line(char *buf, size_t max)
 {
-	size_t pos = 0;
-	while (pos < max - 1) {
-		char c;
-		int64_t n = read(0, &c, 1);
-		if (n <= 0)
-			continue;
-
-		if (c == '\r' || c == '\n') {
-			print("\r\n");
-			break;
-		}
-
-		// Backspace (0x7F) or Ctrl-H (0x08)
-		if (c == 0x7F || c == 0x08) {
-			if (pos > 0) {
-				pos--;
-				print("\b \b");
-			}
-			continue;
-		}
-
-		// Ignore non-printable characters.
-		if (c < 0x20)
-			continue;
-
-		buf[pos++] = c;
-		write(1, &c, 1);
-	}
-	buf[pos] = '\0';
-	return pos;
+	int64_t n = read(0, buf, max - 1);
+	if (n <= 0)
+		return 0;
+	// Strip trailing newline delivered by the TTY.
+	if (n > 0 && buf[n - 1] == '\n')
+		n--;
+	buf[n] = '\0';
+	return (size_t)n;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,9 +164,10 @@ static int execute_stage(char *stage, int in_fd, int out_fd)
 	if (argc <= 0)
 		return -1;
 
-	// Scan argv for a `<` redirect.  This modifies argc and argv[] in place
-	// to remove the `<` and the filename token.
-	int redirect_file_fd = -1;
+	// Scan argv for `<`, `>`, and `>>` redirects.
+	// Removes these tokens (and their filename arguments) from the command argv.
+	int redirect_in_fd  = -1;   // stdin  redirect (<)
+	int redirect_out_fd = -1;   // stdout redirect (> or >>)
 	const char *redirect_argv[MAX_ARGS + 1];
 	int redirect_argc = 0;
 
@@ -196,13 +177,39 @@ static int execute_stage(char *stage, int in_fd, int out_fd)
 				print("shell: expected filename after '<'\r\n");
 				return -1;
 			}
-			redirect_file_fd = open(argv[i + 1]);
-			if (redirect_file_fd < 0) {
+			redirect_in_fd = open(argv[i + 1]);
+			if (redirect_in_fd < 0) {
 				print(argv[i + 1]);
 				print(": no such file\r\n");
 				return -1;
 			}
 			i++;  // skip filename
+		} else if (strcmp(argv[i], ">>") == 0) {
+			if (i + 1 >= argc) {
+				print("shell: expected filename after '>>'\r\n");
+				return -1;
+			}
+			// Create-or-open, then seek to end.
+			redirect_out_fd = creat(argv[i + 1]);
+			if (redirect_out_fd < 0) {
+				print(argv[i + 1]);
+				print(": cannot open\r\n");
+				return -1;
+			}
+			seek(redirect_out_fd, 0, 2);  // SEEK_END = 2
+			i++;
+		} else if (strcmp(argv[i], ">") == 0) {
+			if (i + 1 >= argc) {
+				print("shell: expected filename after '>'\r\n");
+				return -1;
+			}
+			redirect_out_fd = creat(argv[i + 1]);
+			if (redirect_out_fd < 0) {
+				print(argv[i + 1]);
+				print(": cannot create\r\n");
+				return -1;
+			}
+			i++;
 		} else {
 			redirect_argv[redirect_argc++] = argv[i];
 		}
@@ -218,13 +225,14 @@ static int execute_stage(char *stage, int in_fd, int out_fd)
 	int pid = fork();
 	if (pid < 0) {
 		print("shell: fork failed\r\n");
-		if (redirect_file_fd >= 0)
-			close(redirect_file_fd);
+		if (redirect_in_fd >= 0)  close(redirect_in_fd);
+		if (redirect_out_fd >= 0) close(redirect_out_fd);
 		return -1;
 	}
 
 	if (pid == 0) {
 		// Child: set up stdin/stdout redirects.
+		// Pipeline fds first, then explicit redirects (redirects win).
 		if (in_fd != 0) {
 			dup2(in_fd, 0);
 			close(in_fd);
@@ -233,10 +241,20 @@ static int execute_stage(char *stage, int in_fd, int out_fd)
 			dup2(out_fd, 1);
 			close(out_fd);
 		}
-		if (redirect_file_fd >= 0) {
-			dup2(redirect_file_fd, 0);
-			close(redirect_file_fd);
+		if (redirect_in_fd >= 0) {
+			dup2(redirect_in_fd, 0);
+			close(redirect_in_fd);
 		}
+		if (redirect_out_fd >= 0) {
+			dup2(redirect_out_fd, 1);
+			close(redirect_out_fd);
+		}
+		// Close all inherited fds >= 3. The child inherits the parent's full fd
+		// table, including both ends of every pipeline pipe. If we leave the
+		// write end open, pipe_write_end_open() will find it in our own table
+		// and pipe_read() will never see EOF — causing all readers to hang.
+		for (int close_fd = 3; close_fd < 64; close_fd++)
+			close(close_fd);
 		execv(path, redirect_argv);
 		// execv failed — print error and exit.
 		print(redirect_argv[0]);
@@ -244,9 +262,9 @@ static int execute_stage(char *stage, int in_fd, int out_fd)
 		exit(127);
 	}
 
-	// Parent: close fds that were passed into the child.
-	if (redirect_file_fd >= 0)
-		close(redirect_file_fd);
+	// Parent: close fds that were handed to the child.
+	if (redirect_in_fd >= 0)  close(redirect_in_fd);
+	if (redirect_out_fd >= 0) close(redirect_out_fd);
 
 	return pid;
 }
@@ -286,6 +304,11 @@ static void execute_pipeline(char **stages, int n_stages)
 			close(pipes[i][1]);
 	}
 
+	// Declare the last stage as the terminal foreground process so that
+	// Ctrl+C (SIGINT) is delivered to it while the shell is blocked in wait().
+	if (pids[n_stages - 1] >= 0)
+		set_terminal_foreground_pid(pids[n_stages - 1]);
+
 	// Wait for all children.  Waiting in reverse order avoids the last stage
 	// blocking on a full pipe from an earlier stage that we haven't waited for.
 	// In practice, waiting only for the last stage is sufficient for most shell
@@ -294,6 +317,9 @@ static void execute_pipeline(char **stages, int n_stages)
 		if (pids[i] >= 0)
 			wait(pids[i]);
 	}
+
+	// Shell regains the terminal — Ctrl+C must no longer kill anything.
+	set_terminal_foreground_pid(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,29 +348,30 @@ int main(void)
 		}
 
 		if (n_stages == 1) {
-			// Single command: tokenize, check for builtins and redirects.
-			const char *argv[MAX_ARGS + 1];
-			int argc = tokenize(stages[0], argv, MAX_ARGS);
-			if (argc < 0) {
-				print("error: unterminated string\r\n");
-				continue;
-			}
-			if (argc == 0)
-				continue;
-
-			// Check for `<` redirect without a pipeline.
+			// Scan the raw string for redirect operators before tokenizing,
+			// because tokenize() modifies the buffer in place (inserts \0).
+			// A second tokenize in execute_stage would see a truncated string.
 			int has_redirect = 0;
-			for (int i = 0; i < argc; i++) {
-				if (strcmp(argv[i], "<") == 0) {
+			for (const char *scan = stages[0]; *scan; scan++) {
+				if (*scan == '<' || *scan == '>') {
 					has_redirect = 1;
 					break;
 				}
 			}
 
 			if (has_redirect) {
-				// Use the pipeline execution path (handles `<` redirect).
+				// Use the pipeline execution path (handles redirects).
 				execute_pipeline(stages, 1);
 			} else {
+				// Single command without redirects: tokenize and spawn.
+				const char *argv[MAX_ARGS + 1];
+				int argc = tokenize(stages[0], argv, MAX_ARGS);
+				if (argc < 0) {
+					print("error: unterminated string\r\n");
+					continue;
+				}
+				if (argc == 0)
+					continue;
 				// Plain spawn — faster path, no fork overhead.
 				char path[MAX_INPUT];
 				build_path(path, MAX_INPUT, argv[0]);
@@ -355,7 +382,9 @@ int main(void)
 					print(": command not found\r\n");
 					continue;
 				}
+				set_terminal_foreground_pid(pid);
 				wait(pid);
+				set_terminal_foreground_pid(0);
 			}
 		} else {
 			execute_pipeline(stages, n_stages);

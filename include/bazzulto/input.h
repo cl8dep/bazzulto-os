@@ -43,4 +43,6 @@ void input_emit_char(char character);
 
 // Block the calling process until an ASCII character is available, then
 // return it. Called by the VFS console read path for stdin (fd 0).
-char input_getchar(void);
+// Returns -1 if interrupted by a pending signal (so the syscall can return
+// and deliver the signal before eret).
+int input_getchar(void);

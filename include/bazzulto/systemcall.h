@@ -142,7 +142,46 @@
 /// original interrupted context. No explicit arguments.
 #define SYSTEMCALL_SIGRETURN 23
 
-#define NR_SYSTEMCALLS 24
+/// Create or truncate a file for writing and return an fd.
+/// x0 = path (user string, max 256 bytes).
+/// Returns fd >= 0, or -1 on error or read-only scheme.
+#define SYSTEMCALL_CREAT    24
+
+/// Delete a file by path.
+/// x0 = path (user string, max 256 bytes).
+/// Returns 0 on success, -1 on error.
+#define SYSTEMCALL_UNLINK   25
+
+/// Return the size of an open file.
+/// x0 = fd, x1 = pointer to struct vfs_stat (user).
+/// Returns 0 on success, -1 on error.
+#define SYSTEMCALL_FSTAT    26
+
+/// Set the terminal foreground process PID.
+/// x0 = pid (0 = no foreground process — shell is back in control).
+/// Ctrl+C sends SIGINT to this process until it is cleared.
+/// Returns 0.
+#define SYSTEMCALL_SETFGPID 27
+
+// Query disk filesystem info (capacity, free clusters, etc).
+// x0 = 0 → returns total capacity in sectors
+// x1 = 1 → returns free clusters
+// x2 = 2 → returns total clusters
+// x3 = 3 → returns bytes per cluster
+// Returns 0 on success with struct disk_info filled via x1, -1 on error.
+// Simple form: x0 = 0, x1 = pointer to struct disk_info, x2 = sizeof(struct disk_info)
+#define SYSTEMCALL_DISK_INFO 28
+
+// Structure returned by SYSTEMCALL_DISK_INFO.
+struct disk_info {
+    unsigned long long capacity_sectors;  // total disk capacity (512B sectors)
+    unsigned long long free_clusters;     // free clusters available
+    unsigned long long total_clusters;    // total data clusters
+    unsigned long long bytes_per_cluster; // cluster size in bytes
+    int                ready;             // 1 if filesystem initialized, 0 otherwise
+};
+
+#define NR_SYSTEMCALLS 29
 
 // Deliver any pending signals to the current process before returning to EL0.
 // Called at the end of systemcall_dispatch and exception_handler_irq_el0.

@@ -33,6 +33,7 @@ run_test "string" /tmp/bz_test_string \
 
 run_test "stdlib" /tmp/bz_test_stdlib \
     -I userspace/libc \
+    -DBAZZULTO_HOST_TEST \
     tests/libc/test_stdlib.c \
     userspace/libc/stdlib.c
 
@@ -40,6 +41,21 @@ run_test "stdio" /tmp/bz_test_stdio \
     -I userspace/library \
     tests/libc/test_stdio.c \
     userspace/libc/stdio_test_shim.c \
+    userspace/libc/string.c
+
+run_test "utf8" /tmp/bz_test_utf8 \
+    tests/libc/test_utf8.c \
+    userspace/libc/utf8.c
+
+run_test "ctype" /tmp/bz_test_ctype \
+    tests/libc/test_ctype.c \
+    userspace/libc/ctype.c
+
+run_test "stdlib_extended" /tmp/bz_test_stdlib_ext \
+    -I userspace/libc \
+    -DBAZZULTO_HOST_TEST \
+    tests/libc/test_stdlib_extended.c \
+    userspace/libc/stdlib.c \
     userspace/libc/string.c
 
 printf "\n──────────────────────────────────────────\n"

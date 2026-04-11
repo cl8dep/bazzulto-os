@@ -239,3 +239,36 @@ char *strtok(char *str, const char *delim)
     static char *saved_position = (char *)0;
     return strtok_r(str, delim, &saved_position);
 }
+
+char *strerror(int error_number)
+{
+    switch (error_number) {
+        case 0:  return "Success";
+        case 1:  return "Math argument out of domain";           // EDOM
+        case 2:  return "Illegal byte sequence";                 // EILSEQ
+        case 3:  return "Result out of range";                   // ERANGE
+        case 4:  return "Operation not permitted";               // EPERM
+        case 5:  return "No such file or directory";             // ENOENT
+        case 6:  return "Bad file descriptor";                   // EBADF
+        case 7:  return "Out of memory";                         // ENOMEM
+        case 8:  return "Permission denied";                     // EACCES
+        case 9:  return "File already exists";                   // EEXIST
+        case 10: return "Not a directory";                       // ENOTDIR
+        case 11: return "Is a directory";                        // EISDIR
+        case 12: return "Invalid argument";                      // EINVAL
+        case 13: return "Too many open file descriptors";        // EMFILE
+        case 14: return "No space left on device";               // ENOSPC
+        case 15: return "Illegal seek";                          // ESPIPE
+        case 16: return "Function not implemented";              // ENOSYS
+        case 17: return "Interrupted system call";               // EINTR
+        case 18: return "Too many levels of symbolic links";     // ELOOP
+        case 19: return "Read-only file system";                 // EROFS
+        case 20: return "Directory not empty";                   // ENOTEMPTY
+        case 21: return "Cross-device link";                     // EXDEV
+        case 22: return "Bad address";                           // EFAULT
+        case 23: return "No child processes";                    // ECHILD
+        case 24: return "Resource temporarily unavailable";      // EAGAIN
+        case 25: return "No such process";                       // ESRCH
+        default: return "Unknown error";
+    }
+}

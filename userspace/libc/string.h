@@ -31,3 +31,7 @@ char  *strtok_r(char *str, const char *delim, char **saveptr);
 // WARNING: Uses static storage. Not safe in multi-threaded or recursive contexts.
 // Future dynamic library: change static saveptr to __thread for thread safety.
 char  *strtok(char *str, const char *delim);
+
+// Convert an errno value to a human-readable error message — C11 §7.24.6.2.
+// Returns a pointer to a static string. Do not modify or free it.
+char *strerror(int error_number);

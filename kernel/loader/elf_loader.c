@@ -4,7 +4,7 @@
 #include "../../include/bazzulto/virtual_memory.h"
 #include "../../include/bazzulto/physical_memory.h"
 #include "../../include/bazzulto/kernel.h"
-#include "../../include/bazzulto/uart.h"
+#include "../../include/bazzulto/hal/hal_uart.h"
 
 // Signal return trampoline — mapped read+execute at this VA in every user process.
 // Contains a single `svc #SYSTEMCALL_SIGRETURN` instruction (number 23).
@@ -53,37 +53,37 @@ static int validate_elf_header(const elf64_header_t *header, size_t file_size)
 	    header->e_ident[ELF_IDENT_MAGIC1] != 'E'  ||
 	    header->e_ident[ELF_IDENT_MAGIC2] != 'L'  ||
 	    header->e_ident[ELF_IDENT_MAGIC3] != 'F') {
-		uart_puts("[elf_loader] invalid magic\n");
+		hal_uart_puts("[elf_loader] invalid magic\n");
 		return -1;
 	}
 
 	// Must be 64-bit ELF
 	if (header->e_ident[ELF_IDENT_CLASS] != ELF_CLASS_64) {
-		uart_puts("[elf_loader] not ELF-64\n");
+		hal_uart_puts("[elf_loader] not ELF-64\n");
 		return -1;
 	}
 
 	// Must be little-endian (AArch64)
 	if (header->e_ident[ELF_IDENT_DATA] != ELF_DATA_LITTLE_ENDIAN) {
-		uart_puts("[elf_loader] not little-endian\n");
+		hal_uart_puts("[elf_loader] not little-endian\n");
 		return -1;
 	}
 
 	// Must be an executable (not shared object, relocatable, or core)
 	if (header->e_type != ELF_TYPE_EXECUTABLE) {
-		uart_puts("[elf_loader] not an executable\n");
+		hal_uart_puts("[elf_loader] not an executable\n");
 		return -1;
 	}
 
 	// Must target AArch64
 	if (header->e_machine != ELF_MACHINE_AARCH64) {
-		uart_puts("[elf_loader] not AArch64\n");
+		hal_uart_puts("[elf_loader] not AArch64\n");
 		return -1;
 	}
 
 	// Program header table must fit within the file
 	if (header->e_phoff + (uint64_t)header->e_phnum * header->e_phentsize > file_size) {
-		uart_puts("[elf_loader] program headers out of bounds\n");
+		hal_uart_puts("[elf_loader] program headers out of bounds\n");
 		return -1;
 	}
 
@@ -185,7 +185,7 @@ int elf_loader_build_image(const void *data, size_t size,
 	const uint8_t *file_data = (const uint8_t *)data;
 
 	if (size < sizeof(elf64_header_t)) {
-		uart_puts("[elf_loader] file too small\n");
+		hal_uart_puts("[elf_loader] file too small\n");
 		return -1;
 	}
 
@@ -195,13 +195,13 @@ int elf_loader_build_image(const void *data, size_t size,
 		return -1;
 
 	if (header->e_phnum == 0) {
-		uart_puts("[elf_loader] no program headers\n");
+		hal_uart_puts("[elf_loader] no program headers\n");
 		return -1;
 	}
 
 	uint64_t *page_table = virtual_memory_create_table();
 	if (!page_table) {
-		uart_puts("[elf_loader] page table allocation failed\n");
+		hal_uart_puts("[elf_loader] page table allocation failed\n");
 		return -1;
 	}
 
@@ -214,22 +214,22 @@ int elf_loader_build_image(const void *data, size_t size,
 			continue;
 
 		if (phdr->p_offset + phdr->p_filesz > size) {
-			uart_puts("[elf_loader] segment file data out of bounds\n");
+			hal_uart_puts("[elf_loader] segment file data out of bounds\n");
 			return -1;
 		}
 
 		if (phdr->p_memsz < phdr->p_filesz) {
-			uart_puts("[elf_loader] p_memsz < p_filesz\n");
+			hal_uart_puts("[elf_loader] p_memsz < p_filesz\n");
 			return -1;
 		}
 
 		if (phdr->p_vaddr + phdr->p_memsz > 0x0001000000000000ULL) {
-			uart_puts("[elf_loader] segment vaddr out of user range\n");
+			hal_uart_puts("[elf_loader] segment vaddr out of user range\n");
 			return -1;
 		}
 
 		if (map_segment(page_table, file_data, phdr) < 0) {
-			uart_puts("[elf_loader] segment mapping failed\n");
+			hal_uart_puts("[elf_loader] segment mapping failed\n");
 			return -1;
 		}
 	}
@@ -240,7 +240,7 @@ int elf_loader_build_image(const void *data, size_t size,
 	for (int i = 0; i < USER_STACK_PAGES; i++) {
 		void *stack_phys = physical_memory_alloc();
 		if (!stack_phys) {
-			uart_puts("[elf_loader] stack allocation failed\n");
+			hal_uart_puts("[elf_loader] stack allocation failed\n");
 			return -1;
 		}
 		memset(PHYSICAL_TO_VIRTUAL(stack_phys), 0, PAGE_SIZE);
@@ -273,6 +273,7 @@ int elf_loader_build_image(const void *data, size_t size,
 	uint64_t user_sp = stack_top;
 
 	if (argv && argc > 0) {
+		// Step 1: push string data onto the stack (high addresses).
 		uint64_t str_user_addrs[64];
 		for (int i = argc - 1; i >= 0; i--) {
 			size_t len = strlen(argv[i]) + 1;
@@ -280,30 +281,33 @@ int elf_loader_build_image(const void *data, size_t size,
 			memcpy(top_page_virt + (user_sp - page_base), argv[i], len);
 			str_user_addrs[i] = user_sp;
 		}
+		user_sp &= ~(uint64_t)7;  // align string area to 8 bytes
 
-		user_sp &= ~(uint64_t)7;
+		// Step 2: compute the 16-byte-aligned SP for the fixed layout.
+		// _start expects:
+		//   [SP+0]                  = argc
+		//   [SP+8] .. [SP+8*argc]  = argv[0] .. argv[argc-1]
+		//   [SP+8*(argc+1)]        = NULL
+		// Total fixed slots = argc + 2 (argc value + argc pointers + NULL).
+		size_t fixed_slots = (size_t)argc + 2;
+		uint64_t target_sp = (user_sp - 8 * fixed_slots) & ~(uint64_t)15;
 
-		user_sp -= 8;
-		uint64_t *slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
-		*slot = 0;
+		// Step 3: write the layout at target_sp.
+		uint64_t *base = (uint64_t *)(top_page_virt + (target_sp - page_base));
+		base[0] = (uint64_t)argc;
+		for (int i = 0; i < argc; i++)
+			base[1 + i] = str_user_addrs[i];
+		base[1 + argc] = 0;  // NULL terminator
 
-		for (int i = argc - 1; i >= 0; i--) {
-			user_sp -= 8;
-			slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
-			*slot = str_user_addrs[i];
-		}
+		user_sp = target_sp;
 	} else {
-		user_sp &= ~(uint64_t)7;
-		user_sp -= 8;
-		uint64_t *slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
-		*slot = 0;
+		// No argv — push argc=0 and a NULL argv pointer.
+		uint64_t target_sp = (user_sp - 16) & ~(uint64_t)15;
+		uint64_t *base = (uint64_t *)(top_page_virt + (target_sp - page_base));
+		base[0] = 0;  // argc = 0
+		base[1] = 0;  // NULL (empty argv)
+		user_sp = target_sp;
 	}
-
-	user_sp -= 8;
-	uint64_t *argc_slot = (uint64_t *)(top_page_virt + (user_sp - page_base));
-	*argc_slot = (uint64_t)argc;
-
-	user_sp &= ~(uint64_t)15;
 
 	// --- Map the signal return trampoline ---
 	//
@@ -313,7 +317,7 @@ int elf_loader_build_image(const void *data, size_t size,
 	// Signal handlers return via this address (placed in LR at delivery time).
 	void *trampoline_phys = physical_memory_alloc();
 	if (!trampoline_phys) {
-		uart_puts("[elf_loader] trampoline allocation failed\n");
+		hal_uart_puts("[elf_loader] trampoline allocation failed\n");
 		return -1;
 	}
 	memset(PHYSICAL_TO_VIRTUAL(trampoline_phys), 0, PAGE_SIZE);
@@ -343,7 +347,7 @@ process_t *elf_loader_load(const void *data, size_t size,
 		page_table, entry, user_sp);
 
 	if (!process) {
-		uart_puts("[elf_loader] process creation failed\n");
+		hal_uart_puts("[elf_loader] process creation failed\n");
 		return NULL;
 	}
 

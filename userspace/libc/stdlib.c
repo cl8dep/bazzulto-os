@@ -1,11 +1,28 @@
 #include "stdlib.h"
 #include "string.h"
 
-// exit() and mmap()/munmap() are provided by userspace/library/systemcall.S;
-// forward-declare here to avoid pulling in the full syscall header.
-extern void  exit(int status) __attribute__((noreturn));
-extern void *mmap(size_t length);
-extern int   munmap(void *addr);
+#define BAZZULTO_NO_LEGACY_SYSCALL_NAMES
+#include "../library/systemcall.h"
+
+#ifdef BAZZULTO_HOST_TEST
+void sys_exit(int status)
+{
+    (void)status;
+    __builtin_trap();
+}
+
+void *sys_mmap(size_t length)
+{
+    (void)length;
+    return (void *)0;
+}
+
+int sys_munmap(void *addr)
+{
+    (void)addr;
+    return 0;
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Core conversion — strtoull
@@ -170,7 +187,7 @@ long long llabs(long long n)
 
 void abort(void)
 {
-    exit(134);  // 128 + SIGABRT(6) = conventional abort exit code
+    sys_exit(134);  // 128 + SIGABRT(6) = conventional abort exit code
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +266,7 @@ static void insertion_sort(char *base, size_t nmemb, size_t size,
 // leftover is >= MALLOC_HEADER_SIZE + MALLOC_MIN_USABLE bytes.
 // On free, the block is prepended to the free list (no coalescing — simple
 // but correct; fragmentation grows over time but is acceptable for a hobby OS).
-// New memory is requested from the kernel via mmap() in MALLOC_SLAB_PAGES
+// New memory is requested from the kernel via sys_mmap() in MALLOC_SLAB_PAGES
 // increments (currently 16 pages = 64 KB per slab request).
 // ---------------------------------------------------------------------------
 
@@ -274,7 +291,7 @@ static void *malloc_new_slab(size_t minimum_total)
     if (minimum_total > slab_bytes)
         slab_bytes = ((minimum_total + PAGE_SIZE_BYTES - 1) /
                       PAGE_SIZE_BYTES) * PAGE_SIZE_BYTES;
-    return mmap(slab_bytes);
+    return sys_mmap(slab_bytes);
 }
 
 void *malloc(size_t size)

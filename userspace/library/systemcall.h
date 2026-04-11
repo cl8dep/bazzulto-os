@@ -1,114 +1,48 @@
 #pragma once
 
-// User-space system call interface for Bazzulto OS.
-// Each function is a thin wrapper around the SVC instruction.
-// Arguments follow the AAPCS64 calling convention (x0-x5),
-// which matches the kernel's syscall register convention.
+// Raw user-space syscall interface for Bazzulto OS.
+// These functions map 1:1 to SVC instructions and return the kernel value
+// directly, including negative errno-style failures.
+//
+// Public applications should prefer userspace/libc headers. This header exists
+// for libc internals and for legacy Bazzulto tools that still talk to the raw
+// syscall layer directly.
 
 #include <stddef.h>
 #include <stdint.h>
 
-// Terminate the calling process. Does not return.
-void exit(int status) __attribute__((noreturn));
+void    sys_exit(int status) __attribute__((noreturn));
+int64_t sys_write(int fd, const char *buf, size_t len);
+int64_t sys_read(int fd, char *buf, size_t len);
+int     sys_yield(void);
+int     sys_open(const char *path);
+int     sys_close(int fd);
+int64_t sys_seek(int fd, int64_t offset, int whence);
+int     sys_spawn(const char *path, const char *const argv[]);
+int64_t sys_list(int index, char *name_buf, size_t buf_len);
+int64_t sys_wait(int pid);
+int     sys_pipe(int fds[2]);
+int     sys_dup(int oldfd);
+int     sys_dup2(int oldfd, int newfd);
+void   *sys_mmap(size_t length);
+int     sys_munmap(void *addr);
+int     sys_fork(void);
+int     sys_exec(const char *path);
+int     sys_execv(const char *path, const char *const argv[]);
+int     sys_getpid(void);
+int     sys_getppid(void);
 
-// Write up to `len` bytes from `buf` to file descriptor `fd`.
-// Returns bytes written, or -1 on error.
-int64_t write(int fd, const char *buf, size_t len);
-
-// Read up to `len` bytes into `buf` from file descriptor `fd`.
-// Returns bytes read (0 at EOF), or -1 on error.
-int64_t read(int fd, char *buf, size_t len);
-
-// Voluntarily yield the CPU to another process.
-int yield(void);
-
-// Open a file by path. Returns a file descriptor (>= 0), or -1 on error.
-int open(const char *path);
-
-// Close a file descriptor. Returns 0 on success, -1 on error.
-int close(int fd);
-
-// Reposition the read offset of a file descriptor.
-// `whence`: 0 = from start, 1 = from current, 2 = from end.
-// Returns the new offset, or -1 on error.
-int64_t seek(int fd, int64_t offset, int whence);
-
-// Spawn a new process from the executable at `path`.
-// `argv` is a NULL-terminated array of argument strings.
-// argv[0] should be the program name.
-// Pass NULL for no arguments.
-// Returns the child PID (> 0), or -1 on error.
-int spawn(const char *path, const char *const argv[]);
-
-// List a file in the filesystem by index.
-// Copies the file name into `name_buf` (null-terminated, up to `buf_len` bytes).
-// Returns the file size in bytes, or -1 if the index is out of range.
-int64_t list(int index, char *name_buf, size_t buf_len);
-
-// Block until the process with the given PID exits.
-// Returns the child's exit status (>= 0), or -1 if the PID is not found.
-int64_t wait(int pid);
-
-// Create a kernel pipe. Fills fds[0] (read end) and fds[1] (write end).
-// Returns 0 on success, -1 on error.
-int pipe(int fds[2]);
-
-// Duplicate a file descriptor to the lowest free slot >= 3.
-// Returns the new fd, or -1 on error.
-int dup(int oldfd);
-
-// Duplicate oldfd to newfd, closing newfd first if open.
-// Returns newfd on success, -1 on error.
-int dup2(int oldfd, int newfd);
-
-// Allocate `length` bytes of anonymous, zeroed memory.
-// Returns a user virtual address on success, or (void *)-1 on error.
-void *mmap(size_t length);
-
-// Release memory previously returned by mmap.
-// Returns 0 on success, -1 if the address is not a known mmap allocation.
-int munmap(void *addr);
-
-// Fork the calling process.
-// Returns the child PID (> 0) in the parent, 0 in the child, -1 on error.
-int fork(void);
-
-// Replace the current process image with the ELF at `path`.
-// On success: does not return — execution restarts at the new entry point.
-// On failure: returns -1.
-int exec(const char *path);
-
-// Replace the current process image with the ELF at `path`, passing `argv`.
-// `argv` must be a NULL-terminated array of C strings; argv[0] is the program name.
-// On success: does not return. On failure: returns -1.
-int execv(const char *path, const char *const argv[]);
-
-// Return the PID of the calling process.
-int getpid(void);
-
-// Return the PID of the calling process's parent (0 if no parent).
-int getppid(void);
-
-// POSIX-compatible time specification.
 struct timespec {
-    long long tv_sec;   // seconds
-    long long tv_nsec;  // nanoseconds [0, 999999999]
+    long long tv_sec;
+    long long tv_nsec;
 };
 
-// Clock identifiers for clock_gettime.
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
 
-// Read the current time into *tp. clock_id: CLOCK_REALTIME or CLOCK_MONOTONIC.
-// Returns 0 on success, -1 on error.
-int clock_gettime(int clock_id, struct timespec *tp);
+int sys_clock_gettime(int clock_id, struct timespec *tp);
+int sys_nanosleep(const struct timespec *req, struct timespec *rem);
 
-// Sleep for at least the duration given in *req.
-// On completion sets *rem to zero (no interrupt support).
-// Returns 0 on success, -1 on error.
-int nanosleep(const struct timespec *req, struct timespec *rem);
-
-// Signal numbers (POSIX subset).
 #define SIGHUP   1
 #define SIGINT   2
 #define SIGQUIT  3
@@ -117,15 +51,60 @@ int nanosleep(const struct timespec *req, struct timespec *rem);
 #define SIGCHLD 17
 #define SIGSTOP 19
 
-// Special handler values for sigaction().
-#define SIG_DFL  ((void (*)(int))0)   // default action
-#define SIG_IGN  ((void (*)(int))1)   // ignore
+#define SIG_DFL ((void (*)(int))0)
+#define SIG_IGN ((void (*)(int))1)
 
-// Register a signal handler for signal `signum`.
-// `handler`: SIG_DFL, SIG_IGN, or a user function pointer.
-// Returns 0 on success, -1 on invalid signum or uncatchable signal.
-int sigaction(int signum, void (*handler)(int));
+int sys_sigaction(int signum, void (*handler)(int));
+int sys_kill(int pid, int signum);
+int sys_creat(const char *path);
+int sys_unlink(const char *path);
 
-// Send signal `signum` to the process with the given PID.
-// Returns 0 on success, -1 if the process is not found or signum is invalid.
-int kill(int pid, int signum);
+struct stat {
+    unsigned long long size;
+    int                type;
+};
+
+int  sys_fstat(int fd, struct stat *st);
+void sys_set_terminal_foreground_pid(int pid);
+
+struct disk_info {
+    unsigned long long capacity_sectors;
+    unsigned long long free_clusters;
+    unsigned long long total_clusters;
+    unsigned long long bytes_per_cluster;
+    int                ready;
+};
+
+int sys_disk_info(struct disk_info *info);
+
+#ifndef BAZZULTO_NO_LEGACY_SYSCALL_NAMES
+#define exit(status) sys_exit((status))
+#define write(fd, buf, len) sys_write((fd), (buf), (len))
+#define read(fd, buf, len) sys_read((fd), (buf), (len))
+#define yield() sys_yield()
+#define open(path) sys_open((path))
+#define close(fd) sys_close((fd))
+#define seek(fd, offset, whence) sys_seek((fd), (offset), (whence))
+#define spawn(path, argv) sys_spawn((path), (argv))
+#define list(index, name_buf, buf_len) sys_list((index), (name_buf), (buf_len))
+#define wait(pid) sys_wait((pid))
+#define pipe(fds) sys_pipe((fds))
+#define dup(oldfd) sys_dup((oldfd))
+#define dup2(oldfd, newfd) sys_dup2((oldfd), (newfd))
+#define mmap(length) sys_mmap((length))
+#define munmap(addr) sys_munmap((addr))
+#define fork() sys_fork()
+#define exec(path) sys_exec((path))
+#define execv(path, argv) sys_execv((path), (argv))
+#define getpid() sys_getpid()
+#define getppid() sys_getppid()
+#define clock_gettime(clock_id, tp) sys_clock_gettime((clock_id), (tp))
+#define nanosleep(req, rem) sys_nanosleep((req), (rem))
+#define sigaction(signum, handler) sys_sigaction((signum), (handler))
+#define kill(pid, signum) sys_kill((pid), (signum))
+#define creat(path) sys_creat((path))
+#define unlink(path) sys_unlink((path))
+#define fstat(fd, st) sys_fstat((fd), (st))
+#define set_terminal_foreground_pid(pid) sys_set_terminal_foreground_pid((pid))
+#define disk_info(info) sys_disk_info((info))
+#endif

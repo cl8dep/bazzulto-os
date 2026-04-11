@@ -1,13 +1,14 @@
 #include "../../../../include/bazzulto/exceptions.h"
 #include <stdio.h>
 #include "../../../../include/bazzulto/console.h"
-#include "../../../../include/bazzulto/gic.h"
+#include "../../../../include/bazzulto/hal/hal_irq.h"
+#include "../../../../include/bazzulto/hal/hal_timer.h"
+#include "../../../../include/bazzulto/hal/hal_uart.h"
+#include "../../../../include/bazzulto/hal/hal_keyboard.h"
+#include "../../../../include/bazzulto/hal/hal_disk.h"
 #include "../../../../include/bazzulto/scheduler.h"
 #include "../../../../include/bazzulto/pid.h"
-#include "../../../../include/bazzulto/timer.h"
-#include "../../../../include/bazzulto/uart.h"
 #include "../../../../include/bazzulto/systemcall.h"
-#include "../../../../include/bazzulto/keyboard.h"
 
 // Defined in exception_vectors.S — the Assembly table we install.
 extern void exception_vectors(void);
@@ -96,12 +97,12 @@ static void print_exception_info(struct exception_frame *frame) {
               "  ELR=0x%lx [%s]  SP=0x%lx",
               frame->elr, elr_region(frame->elr), frame->sp);
     console_println(line_buf);
-    uart_puts(line_buf); uart_puts("\n");
+    hal_uart_puts(line_buf); hal_uart_puts("\n");
 
     ksnprintf(line_buf, sizeof(line_buf),
               "  ESR=0x%lx  FAR=0x%lx", frame->esr, frame->far);
     console_println(line_buf);
-    uart_puts(line_buf); uart_puts("\n");
+    hal_uart_puts(line_buf); hal_uart_puts("\n");
 
     // Decode ESR fields.
     uint32_t ec   = ESR_EC(frame->esr);
@@ -121,7 +122,7 @@ static void print_exception_info(struct exception_frame *frame) {
                   ec, ec_name(ec));
     }
     console_println(line_buf);
-    uart_puts(line_buf); uart_puts("\n");
+    hal_uart_puts(line_buf); hal_uart_puts("\n");
 }
 
 void exception_handler_sync_el1(struct exception_frame *frame) {
@@ -130,14 +131,14 @@ void exception_handler_sync_el1(struct exception_frame *frame) {
 
     switch (ec) {
         case EC_SVC_AARCH64:
-            uart_puts("WARNING: SVC from EL1 (unexpected system call in kernel)\n");
+            hal_uart_puts("WARNING: SVC from EL1 (unexpected system call in kernel)\n");
             console_println("WARNING: SVC from EL1 (unexpected system call in kernel)");
             return;
         default:
             ksnprintf(panic_buf, sizeof(panic_buf),
                       "KERNEL PANIC: %s", ec_name(ec));
             console_println(panic_buf);
-            uart_puts(panic_buf); uart_puts("\n");
+            hal_uart_puts(panic_buf); hal_uart_puts("\n");
             break;
     }
 
@@ -176,17 +177,17 @@ void exception_handler_sync_el0(struct exception_frame *frame) {
         systemcall_dispatch(frame);
         return;
     case EC_DATA_ABORT_EL0:
-        uart_puts("[kernel] killed pid: data abort from EL0\n");
+        hal_uart_puts("[kernel] killed pid: data abort from EL0\n");
         print_exception_info(frame);
         process_kill_current();
         return;
     case EC_INSN_ABORT_EL0:
-        uart_puts("[kernel] killed pid: instruction abort from EL0\n");
+        hal_uart_puts("[kernel] killed pid: instruction abort from EL0\n");
         print_exception_info(frame);
         process_kill_current();
         return;
     default:
-        uart_puts("[kernel] killed pid: unhandled exception from EL0\n");
+        hal_uart_puts("[kernel] killed pid: unhandled exception from EL0\n");
         print_exception_info(frame);
         process_kill_current();
         return;
@@ -206,34 +207,42 @@ void exception_handler_irq_el0(struct exception_frame *frame) {
 void exception_handler_irq_el1(struct exception_frame *frame) {
     (void)frame;
 
-    // Read GICC_IAR to acknowledge and get the interrupt ID.
-    // This must happen exactly ONCE per IRQ — IHI 0048B §4.4.4.
-    uint32_t iar = GICC_IAR;
-    uint32_t intid = iar & 0x3FF;
+    // Acknowledge the interrupt via the HAL — returns the interrupt ID.
+    uint32_t intid = hal_irq_acknowledge();
 
-    switch (intid) {
-    case IRQ_TIMER_EL1_PHYS:
-        timer_handle_irq();
-        scheduler_tick();
-        break;
-    case IRQ_UART0:
-        uart_irq_handler();
-        break;
-    case IRQ_SPURIOUS:
-        return;  // Do NOT write EOIR for spurious interrupts
-    default:
-        // Route to the keyboard driver if the INTID matches the virtio-input
-        // device registered during keyboard_init(). The INTID is in the range
-        // IRQ_VIRTIO_MMIO_BASE..IRQ_VIRTIO_MMIO_BASE+31 (INTID 48-79).
-        // keyboard_get_irq_intid() returns 0 if no keyboard was found, so
-        // this comparison is safe on the run-serial target.
-        if (intid == keyboard_get_irq_intid())
-            keyboard_irq_handler();
-        break;
+    // Debug: print INTID for unexpected interrupts.
+    // For known ones, skip to avoid spam.
+    int is_known = (intid == HAL_IRQ_TIMER || intid == HAL_IRQ_UART ||
+                    intid == HAL_IRQ_SPURIOUS ||
+                    intid == hal_keyboard_get_irq_id() ||
+                    intid == hal_disk_get_irq_id());
+    if (!is_known) {
+        hal_uart_puts("[irq] unexpected INTID=");
+        char ibuf[8];
+        int ilen = 0;
+        uint32_t tmp = intid;
+        if (tmp == 0) { ibuf[ilen++] = '0'; }
+        else { while (tmp > 0) { ibuf[ilen++] = '0' + (tmp % 10); tmp /= 10; } }
+        ibuf[ilen] = '\0';
+        hal_uart_puts(ibuf);
+        hal_uart_puts("\n");
     }
 
-    // Signal End of Interrupt — must write the original IAR value.
-    GICC_EOIR = iar;
+    if (intid == HAL_IRQ_TIMER) {
+        hal_timer_handle_irq();
+        scheduler_tick();
+    } else if (intid == HAL_IRQ_UART) {
+        hal_uart_irq_handler();
+    } else if (intid == HAL_IRQ_SPURIOUS) {
+        return;  // Do NOT signal EOI for spurious interrupts
+    } else if (intid == hal_keyboard_get_irq_id()) {
+        hal_keyboard_irq_handler();
+    } else if (intid == hal_disk_get_irq_id()) {
+        hal_disk_irq_handler();
+    }
+
+    // Signal End of Interrupt.
+    hal_irq_end(intid);
 }
 
 void exception_handler_unexpected(struct exception_frame *frame) {

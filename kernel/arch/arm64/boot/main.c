@@ -3,17 +3,21 @@
 #include "../../../../include/bazzulto/exceptions.h"
 #include "../../../../include/bazzulto/heap.h"
 #include "../../../../include/bazzulto/scheduler.h"
-#include "../../../../include/bazzulto/timer.h"
-#include "../../../../include/bazzulto/uart.h"
+#include "../../../../include/bazzulto/hal/hal_irq.h"
+#include "../../../../include/bazzulto/hal/hal_timer.h"
+#include "../../../../include/bazzulto/hal/hal_uart.h"
+#include "../../../../include/bazzulto/hal/hal_keyboard.h"
+#include "../../../../include/bazzulto/hal/hal_platform.h"
+#include "../../../../include/bazzulto/hal/hal_disk.h"
 #include "../../../../include/bazzulto/kernel.h"
 #include "../../../../include/bazzulto/physical_memory.h"
 #include "../../../../include/bazzulto/virtual_memory.h"
 #include "../../../../include/bazzulto/ramfs.h"
+#include "../../../../include/bazzulto/vfs_scheme.h"
 #include "../../../../include/bazzulto/elf_loader.h"
 #include "../../../../include/bazzulto/systemcall.h"
 #include "../../../../include/bazzulto/input.h"
-#include "../../../../include/bazzulto/virtio_mmio.h"
-#include "../../../../include/bazzulto/keyboard.h"
+#include "../../../../include/bazzulto/tty.h"
 #include "../../../../include/bazzulto/splash.h"
 #include "../../../../limine/limine.h"
 
@@ -141,34 +145,17 @@ void kernel_main(void) {
         }
     }
 
-    // Map GIC MMIO regions as device memory so timer_init can access them after
-    // we activate our page table. These are MMIO addresses — not RAM — so they
-    // won't appear in the Limine memory map. We must add them explicitly.
-    // GIC Distributor: 0x08000000, size 64KB (16 pages)
-    // GIC CPU Interface: 0x08010000, size 64KB (16 pages)
-    for (uint64_t page = 0; page < 16; page++) {
-        uint64_t gicd_page = 0x08000000ULL + page * PAGE_SIZE;
-        uint64_t gicc_page = 0x08010000ULL + page * PAGE_SIZE;
-        virtual_memory_map(kernel_table, hhdm_offset + gicd_page, gicd_page, PAGE_FLAGS_KERNEL_DEVICE);
-        virtual_memory_map(kernel_table, hhdm_offset + gicc_page, gicc_page, PAGE_FLAGS_KERNEL_DEVICE);
-    }
-
-    // Map PL011 UART MMIO — physical 0x09000000, one page (4KB).
-    // QEMU virt machine: first UART at this address (hw/arm/virt.c).
-    virtual_memory_map(kernel_table,
-                       hhdm_offset + 0x09000000ULL,
-                       0x09000000ULL,
-                       PAGE_FLAGS_KERNEL_DEVICE);
-
-    // Map virtio-mmio slots as device memory — physical 0x0A000000, 32 slots
-    // of 0x200 bytes each = 0x4000 bytes total = 4 pages.
-    // QEMU virt: virtio-mmio region at 0x0A000000, size 0x4000 (hw/arm/virt.c).
-    for (uint64_t page = 0; page < 4; page++) {
-        uint64_t virtio_page = VIRTIO_MMIO_BASE + page * PAGE_SIZE;
-        virtual_memory_map(kernel_table,
-                           hhdm_offset + virtio_page,
-                           virtio_page,
-                           PAGE_FLAGS_KERNEL_DEVICE);
+    // Map platform MMIO regions as device memory. The HAL provides the list
+    // of regions that need to be accessible — this replaces hardcoded addresses.
+    const hal_mmio_region_t *mmio_regions = hal_platform_mmio_regions();
+    for (int r = 0; mmio_regions[r].size != 0; r++) {
+        uint64_t base = mmio_regions[r].physical_base;
+        uint64_t end  = base + mmio_regions[r].size;
+        for (uint64_t addr = base; addr < end; addr += PAGE_SIZE) {
+            virtual_memory_map(kernel_table,
+                               hhdm_offset + addr, addr,
+                               PAGE_FLAGS_KERNEL_DEVICE);
+        }
     }
 
     // --- Step 4: activate our page table ---
@@ -180,53 +167,109 @@ void kernel_main(void) {
     heap_init();
     console_println("Heap: ok");
 
-    // --- Step 6: initialize ramfs ---
+    // --- Step 6: initialize ramfs and VFS scheme router ---
     ramfs_init();
+    vfs_scheme_init();  // initializes //ram: inode table
 
     // --- Step 7: install exception vector table ---
     exceptions_init();
 
-    // --- Step 8: initialize scheduler, timer, and UART ---
-    // Timer must init first — it sets up the GIC distributor and CPU interface.
-    // UART init depends on a working GIC to register IRQ 33.
+    // --- Step 8: initialize scheduler, HAL drivers ---
+    // hal_irq_init sets up the interrupt controller (GIC distributor + CPU interface).
+    // hal_timer_init programs the tick timer and depends on hal_irq.
+    // hal_uart_init configures the serial port and depends on hal_irq.
     scheduler_init();
-    timer_init();
+    hal_irq_init();
+    hal_timer_init();
 
-    uart_init();
-    uart_puts("UART: ok\n");
+    hal_uart_init();
+    hal_uart_puts("UART: ok\n");
     console_println("UART: ok");
 
     // Initialize the input abstraction layer before any driver that feeds it.
     input_init();
 
-    // Enumerate virtio-mmio devices so keyboard_init() can find the input device.
-    virtio_mmio_enumerate();
+    // Initialize the TTY layer (line discipline) between keyboard/UART and processes.
+    tty_init();
 
-    // Initialize the virtio-input keyboard driver. Safe to call when no
-    // keyboard device is present (QEMU run-serial target) — logs a warning
-    // and continues with serial-only input via the UART IRQ path.
-    keyboard_init();
+    // Platform-specific post-heap init (e.g. virtio bus enumeration).
+    hal_platform_init();
+
+    // Initialize the keyboard driver. Safe to call when no keyboard device is
+    // present (QEMU run-serial target) — logs a warning and continues.
+    hal_keyboard_init();
+
+    // Initialize the block device driver (virtio-blk for disk I/O).
+    hal_disk_init();
+
+    // Initialize FAT32 filesystem (depends on hal_disk being ready).
+    extern int fat32_init(void);
+    if (fat32_init() < 0) {
+        hal_uart_puts("[main] FAT32 not available\n");
+    }
 
     // Enable TTBR0 page table walks for user-space processes.
     virtual_memory_enable_user();
 
     // Register all ELF programs in ramfs.
-    extern char _user_hello_elf_start[], _user_hello_elf_end[];
-    extern char _user_shell_elf_start[], _user_shell_elf_end[];
-    extern char _user_ls_elf_start[],    _user_ls_elf_end[];
-    extern char _user_help_elf_start[],  _user_help_elf_end[];
-    extern char _user_echo_elf_start[],  _user_echo_elf_end[];
+    extern char _user_hello_elf_start[],   _user_hello_elf_end[];
+    extern char _user_shell_elf_start[],   _user_shell_elf_end[];
+    extern char _user_ls_elf_start[],      _user_ls_elf_end[];
+    extern char _user_help_elf_start[],    _user_help_elf_end[];
+    extern char _user_echo_elf_start[],    _user_echo_elf_end[];
+    extern char _user_cat_elf_start[],     _user_cat_elf_end[];
+    extern char _user_wc_elf_start[],      _user_wc_elf_end[];
+    extern char _user_grep_elf_start[],    _user_grep_elf_end[];
+    extern char _user_head_elf_start[],    _user_head_elf_end[];
+    extern char _user_hexdump_elf_start[], _user_hexdump_elf_end[];
+    extern char _user_sleep_elf_start[],   _user_sleep_elf_end[];
+    extern char _user_kill_elf_start[],    _user_kill_elf_end[];
+    extern char _user_cp_elf_start[],      _user_cp_elf_end[];
+    extern char _user_rm_elf_start[],      _user_rm_elf_end[];
+    extern char _user_touch_elf_start[],   _user_touch_elf_end[];
+    extern char _user_tee_elf_start[],     _user_tee_elf_end[];
+    extern char _user_ps_elf_start[],      _user_ps_elf_end[];
+    extern char _user_df_elf_start[],      _user_df_elf_end[];
+    extern char _user_mount_elf_start[],   _user_mount_elf_end[];
 
-    ramfs_register("/bin/hello", _user_hello_elf_start,
-                   _user_hello_elf_end - _user_hello_elf_start);
-    ramfs_register("/bin/shell", _user_shell_elf_start,
-                   _user_shell_elf_end - _user_shell_elf_start);
-    ramfs_register("/bin/ls", _user_ls_elf_start,
-                   _user_ls_elf_end - _user_ls_elf_start);
-    ramfs_register("/bin/help", _user_help_elf_start,
-                   _user_help_elf_end - _user_help_elf_start);
-    ramfs_register("/bin/echo", _user_echo_elf_start,
-                   _user_echo_elf_end - _user_echo_elf_start);
+    ramfs_register("/bin/hello",   _user_hello_elf_start,
+                   _user_hello_elf_end   - _user_hello_elf_start);
+    ramfs_register("/bin/shell",   _user_shell_elf_start,
+                   _user_shell_elf_end   - _user_shell_elf_start);
+    ramfs_register("/bin/ls",      _user_ls_elf_start,
+                   _user_ls_elf_end      - _user_ls_elf_start);
+    ramfs_register("/bin/help",    _user_help_elf_start,
+                   _user_help_elf_end    - _user_help_elf_start);
+    ramfs_register("/bin/echo",    _user_echo_elf_start,
+                   _user_echo_elf_end    - _user_echo_elf_start);
+    ramfs_register("/bin/cat",     _user_cat_elf_start,
+                   _user_cat_elf_end     - _user_cat_elf_start);
+    ramfs_register("/bin/wc",      _user_wc_elf_start,
+                   _user_wc_elf_end      - _user_wc_elf_start);
+    ramfs_register("/bin/grep",    _user_grep_elf_start,
+                   _user_grep_elf_end    - _user_grep_elf_start);
+    ramfs_register("/bin/head",    _user_head_elf_start,
+                   _user_head_elf_end    - _user_head_elf_start);
+    ramfs_register("/bin/hexdump", _user_hexdump_elf_start,
+                   _user_hexdump_elf_end - _user_hexdump_elf_start);
+    ramfs_register("/bin/sleep",   _user_sleep_elf_start,
+                   _user_sleep_elf_end   - _user_sleep_elf_start);
+    ramfs_register("/bin/kill",    _user_kill_elf_start,
+                   _user_kill_elf_end    - _user_kill_elf_start);
+    ramfs_register("/bin/cp",      _user_cp_elf_start,
+                   _user_cp_elf_end      - _user_cp_elf_start);
+    ramfs_register("/bin/rm",      _user_rm_elf_start,
+                   _user_rm_elf_end      - _user_rm_elf_start);
+    ramfs_register("/bin/touch",   _user_touch_elf_start,
+                   _user_touch_elf_end   - _user_touch_elf_start);
+    ramfs_register("/bin/tee",     _user_tee_elf_start,
+                   _user_tee_elf_end     - _user_tee_elf_start);
+    ramfs_register("/bin/ps",      _user_ps_elf_start,
+                   _user_ps_elf_end      - _user_ps_elf_start);
+    ramfs_register("/bin/df",      _user_df_elf_start,
+                   _user_df_elf_end      - _user_df_elf_start);
+    ramfs_register("/bin/mount",   _user_mount_elf_start,
+                   _user_mount_elf_end   - _user_mount_elf_start);
 
     // Launch the shell as the initial user-mode process (the init process).
     // Register its PID as the orphan reaper before starting the scheduler so
@@ -245,7 +288,7 @@ void kernel_main(void) {
         }
     }
 
-    splash_display(shell_pid, keyboard_get_irq_intid());
+    splash_display(shell_pid, hal_keyboard_get_irq_id());
     scheduler_start();  // does not return
 
     console_println("Kernel initialized. Halting.");

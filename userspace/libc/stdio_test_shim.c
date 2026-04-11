@@ -14,7 +14,7 @@
 
 // Internal stub — only used by the stdio.c code compiled below.
 // Named differently from write() so it doesn't intercept the test's output.
-static int64_t bz_write_stub(int fd, const char *buf, size_t len)
+static int64_t bz_write_stub(int fd, const void *buf, size_t len)
 {
     (void)fd; (void)buf; (void)len;
     return (int64_t)len;

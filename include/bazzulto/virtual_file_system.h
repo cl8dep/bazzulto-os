@@ -14,13 +14,21 @@
 typedef enum {
     FD_TYPE_NONE,       // Slot is unused
     FD_TYPE_CONSOLE,    // stdin/stdout/stderr — backed by UART
-    FD_TYPE_FILE,       // Regular file backed by ramfs
+    FD_TYPE_FILE,       // Regular file backed by ramfs (read-only)
     FD_TYPE_PIPE_READ,  // Read end of a pipe
     FD_TYPE_PIPE_WRITE, // Write end of a pipe
+    FD_TYPE_RAM_FILE,   // Writable file in the //ram: in-memory filesystem
+    FD_TYPE_PROC,       // Read-only snapshot buffer from //proc:<pid>/ driver
+    FD_TYPE_DEV_NULL,   // /dev/null — reads return 0, writes discarded
+    FD_TYPE_DEV_ZERO,   // /dev/zero — reads return zero bytes
+    FD_TYPE_DEV_RANDOM, // /dev/random — reads return pseudorandom bytes
+    FD_TYPE_DISK_FILE,  // Read-only file on the FAT32 disk (//disk:)
 } fd_type_t;
 
-// Forward declaration — the actual struct is in ramfs.h.
+// Forward declarations.
 struct ramfs_file;
+struct ram_inode;
+struct disk_file;       // FAT32 open file state
 
 // Kernel pipe ring buffer. Allocated on the heap; shared via ref_count.
 // Both ends of the pipe (read FD and write FD) point to the same pipe_buffer.
@@ -29,18 +37,37 @@ typedef struct {
     uint8_t  data[PIPE_BUFFER_SIZE]; // circular buffer
     uint32_t read_pos;               // index of next byte to read
     uint32_t count;                  // bytes currently available to read
-    int      ref_count;              // number of FDs pointing to this buffer
+    int      ref_count;              // total number of FDs pointing to this buffer
+    int      read_ref_count;         // number of open read-end FDs
+                                     // when this reaches 0, writers get broken pipe
 } pipe_buffer_t;
+
+// Proc snapshot buffer — pre-filled at open time, read sequentially.
+#define PROC_SNAPSHOT_SIZE 512
+
+typedef struct {
+    char   buf[PROC_SNAPSHOT_SIZE];
+    size_t size;
+} proc_snapshot_t;
 
 // A single open file descriptor.
 typedef struct {
     fd_type_t type;
     union {
-        const struct ramfs_file *file; // Non-NULL only for FD_TYPE_FILE
-        pipe_buffer_t           *pipe; // Non-NULL for FD_TYPE_PIPE_*
+        const struct ramfs_file *file;     // FD_TYPE_FILE
+        pipe_buffer_t           *pipe;     // FD_TYPE_PIPE_*
+        struct ram_inode        *ram_file; // FD_TYPE_RAM_FILE
+        proc_snapshot_t         *proc;     // FD_TYPE_PROC
+        struct disk_file        *disk_file;// FD_TYPE_DISK_FILE
     };
-    size_t offset; // Current read position (FD_TYPE_FILE only)
+    size_t offset; // Current read/write position
 } file_descriptor_t;
+
+// Minimal stat structure (fstat syscall result).
+struct vfs_stat {
+    uint64_t size;    // file size in bytes
+    int      type;    // 0 = regular file
+};
 
 // Initialize a process's file descriptor table.
 // Opens fd 0 (stdin), 1 (stdout), 2 (stderr) as FD_TYPE_CONSOLE.
@@ -87,6 +114,19 @@ int virtual_file_system_dup(file_descriptor_t *fds, int oldfd);
 // Duplicate fd oldfd to a specific slot newfd, closing newfd first if open.
 // Returns newfd on success, -1 on error.
 int virtual_file_system_dup2(file_descriptor_t *fds, int oldfd, int newfd);
+
+// Create or truncate a file for writing. Returns fd >= 0, or -1 on error.
+// Only writable schemes (//ram:) support creation; //system: returns -1.
+int virtual_file_system_creat(file_descriptor_t *fds, const char *path);
+
+// Delete a file by path. Returns 0 on success, -1 on error.
+// Only writable schemes support deletion.
+int virtual_file_system_unlink(const char *path);
+
+// Fill *stat_out with size information for the given fd.
+// Returns 0 on success, -1 on error.
+int virtual_file_system_fstat(file_descriptor_t *fds, int fd,
+                               struct vfs_stat *stat_out);
 
 // Seek whence constants.
 #define VIRTUAL_FILE_SYSTEM_SEEK_SET 0 // Absolute position

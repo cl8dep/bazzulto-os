@@ -28,131 +28,162 @@
 
 .text
 
-.global exit
-exit:
+.global sys_exit
+sys_exit:
     svc #0
     b .             // unreachable — kernel never returns from SYS_EXIT
 
-.global write
-write:
+.global sys_write
+sys_write:
     svc #1
     ret
 
-.global read
-read:
+.global sys_read
+sys_read:
     svc #2
     ret
 
-.global yield
-yield:
+.global sys_yield
+sys_yield:
     svc #3
     ret
 
-.global open
-open:
+.global sys_open
+sys_open:
     svc #4
     ret
 
-.global close
-close:
+.global sys_close
+sys_close:
     svc #5
     ret
 
-.global seek
-seek:
+.global sys_seek
+sys_seek:
     svc #6
     ret
 
-.global spawn
-spawn:
+.global sys_spawn
+sys_spawn:
     svc #7
     ret
 
-.global list
-list:
+.global sys_list
+sys_list:
     svc #8
     ret
 
-.global wait
-wait:
+.global sys_wait
+sys_wait:
     svc #9
     ret
 
-.global pipe
-pipe:
+.global sys_pipe
+sys_pipe:
     svc #10
     ret
 
-.global dup
-dup:
+.global sys_dup
+sys_dup:
     svc #11
     ret
 
-.global dup2
-dup2:
+.global sys_dup2
+sys_dup2:
     svc #12
     ret
 
-.global mmap
-mmap:
+.global sys_mmap
+sys_mmap:
     svc #13
     ret
 
-.global munmap
-munmap:
+.global sys_munmap
+sys_munmap:
     svc #14
     ret
 
-.global fork
-fork:
+.global sys_fork
+sys_fork:
     svc #15
     ret
 
 // exec(path): x0=path, x1 must be 0 (no argv — kernel uses {path}).
 // Without the explicit zero, x1 contains whatever the caller had, which the
 // kernel would misinterpret as a user argv pointer.
-.global exec
-exec:
+.global sys_exec
+sys_exec:
     mov x1, #0
     svc #16
     ret
 
 // execv(path, argv): x0=path, x1=argv (NULL-terminated string array).
-.global execv
-execv:
+.global sys_execv
+sys_execv:
     svc #16
     ret
 
-.global getpid
-getpid:
+.global sys_getpid
+sys_getpid:
     svc #17
     ret
 
-.global getppid
-getppid:
+.global sys_getppid
+sys_getppid:
     svc #18
     ret
 
 // clock_gettime(clock_id, tp): x0=clock_id, x1=tp.
-.global clock_gettime
-clock_gettime:
+.global sys_clock_gettime
+sys_clock_gettime:
     svc #19
     ret
 
 // nanosleep(req, rem): x0=req, x1=rem.
-.global nanosleep
-nanosleep:
+.global sys_nanosleep
+sys_nanosleep:
     svc #20
     ret
 
 // sigaction(signum, handler): x0=signum, x1=handler_va.
-.global sigaction
-sigaction:
+.global sys_sigaction
+sys_sigaction:
     svc #21
     ret
 
 // kill(pid, signum): x0=pid, x1=signum.
-.global kill
-kill:
+.global sys_kill
+sys_kill:
     svc #22
+    ret
+
+// creat(path): x0=path.
+.global sys_creat
+sys_creat:
+    svc #24
+    ret
+
+// unlink(path): x0=path.
+.global sys_unlink
+sys_unlink:
+    svc #25
+    ret
+
+// fstat(fd, stat): x0=fd, x1=stat.
+.global sys_fstat
+sys_fstat:
+    svc #26
+    ret
+
+// set_terminal_foreground_pid(pid): x0=pid.
+.global sys_set_terminal_foreground_pid
+sys_set_terminal_foreground_pid:
+    svc #27
+    ret
+
+// disk_info(info): x0=pointer to struct disk_info.
+// Returns 0 on success, -1 on error.
+.global sys_disk_info
+sys_disk_info:
+    svc #28
     ret

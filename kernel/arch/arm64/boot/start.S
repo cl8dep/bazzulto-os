@@ -29,7 +29,11 @@ _start:
     msr spsel, #1
 
     // Set up the kernel stack. Now that SPSel=1, `mov sp` writes SP_EL1.
-    adr x9, stack_top
+    // Use ADRP+ADD instead of ADR: ADR only reaches ±1 MB from the PC,
+    // but the embedded user-program blobs in .rodata may push .bss beyond
+    // that range. ADRP+ADD covers the full ±4 GB page-table range.
+    adrp x9, stack_top
+    add  x9, x9, :lo12:stack_top
     mov sp, x9
 
     // Clear the frame pointer so stack traces stop here.

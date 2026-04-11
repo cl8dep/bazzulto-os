@@ -62,6 +62,8 @@ struct process {
     // signal_handlers[N]: 0 = SIG_DFL (default), 1 = SIG_IGN, else = user handler VA.
     uint64_t        pending_signals;
     uint64_t        signal_handlers[32];
+    // Human-readable process name, set on spawn/exec. Used by //proc:<pid>/status.
+    char            name[16];
     process_t      *next;               // next process in the circular run queue
     process_t      *wait_next;          // next process in a wait queue (NULL if not waiting)
 };
@@ -160,3 +162,9 @@ void scheduler_free_user_address_space(process_t *process);
 // The parent's syscall return value (frame->x0) is set to the child PID
 // by sys_fork before this function returns.
 uint16_t scheduler_fork_process(struct exception_frame *parent_frame);
+
+// Set / get the terminal foreground process PID.
+// The shell calls set before wait() and passes 0 after.
+// The input layer calls send_sigint_to_foreground when Ctrl+C is pressed.
+void scheduler_set_foreground_pid(uint16_t pid);
+void scheduler_send_signal_to_foreground(int signum);
