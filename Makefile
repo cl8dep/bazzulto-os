@@ -239,6 +239,34 @@ FORCE:
 
 USER_PROGRAM_OBJECTS := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p).o userspace/$(p)/$(p).elf)
 
+# --- Rust kernel targets ---
+RUST_DIR  := rust
+RUST_ELF  := rust/target/aarch64-unknown-none/debug/bazzulto
+
+.PHONY: rust rust-release run-rust
+
+rust:
+	cd $(RUST_DIR) && . ~/.cargo/env && cargo build
+
+rust-release:
+	cd $(RUST_DIR) && . ~/.cargo/env && cargo build --release
+
+run-rust: rust
+	cp $(RUST_ELF) esp/bazzulto.elf
+	$(QEMU) \
+	    -machine virt \
+	    -cpu cortex-a72 \
+	    -m 1G \
+	    -bios $(UEFI_FW) \
+	    -drive file=fat:rw:esp,format=raw \
+	    -device ramfb \
+	    -display cocoa \
+	    -monitor none \
+	    -serial stdio \
+	    -parallel none
+
+# ---------------------------------------------------------------------------
+
 clean:
 	rm -f $(KERNEL_OBJECTS) $(USER_LIB_OBJECTS) $(USER_ELF_EMBEDS) \
 	      $(USER_PROGRAM_OBJECTS) \
