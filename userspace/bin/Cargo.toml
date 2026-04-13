@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "bzinit",
+    "bzctl",
+    "bzdisplayd",
+    "fontmanager",
+    "bzsh",
+    "coreutils",
+]
+
+resolver = "2"
+
+[profile.dev]
+panic = "abort"

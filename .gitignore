@@ -25,6 +25,9 @@ kernel/target/
 # Cargo build output — userspace / BSL workspace
 userspace/bin/target/
 
+# Cargo build output — all BSL library crates (includes rustdoc HTML under target/doc/)
+userspace/lib/**/target/
+
 # Internal tools — not tracked in the repository
 tools/
 
@@ -40,6 +43,9 @@ docs/mkdocs/
 
 # Wiki is a separate git repository (GitHub Wiki clone), not tracked here
 docs/wiki/
+
+# Reference PDFs — large binary files, not tracked in git
+docs/*.pdf
 
 # MkDocs Python virtualenv / dependencies
 docs/requirements.txt.lock

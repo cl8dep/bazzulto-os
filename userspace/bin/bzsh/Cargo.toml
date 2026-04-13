@@ -1,0 +1,17 @@
+[package]
+name    = "bzsh"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bzsh"
+path = "src/main.rs"
+
+[dependencies]
+bazzulto-system = { path = "../../lib/bsl/Bazzulto.System" }
+
+[profile.release]
+panic     = "abort"
+opt-level = "s"
+lto       = true
+strip     = true

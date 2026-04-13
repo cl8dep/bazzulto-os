@@ -1,0 +1,20 @@
+# Bazzulto dynamic linker configuration.
+# Read by the BDL loader to resolve library search paths.
+
+[search_paths]
+primary = [
+    "/system/lib/bazzukto/2.0",
+    "/system/lib",
+]
+
+# Per-user overrides — checked after primary paths.
+user = [
+    "/home/user/.lib",
+]
+
+# POSIX compat aliases — maps legacy paths to Bazzulto locations.
+[compat_paths]
+"/usr/lib"       = "/home/user/.lib"
+"/usr/local/lib" = "/home/user/.lib"
+"/lib64"         = "/system/lib"
+"/lib"           = "/system/lib"

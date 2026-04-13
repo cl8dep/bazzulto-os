@@ -1,0 +1,232 @@
+site_name: Bazzulto OS
+site_description: Bazzulto Standard Library — API Reference
+site_url: https://bazzulto.github.io/so/
+repo_url: https://github.com/bazzulto/so
+repo_name: bazzulto/so
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.inlinehilite
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - tables
+
+extra_css:
+  - stylesheets/sidebar-filter.css
+
+extra_javascript:
+  - javascripts/sidebar-filter.js
+
+hooks:
+  - docs/hooks.py
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Guides:
+    - Getting Started: guides/getting-started.md
+    - Code Examples: guides/code-examples.md
+  - API Reference:
+    - Overview: api/index.md
+    - Bazzulto.Display:
+      - Overview: api/Bazzulto.Display/index.md
+      - color:
+        - Overview: api/Bazzulto.Display/color/index.md
+        - Color: api/Bazzulto.Display/color/Color.md
+        - ColorF: api/Bazzulto.Display/color/ColorF.md
+      - ffi:
+        - Overview: api/Bazzulto.Display/ffi/index.md
+        - BzSurface: api/Bazzulto.Display/ffi/BzSurface.md
+        - BzScreenInfo: api/Bazzulto.Display/ffi/BzScreenInfo.md
+        - BzRect: api/Bazzulto.Display/ffi/BzRect.md
+      - font_manager:
+        - Overview: api/Bazzulto.Display/font_manager/index.md
+        - FontWeight: api/Bazzulto.Display/font_manager/FontWeight.md
+        - FontStyle: api/Bazzulto.Display/font_manager/FontStyle.md
+        - FontVariant: api/Bazzulto.Display/font_manager/FontVariant.md
+        - FontId: api/Bazzulto.Display/font_manager/FontId.md
+        - GlyphBitmap: api/Bazzulto.Display/font_manager/GlyphBitmap.md
+        - FontManager: api/Bazzulto.Display/font_manager/FontManager.md
+        - load_font_bytes: api/Bazzulto.Display/font_manager/load_font_bytes.md
+        - rasterize: api/Bazzulto.Display/font_manager/rasterize.md
+        - fallback_font_id: api/Bazzulto.Display/font_manager/fallback_font_id.md
+        - ascender_pixels: api/Bazzulto.Display/font_manager/ascender_pixels.md
+        - font_count: api/Bazzulto.Display/font_manager/font_count.md
+        - font_info: api/Bazzulto.Display/font_manager/font_info.md
+        - FontError: api/Bazzulto.Display/font_manager/FontError.md
+        - read_file: api/Bazzulto.Display/font_manager/read_file.md
+      - geometry:
+        - Overview: api/Bazzulto.Display/geometry/index.md
+        - Point: api/Bazzulto.Display/geometry/Point.md
+        - Size: api/Bazzulto.Display/geometry/Size.md
+        - Rect: api/Bazzulto.Display/geometry/Rect.md
+      - screen:
+        - Overview: api/Bazzulto.Display/screen/index.md
+        - Screen: api/Bazzulto.Display/screen/Screen.md
+      - surface:
+        - Overview: api/Bazzulto.Display/surface/index.md
+        - Surface: api/Bazzulto.Display/surface/Surface.md
+    - Bazzulto.IO:
+      - Overview: api/Bazzulto.IO/index.md
+      - directory:
+        - Overview: api/Bazzulto.IO/directory/index.md
+        - read_dir: api/Bazzulto.IO/directory/read_dir.md
+        - Directory: api/Bazzulto.IO/directory/Directory.md
+      - file:
+        - Overview: api/Bazzulto.IO/file/index.md
+        - File: api/Bazzulto.IO/file/File.md
+        - unlink: api/Bazzulto.IO/file/unlink.md
+      - path:
+        - Overview: api/Bazzulto.IO/path/index.md
+        - Path: api/Bazzulto.IO/path/Path.md
+      - stream:
+        - Overview: api/Bazzulto.IO/stream/index.md
+        - Stream: api/Bazzulto.IO/stream/Stream.md
+        - stdin: api/Bazzulto.IO/stream/stdin.md
+        - stdout: api/Bazzulto.IO/stream/stdout.md
+        - stderr: api/Bazzulto.IO/stream/stderr.md
+    - Bazzulto.System:
+      - Overview: api/Bazzulto.System/index.md
+      - alloc_impl:
+        - Overview: api/Bazzulto.System/alloc_impl/index.md
+        - BazzultoAllocator: api/Bazzulto.System/alloc_impl/BazzultoAllocator.md
+      - console:
+        - Overview: api/Bazzulto.System/console/index.md
+        - Color: api/Bazzulto.System/console/Color.md
+        - KeyInfo: api/Bazzulto.System/console/KeyInfo.md
+        - Console: api/Bazzulto.System/console/Console.md
+      - diagnostics:
+        - Overview: api/Bazzulto.System/diagnostics/index.md
+        - Stopwatch: api/Bazzulto.System/diagnostics/Stopwatch.md
+        - Diagnostics: api/Bazzulto.System/diagnostics/Diagnostics.md
+        - DiagProcess: api/Bazzulto.System/diagnostics/DiagProcess.md
+      - environment:
+        - Overview: api/Bazzulto.System/environment/index.md
+        - Environment: api/Bazzulto.System/environment/Environment.md
+      - info:
+        - Overview: api/Bazzulto.System/info/index.md
+        - Info: api/Bazzulto.System/info/Info.md
+      - memory:
+        - Overview: api/Bazzulto.System/memory/index.md
+        - Protection: api/Bazzulto.System/memory/Protection.md
+        - MapFlags: api/Bazzulto.System/memory/MapFlags.md
+        - MemoryMap: api/Bazzulto.System/memory/MemoryMap.md
+        - Memory: api/Bazzulto.System/memory/Memory.md
+        - page_size: api/Bazzulto.System/memory/page_size.md
+        - usage: api/Bazzulto.System/memory/usage.md
+        - available: api/Bazzulto.System/memory/available.md
+      - process:
+        - Overview: api/Bazzulto.System/process/index.md
+        - Pipe: api/Bazzulto.System/process/Pipe.md
+        - ProcessBuilder: api/Bazzulto.System/process/ProcessBuilder.md
+        - SpawnedProcess: api/Bazzulto.System/process/SpawnedProcess.md
+        - CurrentProcess: api/Bazzulto.System/process/CurrentProcess.md
+        - Process: api/Bazzulto.System/process/Process.md
+        - exit: api/Bazzulto.System/process/exit.md
+        - getpid: api/Bazzulto.System/process/getpid.md
+        - getppid: api/Bazzulto.System/process/getppid.md
+        - fork: api/Bazzulto.System/process/fork.md
+        - exec: api/Bazzulto.System/process/exec.md
+        - spawn: api/Bazzulto.System/process/spawn.md
+        - wait: api/Bazzulto.System/process/wait.md
+        - kill: api/Bazzulto.System/process/kill.md
+      - raw:
+        - Overview: api/Bazzulto.System/raw/index.md
+        - raw_exit: api/Bazzulto.System/raw/raw_exit.md
+        - raw_write: api/Bazzulto.System/raw/raw_write.md
+        - raw_read: api/Bazzulto.System/raw/raw_read.md
+        - raw_yield: api/Bazzulto.System/raw/raw_yield.md
+        - raw_open: api/Bazzulto.System/raw/raw_open.md
+        - raw_close: api/Bazzulto.System/raw/raw_close.md
+        - raw_seek: api/Bazzulto.System/raw/raw_seek.md
+        - raw_spawn: api/Bazzulto.System/raw/raw_spawn.md
+        - raw_spawn_with_capabilities: api/Bazzulto.System/raw/raw_spawn_with_capabilities.md
+        - raw_list: api/Bazzulto.System/raw/raw_list.md
+        - raw_wait: api/Bazzulto.System/raw/raw_wait.md
+        - raw_pipe: api/Bazzulto.System/raw/raw_pipe.md
+        - raw_dup: api/Bazzulto.System/raw/raw_dup.md
+        - raw_dup2: api/Bazzulto.System/raw/raw_dup2.md
+        - raw_mmap: api/Bazzulto.System/raw/raw_mmap.md
+        - raw_munmap: api/Bazzulto.System/raw/raw_munmap.md
+        - raw_fork: api/Bazzulto.System/raw/raw_fork.md
+        - raw_exec: api/Bazzulto.System/raw/raw_exec.md
+        - raw_getpid: api/Bazzulto.System/raw/raw_getpid.md
+        - raw_getppid: api/Bazzulto.System/raw/raw_getppid.md
+        - raw_clock_gettime: api/Bazzulto.System/raw/raw_clock_gettime.md
+        - raw_nanosleep: api/Bazzulto.System/raw/raw_nanosleep.md
+        - raw_sigaction: api/Bazzulto.System/raw/raw_sigaction.md
+        - raw_kill: api/Bazzulto.System/raw/raw_kill.md
+        - raw_creat: api/Bazzulto.System/raw/raw_creat.md
+        - raw_creat_append: api/Bazzulto.System/raw/raw_creat_append.md
+        - raw_unlink: api/Bazzulto.System/raw/raw_unlink.md
+        - raw_setfgpid: api/Bazzulto.System/raw/raw_setfgpid.md
+        - raw_getcwd: api/Bazzulto.System/raw/raw_getcwd.md
+        - raw_mkdir: api/Bazzulto.System/raw/raw_mkdir.md
+        - raw_getdents64: api/Bazzulto.System/raw/raw_getdents64.md
+        - raw_chdir: api/Bazzulto.System/raw/raw_chdir.md
+        - raw_getrusage: api/Bazzulto.System/raw/raw_getrusage.md
+        - raw_framebuffer_map: api/Bazzulto.System/raw/raw_framebuffer_map.md
+        - raw_umask: api/Bazzulto.System/raw/raw_umask.md
+        - raw_sigaltstack: api/Bazzulto.System/raw/raw_sigaltstack.md
+        - raw_alarm: api/Bazzulto.System/raw/raw_alarm.md
+        - raw_machine_reboot: api/Bazzulto.System/raw/raw_machine_reboot.md
+        - raw_machine_poweroff: api/Bazzulto.System/raw/raw_machine_poweroff.md
+      - signal:
+        - Overview: api/Bazzulto.System/signal/index.md
+        - Signal: api/Bazzulto.System/signal/Signal.md
+        - SigAction: api/Bazzulto.System/signal/SigAction.md
+        - sigaction: api/Bazzulto.System/signal/sigaction.md
+      - thread:
+        - Overview: api/Bazzulto.System/thread/index.md
+        - ThreadId: api/Bazzulto.System/thread/ThreadId.md
+        - Thread: api/Bazzulto.System/thread/Thread.md
+        - CurrentThread: api/Bazzulto.System/thread/CurrentThread.md
+        - ThreadHandle: api/Bazzulto.System/thread/ThreadHandle.md
+        - ThreadPool: api/Bazzulto.System/thread/ThreadPool.md
+      - time:
+        - Overview: api/Bazzulto.System/time/index.md
+        - Duration: api/Bazzulto.System/time/Duration.md
+        - Instant: api/Bazzulto.System/time/Instant.md
+        - SystemTime: api/Bazzulto.System/time/SystemTime.md
+        - Time: api/Bazzulto.System/time/Time.md
+        - DateTime: api/Bazzulto.System/time/DateTime.md
+        - now: api/Bazzulto.System/time/now.md
+        - utc_now: api/Bazzulto.System/time/utc_now.md
+        - today: api/Bazzulto.System/time/today.md
+        - ClockId: api/Bazzulto.System/time/ClockId.md
+        - TimeSpec: api/Bazzulto.System/time/TimeSpec.md
+        - clock_gettime: api/Bazzulto.System/time/clock_gettime.md
+        - nanosleep: api/Bazzulto.System/time/nanosleep.md

@@ -1,0 +1,8 @@
+[Service]
+name              = "bzdisplayd"
+binary            = "/system/bin/bzdisplayd"
+after             = []
+restart           = "always"
+max_retries       = "0"
+capabilities      = ["display"]
+is_display_server = "true"

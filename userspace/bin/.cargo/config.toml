@@ -1,0 +1,2 @@
+[target.aarch64-unknown-none]
+rustflags = ["-C", "link-arg=-T/Users/cl8dep/Documents/Development/so/userspace/bin/bsl.ld"]

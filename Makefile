@@ -1,276 +1,244 @@
-# Bazzulto OS build system
+# Bazzulto OS — top-level build system
 
-# --- Toolchain ---
-CC      := aarch64-elf-gcc
-AS      := aarch64-elf-gcc   # GCC can assemble .S files directly
-LD      := aarch64-elf-ld
+# ---------------------------------------------------------------------------
+# Toolchain
+# ---------------------------------------------------------------------------
 
-# --- Kernel flags ---
-# -ffreestanding: no standard library, no OS assumed
-# -fno-stack-protector: stack canaries require libc support we don't have
-# -mgeneral-regs-only: avoid SIMD/FP registers in kernel (they need extra save/restore)
-# -Wall -Wextra: catch common mistakes early
-CFLAGS  := -std=c11 -ffreestanding -fno-stack-protector -fno-pic \
-           -mgeneral-regs-only -Wall -Wextra \
-           -I./include -I./include/libc
+CARGO        := ~/.cargo/bin/cargo
+QEMU         := qemu-system-aarch64
+XORRISO      := xorriso
+UEFI_FW      := /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+ISO          := bazzulto.iso
 
-ASFLAGS := -ffreestanding
+# ---------------------------------------------------------------------------
+# Targets (BSL = Rust userspace workspace)
+# ---------------------------------------------------------------------------
 
-LDFLAGS := -nostdlib -static \
-           -T kernel/arch/arm64/linker.ld
+BSL_TARGET   := aarch64-unknown-none
+BSL_MANIFEST := userspace/bin/Cargo.toml
+KERNEL_DIR   := kernel
+KERNEL_ELF   := kernel/target/$(BSL_TARGET)/debug/bazzulto
+KERNEL_ELF_R := kernel/target/$(BSL_TARGET)/release/bazzulto
 
-# --- User-space flags ---
-USER_CFLAGS  := -std=c11 -ffreestanding -fno-stack-protector -fno-pic \
-                -mgeneral-regs-only -Wall -Wextra \
-                -I./userspace/libc
-USER_LDFLAGS := -nostdlib -static -T userspace/library/linker.ld
+# ---------------------------------------------------------------------------
+# Userspace binary paths (release build, aarch64-unknown-none)
+# ---------------------------------------------------------------------------
 
-# --- Platform selection ---
-PLATFORM ?= qemu_virt
-PLATFORM_DIR := kernel/platform/$(PLATFORM)
+BSL_BIN_DIR := userspace/bin/target/$(BSL_TARGET)/release
+BSL_SVC_DIR := userspace/services
+BSL_FONT_DIR := userspace/fonts
 
-# --- Kernel sources ---
-C_SOURCES := \
-    kernel/arch/arm64/boot/main.c \
-    kernel/arch/arm64/exceptions/exceptions.c \
-    kernel/drivers/console/console.c \
-    kernel/drivers/console/font_latin_extended.c \
-    kernel/memory/physical_memory.c \
-    kernel/memory/virtual_memory.c \
-    kernel/memory/heap.c \
-    kernel/scheduler/scheduler.c \
-    kernel/scheduler/waitqueue.c \
-    kernel/scheduler/pid.c \
-    kernel/arch/arm64/systemcall/systemcall.c \
-    kernel/filesystem/ramfs.c \
-    kernel/filesystem/virtual_file_system.c \
-    kernel/filesystem/vfs_scheme.c \
-    kernel/filesystem/fs_system.c \
-    kernel/filesystem/fs_ram.c \
-    kernel/filesystem/fs_proc.c \
-    kernel/filesystem/filesystem_disk.c \
-    kernel/loader/elf_loader.c \
-    kernel/drivers/input/input.c \
-    kernel/drivers/tty/tty.c \
-    kernel/drivers/keyboard/keymap.c \
-    kernel/lib/string.c \
-    kernel/lib/stdio.c \
-    kernel/lib/stdlib.c \
-    kernel/lib/utf8.c \
-    kernel/arch/arm64/boot/splash.c
+# ---------------------------------------------------------------------------
+# Auto-discover all userspace binaries — any executable file in BSL_BIN_DIR
+# that is not a .d file and has no extension is a binary to install.
+#
+# Exclusions: fontmanager (internal tool, not a shell command).
+# ---------------------------------------------------------------------------
+BSL_BIN_EXCLUDE := fontmanager echo pwd
 
-# Platform-specific sources (HAL backends)
-C_SOURCES += $(wildcard $(PLATFORM_DIR)/*.c)
+_BSL_ALL_BINS := $(filter-out \
+    $(addprefix $(BSL_BIN_DIR)/,$(BSL_BIN_EXCLUDE)), \
+    $(shell find $(BSL_BIN_DIR) -maxdepth 1 -type f ! -name '*.*' 2>/dev/null))
 
-ASM_SOURCES := \
-    kernel/arch/arm64/boot/start.S \
-    kernel/arch/arm64/exceptions/exception_vectors.S \
-    kernel/scheduler/context_switch.S
+# Convert each host path to host_path:/system/bin/<name> mapping.
+_BSL_BIN_MAPPINGS := $(foreach bin,$(_BSL_ALL_BINS),$(bin):/system/bin/$(notdir $(bin)))
 
-# No more legacy raw user programs — all programs are now ELF binaries.
-USER_RAW_SOURCES :=
+# Directories to create on the disk image (no files needed, just the directory).
+# mkfatimg creates them via "DIR:target_path" mappings.
+BSL_DIRS := \
+	DIR:/home \
+	DIR:/home/user \
+	DIR:/home/user/.bin \
+	DIR:/home/user/.lib \
+	DIR:/system/lib \
+	DIR:/system/share \
+	DIR:/data \
+	DIR:/data/temp \
+	DIR:/data/logs \
+	DIR:/dev \
+	DIR:/proc \
+	DIR:/apps \
 
-# --- User-space library ---
-USER_LIB_OBJECTS := userspace/library/startup.o userspace/library/systemcall.o \
-                    userspace/libc/string.o userspace/libc/stdio.o \
-                    userspace/libc/stdlib.o userspace/libc/errno.o \
-                    userspace/libc/unistd.o
+# All file mappings for the disk image: host_path:target_path
+DISK_FILES := \
+	$(_BSL_BIN_MAPPINGS) \
+	$(BSL_SVC_DIR)/bzdisplayd.service:/config/bazzulto/services/bzdisplayd.service \
+	$(BSL_SVC_DIR)/shell.service:/config/bazzulto/services/shell.service \
+	$(BSL_FONT_DIR)/JetBrainsMono/JetBrainsMono-Regular.ttf:/system/fonts/JetBrainsMono/JetBrainsMono-Regular.ttf
 
-# --- User-space ELF programs ---
-# To add a new program: add its name here and create userspace/<name>/<name>.c
-# and userspace/<name>/<name>_embed.S — the rules are generated automatically.
-USER_PROGRAMS := hello shell ls help echo cat wc grep head hexdump sleep kill cp rm touch tee ps df mount
+# ---------------------------------------------------------------------------
+# Default: build everything (kernel + disk image)
+# ---------------------------------------------------------------------------
 
-USER_ELF_PROGRAMS := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p).elf)
-USER_ELF_EMBEDS   := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p)_embed.o)
+.PHONY: all
+all: kernel disk
 
-KERNEL_OBJECTS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.S=.o) $(USER_RAW_SOURCES:.S=.o)
-OBJECTS := $(KERNEL_OBJECTS) $(USER_ELF_EMBEDS)
+# ---------------------------------------------------------------------------
+# BSL — Rust userspace workspace (bzinit, bzctl, bzsh, bzdisplayd, …)
+# ---------------------------------------------------------------------------
 
-# --- Targets ---
-.PHONY: all clean test
+.PHONY: bsl
+bsl:
+	$(CARGO) build --release --target $(BSL_TARGET) \
+	  --manifest-path $(BSL_MANIFEST)
 
-all: bazzulto.elf
+.PHONY: bsl-debug
+bsl-debug:
+	$(CARGO) build --target $(BSL_TARGET) \
+	  --manifest-path $(BSL_MANIFEST)
 
-test:
-	./tests/runner.sh
+# Build a single crate from the BSL workspace (usage: make bsl-crate CRATE=bzinit)
+.PHONY: bsl-crate
+bsl-crate:
+	$(CARGO) build --release --target $(BSL_TARGET) \
+	  --manifest-path $(BSL_MANIFEST) -p $(CRATE)
 
-bazzulto.elf: $(OBJECTS)
-	$(LD) $(LDFLAGS) -o $@ $^
+.PHONY: bsl-crate-debug
+bsl-crate-debug:
+	$(CARGO) build --target $(BSL_TARGET) \
+	  --manifest-path $(BSL_MANIFEST) -p $(CRATE)
 
-# --- Kernel build rules ---
-# -MMD -MP: generate .d dependency files alongside each .o.
-# The .d files list which headers each .c file includes, so make
-# automatically recompiles any .o when a header it depends on changes.
-%.o: %.c
-	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+# ---------------------------------------------------------------------------
+# Kernel — independent of BSL (no embedded ELFs; reads from disk at runtime)
+# ---------------------------------------------------------------------------
 
-%.o: %.S
-	$(AS) $(ASFLAGS) -c -o $@ $<
+.PHONY: kernel
+kernel:
+	cd $(KERNEL_DIR) && $(CARGO) build
 
-# Include all generated dependency files (ignore missing ones on first build).
-DEPENDENCY_FILES := $(KERNEL_OBJECTS:.o=.d)
--include $(DEPENDENCY_FILES)
+.PHONY: kernel-release
+kernel-release:
+	cd $(KERNEL_DIR) && $(CARGO) build --release
 
-# --- User-space libc ---
-userspace/libc/string.o: userspace/libc/string.c userspace/libc/string.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+# ---------------------------------------------------------------------------
+# Disk image — built with the host Rust toolchain, no external tools needed.
+# ---------------------------------------------------------------------------
 
-userspace/libc/stdio.o: userspace/libc/stdio.c userspace/libc/stdio.h userspace/libc/string.h userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+MKFATIMG     := tools/mkfatimg
+MKFATIMG_BIN := $(MKFATIMG)/target/release/mkfatimg
 
-userspace/libc/stdlib.o: userspace/libc/stdlib.c userspace/libc/stdlib.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+$(MKFATIMG_BIN): $(MKFATIMG)/src/main.rs $(MKFATIMG)/Cargo.toml
+	$(CARGO) build --release --manifest-path $(MKFATIMG)/Cargo.toml
 
-userspace/libc/errno.o: userspace/libc/errno.c userspace/libc/errno.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+.PHONY: disk
+disk: bsl $(MKFATIMG_BIN)
+	$(MKFATIMG_BIN) disk.img 256 $(DISK_FILES) $(BSL_DIRS)
 
-userspace/libc/unistd.o: userspace/libc/unistd.c userspace/libc/unistd.h userspace/libc/errno.h userspace/library/systemcall.h
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
+# ---------------------------------------------------------------------------
+# ISO image — UEFI bootable via xorriso (cross-platform: Linux/macOS/Windows)
+#
+# Structure inside the ISO mirrors esp/:
+#   EFI/BOOT/BOOTAA64.EFI   ← Limine UEFI binary
+#   limine.conf
+#   bazzulto.elf
+#   boot-wallpaper.jpg
+#
+# El Torito UEFI boot: no emulation, EFI/BOOT/BOOTAA64.EFI is the boot image.
+# No BIOS/legacy boot — Bazzulto targets UEFI-only hardware and QEMU virt.
+# ---------------------------------------------------------------------------
 
-# --- User-space library ---
-userspace/library/startup.o: userspace/library/startup.S
-	$(AS) $(ASFLAGS) -c -o $@ $<
+.PHONY: iso
+iso: kernel
+	cp $(KERNEL_ELF) esp/bazzulto.elf
+	# startup.nsh: UEFI Shell auto-executes this when El Torito auto-boot
+	# does not trigger.  Placed temporarily in esp/ for xorriso, then removed.
+	printf '\EFI\BOOT\BOOTAA64.EFI\n' > esp/startup.nsh
+	$(XORRISO) -as mkisofs \
+	    -V 'BAZZULTO' \
+	    --efi-boot EFI/BOOT/BOOTAA64.EFI \
+	    -no-emul-boot \
+	    -efi-boot-part \
+	    --efi-boot-image \
+	    -o $(ISO) \
+	    esp/ ; \
+	rm -f esp/startup.nsh
 
-userspace/library/systemcall.o: userspace/library/systemcall.S
-	$(AS) $(ASFLAGS) -c -o $@ $<
+# ---------------------------------------------------------------------------
+# Run in QEMU
+# ---------------------------------------------------------------------------
 
-# --- User-space programs ---
-# Rules are generated for every entry in USER_PROGRAMS.
-# Adding a new program only requires adding its name to that list.
-define userspace_program
-userspace/$(1)/$(1).o: userspace/$(1)/$(1).c userspace/library/systemcall.h
-	$$(CC) $$(USER_CFLAGS) -c -o $$@ $$<
-
-userspace/$(1)/$(1).elf: $$(USER_LIB_OBJECTS) userspace/$(1)/$(1).o
-	$$(LD) $$(USER_LDFLAGS) -o $$@ $$^
-
-userspace/$(1)/$(1)_embed.o: userspace/$(1)/$(1)_embed.S userspace/$(1)/$(1).elf
-	$$(AS) $$(ASFLAGS) -c -o $$@ $$<
-endef
-
-$(foreach p,$(USER_PROGRAMS),$(eval $(call userspace_program,$(p))))
-
-# --- QEMU targets ---
-QEMU        := qemu-system-aarch64
-UEFI_FW     := /opt/homebrew/share/qemu/edk2-aarch64-code.fd
-
-run: bazzulto.elf disk.img
-	cp bazzulto.elf esp/bazzulto.elf
-	$(QEMU) \
+# Shared QEMU flags — peripherals common to all run targets.
+QEMU_COMMON := \
 	    -machine virt \
 	    -cpu cortex-a72 \
-	    -m 1G \
+	    -m 2G \
 	    -bios $(UEFI_FW) \
-	    -drive file=fat:rw:esp,format=raw \
 	    -device ramfb \
 	    -device virtio-keyboard-device,bus=virtio-mmio-bus.0 \
-	    -drive file=disk.img,format=raw,if=none,id=disk0 \
+	    -drive file=disk.img,format=raw,if=none,id=disk0,snapshot=on \
 	    -device virtio-blk-device,drive=disk0 \
-	    -display cocoa \
-	    -monitor none \
-	    -serial stdio \
-	    -parallel none &
-
-run-serial: bazzulto.elf disk.img
-	cp bazzulto.elf esp/bazzulto.elf
-	@echo "================================================"
-	@echo "  UART serial on TCP port 4444"
-	@echo "  Connect with:  nc localhost 4444"
-	@echo "================================================"
-	$(QEMU) \
-	    -machine virt \
-	    -cpu cortex-a72 \
-	    -m 1G \
-	    -bios $(UEFI_FW) \
-	    -drive file=fat:rw:esp,format=raw \
-	    -device ramfb \
-	    -drive file=disk.img,format=raw,if=none,id=disk0 \
-	    -device virtio-blk-device,drive=disk0 \
-	    -display cocoa \
-	    -monitor none \
-	    -serial tcp::4444,server,nowait \
-	    -parallel none &
-
-debug: bazzulto.elf disk.img
-	cp bazzulto.elf esp/bazzulto.elf
-	$(QEMU) \
-	    -machine virt \
-	    -cpu cortex-a72 \
-	    -m 1G \
-	    -bios $(UEFI_FW) \
-	    -drive file=fat:rw:esp,format=raw \
-	    -device ramfb \
-	    -drive file=disk.img,format=raw,if=none,id=disk0 \
-	    -device virtio-blk-device,drive=disk0 \
-	    -display cocoa \
-	    -monitor none \
-	    -serial stdio \
-	    -parallel none \
-	    -d int,cpu_reset -D qemu_debug.log
-
-gdb: bazzulto.elf disk.img
-	cp bazzulto.elf esp/bazzulto.elf
-	$(QEMU) \
-	    -machine virt \
-	    -cpu cortex-a72 \
-	    -m 1G \
-	    -bios $(UEFI_FW) \
-	    -drive file=fat:rw:esp,format=raw \
-	    -device ramfb \
-	    -drive file=disk.img,format=raw,if=none,id=disk0 \
-	    -device virtio-blk-device,drive=disk0 \
-	    -display cocoa \
-	    -monitor none \
-	    -serial stdio \
-	    -parallel none \
-	    -S -s &
-	@echo "GDB stub listening on :1234"
-	@echo "Connect with: aarch64-elf-gdb -ex 'target remote :1234' -ex 'symbol-file bazzulto.elf'"
-
-# --- Disk image ---
-# Always regenerate on every build (never stale).
-.PHONY: disk.img
-
-disk.img: FORCE
-	python3 create_disk.py
-
-FORCE:
-
-USER_PROGRAM_OBJECTS := $(foreach p,$(USER_PROGRAMS),userspace/$(p)/$(p).o userspace/$(p)/$(p).elf)
-
-# --- Rust kernel targets ---
-RUST_DIR  := rust
-RUST_ELF  := rust/target/aarch64-unknown-none/debug/bazzulto
-
-.PHONY: rust rust-release run-rust
-
-rust:
-	cd $(RUST_DIR) && . ~/.cargo/env && cargo build
-
-rust-release:
-	cd $(RUST_DIR) && . ~/.cargo/env && cargo build --release
-
-run-rust: rust
-	cp $(RUST_ELF) esp/bazzulto.elf
-	$(QEMU) \
-	    -machine virt \
-	    -cpu cortex-a72 \
-	    -m 1G \
-	    -bios $(UEFI_FW) \
-	    -drive file=fat:rw:esp,format=raw \
-	    -device ramfb \
-	    -display cocoa \
 	    -monitor none \
 	    -serial stdio \
 	    -parallel none
 
+QEMU_BOOT_ESP := -drive file=fat:rw:esp,format=raw
+
+# ISO boot via virtio-scsi (for run-iso / distribution testing).
+# edk2 on -machine virt mounts the El Torito FAT as FS0 but does not
+# auto-execute \EFI\BOOT\BOOTAA64.EFI from it reliably — use run-iso
+# only when testing the distributable ISO, not for daily development.
+QEMU_BOOT_ISO := \
+	    -device virtio-scsi-device,id=scsi0 \
+	    -drive file=$(ISO),format=raw,if=none,media=cdrom,id=cdrom0 \
+	    -device scsi-cd,bus=scsi0.0,drive=cdrom0
+
+# ---------------------------------------------------------------------------
+# Daily development targets — boot from esp/ (no xorriso, instant boot).
 # ---------------------------------------------------------------------------
 
+.PHONY: run
+run: kernel disk
+	cp $(KERNEL_ELF) esp/bazzulto.elf
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ESP) -display cocoa
+
+.PHONY: debug-run
+debug-run: kernel disk
+	cp $(KERNEL_ELF) esp/bazzulto.elf
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ESP) -display none
+
+.PHONY: debug-gdb
+debug-gdb: kernel disk
+	cp $(KERNEL_ELF) esp/bazzulto.elf
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ESP) -display none -s -S
+
+.PHONY: run-release
+run-release: kernel-release disk
+	cp $(KERNEL_ELF_R) esp/bazzulto.elf
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ESP) -display cocoa
+
+# ---------------------------------------------------------------------------
+# ISO distribution targets — build ISO and boot from it.
+# ---------------------------------------------------------------------------
+
+.PHONY: run-iso
+run-iso: iso disk
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ISO) -display cocoa
+
+.PHONY: debug-run-iso
+debug-run-iso: iso disk
+	$(QEMU) $(QEMU_COMMON) $(QEMU_BOOT_ISO) -display none
+
+.PHONY: iso-release
+iso-release: kernel-release
+	cp $(KERNEL_ELF_R) esp/bazzulto.elf
+	printf '\EFI\BOOT\BOOTAA64.EFI\n' > esp/startup.nsh
+	$(XORRISO) -as mkisofs \
+	    -V 'BAZZULTO' \
+	    --efi-boot EFI/BOOT/BOOTAA64.EFI \
+	    -no-emul-boot \
+	    -efi-boot-part \
+	    --efi-boot-image \
+	    -o $(ISO) \
+	    esp/ ; \
+	rm -f esp/startup.nsh
+
+# ---------------------------------------------------------------------------
+# Clean
+# ---------------------------------------------------------------------------
+
+.PHONY: clean
 clean:
-	rm -f $(KERNEL_OBJECTS) $(USER_LIB_OBJECTS) $(USER_ELF_EMBEDS) \
-	      $(USER_PROGRAM_OBJECTS) \
-	      userspace/libc/string.o userspace/libc/stdio.o userspace/libc/stdlib.o \
-	      userspace/libc/errno.o userspace/libc/unistd.o \
-	      bazzulto.elf esp/bazzulto.elf qemu_debug.log \
-	      disk.img
+	cd $(KERNEL_DIR) && $(CARGO) clean
+	$(CARGO) clean --manifest-path $(BSL_MANIFEST)
+	$(CARGO) clean --manifest-path $(MKFATIMG)/Cargo.toml
+	rm -f esp/bazzulto.elf disk.img $(ISO)

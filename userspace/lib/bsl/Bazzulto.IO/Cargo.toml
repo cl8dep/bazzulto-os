@@ -1,0 +1,21 @@
+[package]
+name = "bazzulto-io"
+version = "0.1.0"
+edition = "2021"
+
+# Bazzulto.IO — typed I/O wrappers (File, Directory, Stream, Path).
+# Depends on Bazzulto.System for all syscall access.
+
+[lib]
+name = "bazzulto_io"
+
+[dependencies]
+bazzulto-system = { path = "../Bazzulto.System" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

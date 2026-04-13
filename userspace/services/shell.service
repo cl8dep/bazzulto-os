@@ -1,0 +1,7 @@
+[Service]
+name           = "shell"
+binary         = "/system/bin/bzsh"
+after          = ["bzdisplayd"]
+restart        = "always"
+max_retries    = "0"
+display_output = "true"

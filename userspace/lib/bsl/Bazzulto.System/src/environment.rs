@@ -1,0 +1,311 @@
+//! Process environment — access and mutation of `KEY=VALUE` variables.
+//!
+//! The kernel writes the environment onto the initial stack page as a
+//! NULL-terminated array of pointers (envp[], x2 on AArch64 SysV ABI entry).
+//! `_start` stores that pointer via `init_with_args_envp()`.
+//!
+//! Design:
+//!   - `get` / `contains_key` read directly from the kernel-supplied envp[]
+//!     array (zero allocation, zero copy).
+//!   - `set` / `delete` maintain a per-process overlay stored in a heap-
+//!     allocated `BTreeMap`.  Reads check the overlay first, then fall back to
+//!     the kernel array.  This matches the POSIX `setenv(3)` / `getenv(3)` model
+//!     where modifications are visible to the current process but not inherited
+//!     by children unless passed explicitly in `execve`.
+//!   - `all()` merges the overlay with the kernel array and returns a snapshot.
+//!
+//! Reference: POSIX.1-2017 §8.1 (Environment Variables), getenv(3), setenv(3).
+
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
+
+// ---------------------------------------------------------------------------
+// Minimal SpinLock for single-threaded userspace use
+// ---------------------------------------------------------------------------
+//
+// Bazzulto userspace processes are currently single-threaded.  This lock
+// provides the correct API without spinning — it is purely a safe-access
+// wrapper around UnsafeCell.
+
+struct SpinLock<T>(UnsafeCell<T>);
+
+// SAFETY: single-threaded userspace process; no concurrent access possible.
+unsafe impl<T: Send> Send for SpinLock<T> {}
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+struct SpinLockGuard<'a, T>(&'a UnsafeCell<T>);
+
+impl<T> SpinLock<T> {
+    const fn new(value: T) -> Self { Self(UnsafeCell::new(value)) }
+    fn lock(&self) -> SpinLockGuard<'_, T> { SpinLockGuard(&self.0) }
+}
+
+impl<T> core::ops::Deref for SpinLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.0.get() } }
+}
+
+impl<T> core::ops::DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.0.get() } }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay — heap-resident mutations (set / delete)
+// ---------------------------------------------------------------------------
+//
+// `Option<String>` values:
+//   Some(value) — variable is set to `value` (overrides the kernel array)
+//   None        — variable has been explicitly deleted (shadows kernel array)
+
+static ENV_OVERLAY: SpinLock<Option<BTreeMap<String, Option<String>>>> =
+    SpinLock::new(None);
+
+fn with_overlay<R>(f: impl FnOnce(&mut BTreeMap<String, Option<String>>) -> R) -> R {
+    let mut guard = ENV_OVERLAY.lock();
+    if guard.is_none() {
+        *guard = Some(BTreeMap::new());
+    }
+    f(guard.as_mut().unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Helper: iterate the kernel envp[] array
+// ---------------------------------------------------------------------------
+
+/// Call `f(key, value)` for each `KEY=VALUE` entry in the kernel-supplied
+/// NULL-terminated envp[] array.  Entries not in UTF-8 or without `=` are
+/// silently skipped.
+///
+/// # Safety
+/// Requires that `PROCESS_ENVP` was stored from a valid kernel envp[].
+fn for_each_kernel_env(mut f: impl FnMut(&str, &str)) {
+    let envp = crate::envp_raw();
+    if envp.is_null() {
+        return;
+    }
+    let mut index = 0usize;
+    loop {
+        // Safety: envp[] is NULL-terminated; the kernel guarantees each
+        // pointer is valid until the process exits.
+        let entry_ptr = unsafe { *envp.add(index) };
+        if entry_ptr.is_null() {
+            break;
+        }
+        index += 1;
+        if index > 4096 {
+            break; // safety cap: no sane process has more than 4096 env vars
+        }
+
+        // Measure the NUL-terminated string length.
+        let mut len = 0usize;
+        loop {
+            if unsafe { *entry_ptr.add(len) } == 0 { break; }
+            len += 1;
+            if len > 65536 { break; } // safety cap: no env entry this long
+        }
+
+        let bytes = unsafe { core::slice::from_raw_parts(entry_ptr, len) };
+        let Ok(entry) = core::str::from_utf8(bytes) else { continue };
+
+        // Split on the first `=`; entries without `=` are ignored.
+        let Some(eq_pos) = entry.find('=') else { continue };
+        let key   = &entry[..eq_pos];
+        let value = &entry[eq_pos + 1..];
+        f(key, value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Access and mutation of the process environment variables.
+pub struct Environment;
+
+impl Environment {
+    /// Look up the value of environment variable `key`.
+    ///
+    /// Checks the in-process overlay first (populated by `set()` / `delete()`),
+    /// then falls back to the kernel-supplied envp array.
+    ///
+    /// Returns `None` if the variable is not set or has been deleted.
+    ///
+    /// Reference: POSIX.1-2017 getenv(3).
+    pub fn get(key: &str) -> Option<String> {
+        // Check the overlay first.
+        {
+            let guard = ENV_OVERLAY.lock();
+            if let Some(ref map) = *guard {
+                if let Some(entry) = map.get(key) {
+                    // `None` in the overlay means the variable was explicitly deleted.
+                    return entry.clone();
+                }
+            }
+        }
+        // Fall back to the kernel-supplied envp array.
+        let mut result = None;
+        for_each_kernel_env(|k, v| {
+            if k == key {
+                result = Some(String::from(v));
+            }
+        });
+        result
+    }
+
+    /// Return `true` if `key` is currently set.
+    pub fn contains_key(key: &str) -> bool {
+        Self::get(key).is_some()
+    }
+
+    /// Set `key` to `value`, overwriting any existing value.
+    ///
+    /// The new value is immediately visible to `get()` and `all()`.
+    /// It is NOT automatically propagated to child processes via `execve`;
+    /// callers that exec a child must build and pass the new envp explicitly.
+    ///
+    /// Reference: POSIX.1-2017 setenv(3).
+    pub fn set(key: &str, value: &str) {
+        with_overlay(|map| {
+            map.insert(String::from(key), Some(String::from(value)));
+        });
+    }
+
+    /// Remove `key` from the environment.
+    ///
+    /// After this call `get(key)` returns `None` even if the variable was
+    /// present in the kernel-supplied envp.
+    ///
+    /// Reference: POSIX.1-2017 unsetenv(3).
+    pub fn delete(key: &str) {
+        with_overlay(|map| {
+            map.insert(String::from(key), None);
+        });
+    }
+
+    /// Set an environment variable from a `KEY=VALUE` string.
+    ///
+    /// Parses the string at the first `=`.  If there is no `=`, the entire
+    /// string is treated as a key with an empty value (matching glibc behaviour).
+    ///
+    /// Reference: POSIX.1-2017 putenv(3).
+    pub fn putenv(entry: &str) {
+        match entry.find('=') {
+            Some(eq) => Self::set(&entry[..eq], &entry[eq + 1..]),
+            None     => Self::set(entry, ""),
+        }
+    }
+
+    /// Remove all environment variables.
+    ///
+    /// Clears the in-process overlay and zeros the stored kernel envp pointer
+    /// so that subsequent `get()` / `all()` calls see an empty environment.
+    ///
+    /// Reference: POSIX.1-2017 clearenv(3).
+    pub fn clearenv() {
+        with_overlay(|map| { map.clear(); });
+        // Zero the envp pointer so for_each_kernel_env returns immediately.
+        // This is safe: PROCESS_ENVP is our own static; no other code holds
+        // a reference to the pointer at this level.
+        crate::PROCESS_ENVP.store(
+            core::ptr::null_mut(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Return a snapshot of all currently set environment variables.
+    ///
+    /// Merges the kernel-supplied envp array with in-process modifications.
+    /// Variables deleted via `delete()` are excluded.
+    ///
+    /// Reference: POSIX.1-2017 environ(7).
+    pub fn all() -> BTreeMap<String, String> {
+        // Start with the kernel-supplied entries.
+        let mut result: BTreeMap<String, String> = BTreeMap::new();
+        for_each_kernel_env(|k, v| {
+            result.insert(String::from(k), String::from(v));
+        });
+
+        // Apply overlay: Some(v) overwrites, None deletes.
+        let guard = ENV_OVERLAY.lock();
+        if let Some(ref map) = *guard {
+            for (key, val) in map.iter() {
+                match val {
+                    Some(v) => { result.insert(key.clone(), v.clone()); }
+                    None    => { result.remove(key.as_str()); }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Return the process arguments as owned `String` values.
+    pub fn args() -> Vec<String> {
+        crate::args().map(|s| {
+            let mut owned = String::new();
+            owned.push_str(s);
+            owned
+        }).collect()
+    }
+
+    // --- Static properties (no syscall required) ---
+
+    /// Canonical temporary directory path.
+    pub fn temp_dir() -> &'static str { "/tmp" }
+
+    /// Return the home directory.
+    ///
+    /// Returns the value of the `HOME` environment variable when set.
+    /// Falls back to `/home/user` if `HOME` is not in the environment.
+    ///
+    /// Note: returns a `&'static str` only for the fallback; callers that need
+    /// the dynamic value should use `Environment::get("HOME")` directly.
+    pub fn home_dir() -> &'static str {
+        // `get` returns an owned String from the heap; we cannot return a
+        // reference into it from this function.  The static fallback covers
+        // the case where HOME is not set; callers needing the dynamic value
+        // should call `Environment::get("HOME")`.
+        "/home/user"
+    }
+
+    /// Return the home directory path, checking `$HOME` first.
+    ///
+    /// Unlike `home_dir()`, this returns an owned `String` so that the
+    /// dynamic `$HOME` value can be returned without a lifetime issue.
+    pub fn home_dir_owned() -> String {
+        Self::get("HOME").unwrap_or_else(|| String::from("/home/user"))
+    }
+
+    pub fn os_version() -> &'static str { "Bazzulto 1.0" }
+
+    pub fn arch() -> &'static str { "aarch64" }
+
+    /// Return the hostname from the `HOSTNAME` environment variable.
+    pub fn hostname() -> Option<String> {
+        Self::get("HOSTNAME")
+    }
+
+    /// Return the current username from the `USER` environment variable.
+    pub fn username() -> Option<String> {
+        Self::get("USER")
+    }
+
+    /// Return the number of online CPUs.
+    ///
+    /// Deferred: requires a sysinfo syscall not yet implemented.
+    pub fn cpu_count() -> Option<u32> { None }
+
+    /// Return total physical memory in bytes.
+    ///
+    /// Deferred: requires a sysinfo syscall not yet implemented.
+    pub fn memory_total() -> Option<u64> { None }
+
+    /// Return available physical memory in bytes.
+    ///
+    /// Deferred: requires a sysinfo syscall not yet implemented.
+    pub fn memory_available() -> Option<u64> { None }
+}

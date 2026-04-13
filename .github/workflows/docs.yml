@@ -1,0 +1,67 @@
+name: docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'userspace/lib/bsl/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-none
+
+      - name: Build Rust API docs — Bazzulto.System
+        working-directory: userspace/lib/bsl/Bazzulto.System
+        run: cargo doc --no-deps --target aarch64-unknown-none
+
+      - name: Build Rust API docs — Bazzulto.Display
+        working-directory: userspace/lib/bsl/Bazzulto.Display
+        run: cargo doc --no-deps --target aarch64-unknown-none
+
+      - name: Build Rust API docs — Bazzulto.IO
+        working-directory: userspace/lib/bsl/Bazzulto.IO
+        run: cargo doc --no-deps --target aarch64-unknown-none
+
+      - name: Collect rustdoc output
+        run: |
+          mkdir -p site/api/rust
+          cp -r userspace/lib/bsl/Bazzulto.System/target/aarch64-unknown-none/doc/* site/api/rust/
+          cp -r userspace/lib/bsl/Bazzulto.Display/target/aarch64-unknown-none/doc/* site/api/rust/ 2>/dev/null || true
+          cp -r userspace/lib/bsl/Bazzulto.IO/target/aarch64-unknown-none/doc/* site/api/rust/ 2>/dev/null || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install MkDocs dependencies
+        run: pip install mkdocs-material
+
+      - name: Build MkDocs site
+        run: mkdocs build --strict --site-dir site
+
+      - name: Deploy to GitHub Pages
+        if: ${{ !env.ACT }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages

@@ -1,0 +1,25 @@
+[package]
+name = "bazzulto-system"
+version = "0.1.0"
+edition = "2021"
+
+# Bazzulto.System — the OS API layer for Bazzulto userspace.
+#
+# Provides:
+#   - GlobalAlloc backed by the mmap syscall
+#   - vDSO trampoline constants (stable slot IDs → current SVC numbers)
+#   - Typed wrappers for all kernel syscalls
+#
+# All other BSL packages (Bazzulto.IO, etc.) and userspace binaries depend on
+# this crate. It must be the first thing initialized in _start.
+
+[lib]
+name = "bazzulto_system"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

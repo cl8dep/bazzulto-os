@@ -1,0 +1,28 @@
+[package]
+name    = "bazzulto-display"
+version = "0.1.0"
+edition = "2021"
+
+# Bazzulto.Display — framebuffer access, font management, and glyph rasterization.
+#
+# Provides:
+#   - FontManager: load, cache, and rasterize TrueType fonts via fontdue
+#   - FramebufferSurface: pixel-level write access to the Limine framebuffer (v1.0)
+#
+# Depends on Bazzulto.System for all syscall access.
+# fontdue is the rasterization backend; it is no_std compatible.
+
+[lib]
+name = "bazzulto_display"
+
+[dependencies]
+bazzulto-system = { path = "../Bazzulto.System" }
+fontdue         = { version = "0.7", default-features = false }
+
+[profile.release]
+panic     = "abort"
+opt-level = "s"
+lto       = true
+
+[profile.dev]
+panic = "abort"
