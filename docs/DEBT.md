@@ -42,14 +42,16 @@ Documento consolidado. Reemplaza los archivos individuales en `docs/debts/` y
 | Reboot / shutdown via PSCI | ✅ Completo |
 | bzinit (PID 1, service manager) | ✅ Funcional |
 | FAT32 | ⚠️ Parcial — sin instancia por volumen |
-| BlockDevice trait + multi-disk registry | ❌ No implementado |
-| Partition table (MBR/GPT) | ❌ No implementado |
+| BlockDevice trait + multi-disk registry | ✅ Implementado (actualizar tabla de estado) |
+| Partition table (MBR/GPT) | ✅ Implementado (actualizar tabla de estado) |
 | Demand paging (lazy BSS) | ❌ No implementado |
+| MAP_SHARED + mmap file-backed | ❌ No implementado |
 | MAP_SHARED excluido de CoW en fork() | ❌ No implementado |
-| Red (TCP/IP) | ❌ No implementado |
-| UID/GID + permisos de archivo | ❌ No implementado |
-| Binary Permission Model (permissiond) | ❌ No implementado |
-| Editor de texto | ❌ No implementado |
+| UID/GID + permisos de archivo POSIX | ❌ No implementado |
+| Binary Permission Model (kernel side) | ❌ No implementado |
+| Red (TCP/IP) | ❌ No implementado — explícitamente fuera de scope v1.0 |
+| Binary Permission Model (permissiond daemon) | ❌ Post-v1.0 |
+| Editor de texto | ❌ Post-v1.0 (userspace) |
 
 ---
 
@@ -417,3 +419,84 @@ Los siguientes ítems estaban abiertos y fueron completados:
 | sigaltstack + SA_ONSTACK + signal frame save/restore | 2026-04-11 |
 | Terminal signals Ctrl+C/Z/\\ (ya estaba implementado, verificado) | 2026-04-12 |
 | vDSO clock_gettime acelerado (CNTPCT_EL0, data page 0x3000) | 2026-04-11 |
+
+---
+
+## Post-v1.0 — Deuda documentada para v2.0+
+
+Estas deudas son trabajo real y fueron consideradas para v1.0, pero están explícitamente diferidas post-v1.0 porque requieren userspace estable o componentes que dependen de características aún no implementadas.
+
+### Seguridad / Modelo de permisos (post-v1.0)
+
+**Contexto:** El Binary Permission Model está completamente especificado en `docs/features/Binary Permission Model.md`. En v1.0, se implementa el lado kernel (granted_permissions, vfs_open check, Tier 1/4 parcial). El lado permissiond + Ed25519 + IPC + prompts va post-v1.0.
+
+- **Tier 2 policy store** (`//sys:policy:{sha256}`): requiere permissiond corriendo en userspace. Kernel ya tendrá la infraestructura en v1.0.
+- **Tier 3 ELF section + approval prompt**: requiere permissiond + UI terminal/gráfica. Ver paso 7 en `docs/features/Binary Permission Model.md`.
+- **Ed25519 Tier 1 signature verification**: requiere clave pública embedded en kernel + herramienta de signing en toolchain. Prerequisito: binarios del sistema firmados.
+- **Merkle root computation**: depende de dynamic linker para resolver `.so` deps.
+- **`sys_request_cap`** (runtime elevation) + rate limiting: requiere permissiond.
+- **`sys_powerbox_open`** (file picker sin exponer path): requiere permissiond + UI.
+- **`sys_restrict_self`** (irreversible privilege reduction para interpreters): requiere Tier 2/3.
+- **IPC fd re-validation** en `recvmsg` SCM_RIGHTS: requiere Tier 2/3 completos.
+- **Password re-prompt** para permisos Authenticated: requiere permissiond + credenciales.
+- **TPM binding** para policy entries: deferred hasta hardware real.
+- **Saved-set-UID**: `setuid` con semántica POSIX completa (tres UIDs: real, effective, saved).
+- **`seccomp` filter**: deferred hasta que modelo de seguridad esté estable.
+
+### Memoria (post-v1.0)
+
+- **Buddy allocator**: el first-fit actual es funcional. Buddy es una optimización de fragmentación para reducir wastage bajo carga real.
+- **`vmalloc`**: para objetos grandes del kernel. El slab+first-fit es suficiente para v1.0.
+- **Memory hotplug**: añadir RAM en vivo — requiere arquitectura más sofisticada.
+
+### IPC (post-v1.0)
+
+- **`sendmsg` / `recvmsg` SCM_RIGHTS**: requiere fd re-validation contra granted_permissions de receiver. Requiere Binary Permission Model Tier 2/3.
+- **`FUTEX_REQUEUE` / `FUTEX_WAIT_BITSET`**: operaciones futex avanzadas para compatibilidad glibc.
+- **`CLONE_SIGHAND` / `CLONE_FS` / `CLONE_NEWNS`**: flags de clone avanzados.
+- **`splice()` / `vmsplice()`**: zero-copy syscalls para pipes.
+
+### Scheduling (post-v1.0)
+
+- **`Arc<PageTable>`** en clone de threads: actualmente raw pointer documentado como TECHNICAL DEBT. Requiere ownership model mejor.
+- **Orphan reparenting completo** a PID 1: parcialmente implementado. Falta garantía de que todos los huérfanos se reasignan.
+
+### Filesystem (post-v1.0)
+
+- **BAFS como filesystem nativo por defecto**: una vez que BAFS v1 esté maduro y testeado en kernel. FAT32 sigue siendo el bootloader/alternativo.
+- **FSInfo writeback** en FAT32: el free cluster count no se escribe de vuelta al FSInfo sector. Bajo impacto.
+- **`rename` en FAT32 y BAFS**: `Inode::link_child()` retorna `NotSupported` actualmente.
+- **Non-ASCII filenames** en FAT32: `lfn_char_to_ascii()` convierte a `?` todo código >= U+0080.
+- **Hard links en BAFS**: la V1 del spec no incluye hard links, solo symlinks.
+- **Extended attributes** (xattrs): `baz.*` namespace para hints de permisos (post-v1.0).
+
+### Red (explícitamente fuera de scope)
+
+- **TCP/IP stack completo**: VirtIO-net driver, Ethernet, ARP, IPv4, ICMP, UDP, TCP. Explícitamente deferred indefinidamente.
+- **DHCP client**: configuración automática de IP.
+- **DNS resolver**: IANA zone file o stub resolver.
+
+### Userspace / BDL (no es kernel, pero bloqueante para ciertos features)
+
+- **`permissiond` daemon**: primer binario Tier 1 que debe escribirse en userspace (Rust o C). Requiere scheduler + IPC estables en kernel.
+- **Dynamic linker / PT_INTERP**: requiere `mmap` file-backed (MAP_PRIVATE) en kernel (Fase D). Linker muestra símbolos + relocations.
+- **Text editor (nano-like)**: BDL/userspace, no kernel.
+- **`bzctl` + service manager avanzado**: control de servicio con timeline/dependency graph.
+- **Package manager (`baz`)**: ya existe userspace, requiere syscall `grant_permissions()` en kernel (permissiond).
+- **Bazzulto Standard Library (BSL)**: API stable para userspace (I/O, memory, permissions, IPC, crypto).
+
+### v1.0 blockers reales — qué debe estar hecho
+
+Para declarar v1.0, el kernel debe tener:
+
+1. ✅ FAT32 per-volume (Fase A)
+2. ✅ Demand paging + MAP_SHARED file-backed (Fases C, D)
+3. ✅ UIDs/GIDs POSIX (Fase E)
+4. ✅ Binary Permission Model kernel side — granted_permissions + vfs_open check (Fase E2)
+5. ✅ fsync + VMA tree + ASLR (Fase F)
+6. ✅ TLB shootdown SMP fix (Fase B)
+7. ✅ Stubs menores filled in (Fase G)
+8. ✅ BAFS driver opcional soportado (Fase G)
+9. ✅ docs/DEBT.md actualizado con deuda post-v1.0
+
+Una vez hecho, el kernel es "estable v1.0". Ninguno de los post-v1.0 items anterior bloquea ese hito.

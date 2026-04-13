@@ -9,6 +9,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use alloc::vec;
+use alloc::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // FAT32 on-disk structures (little-endian, packed)
@@ -1048,40 +1049,35 @@ pub fn fat32_creat(path: &str, truncate: bool) -> Option<Fat32File> {
             }
         }
 
-        // Find a free directory entry slot.
-        let (entry_cluster_num, entry_index) = find_free_dir_slot(state, dir_cluster)?;
-
-        // Build short name.
-        let mut short_name = [b' '; 11];
-        let nt_res = name_to_short(filename, &mut short_name);
-
-        // Write directory entry (no LFN for now — simple 8.3 creation).
-        let mut new_entry = Fat32DirEntry::default();
-        new_entry.name = short_name;
-        new_entry.nt_res = nt_res;
-        new_entry.attr = 0x20; // ARCHIVE
-        new_entry.file_size = 0;
-        new_entry.fst_clus_lo = 0;
-        new_entry.fst_clus_hi = 0;
-
-        // Write entry to disk.
-        if !read_cluster(state, entry_cluster_num) { return None; }
-        let entry_offset = entry_index as usize * 32;
-        let entry_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &new_entry as *const Fat32DirEntry as *const u8,
-                32,
-            )
+        // Write directory entry — with LFN if the name requires it.
+        let (entry_cluster_num, entry_index) = if needs_lfn(filename) {
+            let short_name = generate_short_alias(state, dir_cluster, filename)?;
+            let n_slots    = lfn_entry_count(filename) + 1;
+            let (sc, si)   = find_n_free_dir_slots(state, dir_cluster, n_slots)?;
+            write_lfn_and_83(state, sc, si, filename, &short_name, 0x20, 0, 0)?
+        } else {
+            let mut short_name = [b' '; 11];
+            let nt_res = name_to_short(filename, &mut short_name);
+            let (sc, si) = find_free_dir_slot(state, dir_cluster)?;
+            let mut new_entry = Fat32DirEntry::default();
+            new_entry.name   = short_name;
+            new_entry.nt_res = nt_res;
+            new_entry.attr   = 0x20; // ARCHIVE
+            if !read_cluster(state, sc) { return None; }
+            let entry_bytes = unsafe {
+                core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
+            };
+            state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
+            if !write_cluster(state, sc) { return None; }
+            (sc, si)
         };
-        state.cluster_buf[entry_offset..entry_offset + 32].copy_from_slice(entry_bytes);
-        if !write_cluster(state, entry_cluster_num) { return None; }
 
         Some(Fat32File {
-            dir_cluster: entry_cluster_num,
+            dir_cluster:     entry_cluster_num,
             dir_entry_index: entry_index,
-            first_cluster: 0,
-            file_size: 0,
-            position: 0,
+            first_cluster:   0,
+            file_size:       0,
+            position:        0,
         })
     })
 }
@@ -1111,6 +1107,305 @@ fn find_free_dir_slot(state: &mut Fat32State, dir_cluster: u32) -> Option<(u32, 
     state.cluster_buf.fill(0);
     write_cluster(state, new_cluster);
     Some((new_cluster, 0))
+}
+
+// ---------------------------------------------------------------------------
+// LFN helpers — Long File Name support (VFAT extension, FAT32 spec §7)
+// ---------------------------------------------------------------------------
+
+/// Returns true when the name requires LFN directory entries.
+///
+/// LFN is needed when any of these hold:
+///   - base component > 8 chars or extension > 3 chars
+///   - mixed case within base or extension ("Hola", "ReadMe.Txt")
+///   - contains characters illegal in 8.3 names (space, +, ,, ;, =, [, ])
+fn needs_lfn(name: &str) -> bool {
+    let dot_pos = name.rfind('.');
+    let (base, ext) = match dot_pos {
+        Some(pos) => (&name[..pos], &name[pos+1..]),
+        None => (name, ""),
+    };
+    if base.len() > 8 || ext.len() > 3 { return true; }
+    for b in name.bytes() {
+        if b" +,;=[]".contains(&b) { return true; }
+    }
+    let base_up = base.bytes().any(|c| c >= b'A' && c <= b'Z');
+    let base_lo = base.bytes().any(|c| c >= b'a' && c <= b'z');
+    if base_up && base_lo { return true; }
+    let ext_up = ext.bytes().any(|c| c >= b'A' && c <= b'Z');
+    let ext_lo = ext.bytes().any(|c| c >= b'a' && c <= b'z');
+    ext_up && ext_lo
+}
+
+/// Number of LFN directory entries needed to store `name` (ceil(len / 13)).
+fn lfn_entry_count(name: &str) -> usize {
+    (name.len() + 12) / 13
+}
+
+/// Generate a unique 8.3 alias for a long name (e.g. "MiCarpeta" → "MICAR~1   ").
+///
+/// Returns `None` if no alias can be found (directory has >9999 similarly
+/// named entries — effectively impossible in practice).
+fn generate_short_alias(
+    state:       &mut Fat32State,
+    dir_cluster: u32,
+    name:        &str,
+) -> Option<[u8; 11]> {
+    let dot_pos = name.rfind('.');
+    let (base_part, ext_part) = match dot_pos {
+        Some(pos) => (&name[..pos], &name[pos+1..]),
+        None => (name, ""),
+    };
+
+    // Collect up to 6 valid 8.3 base chars (uppercase, skip illegal chars).
+    let mut base_chars = [b' '; 6];
+    let mut base_len = 0usize;
+    for c in base_part.bytes() {
+        if base_len >= 6 { break; }
+        if b" +,;=[]".contains(&c) || c == b'.' { continue; }
+        base_chars[base_len] = if c >= b'a' && c <= b'z' { c - 32 } else { c };
+        base_len += 1;
+    }
+
+    // Extension: up to 3 chars, uppercased.
+    let mut ext_bytes = [b' '; 3];
+    for (i, c) in ext_part.bytes().enumerate().take(3) {
+        ext_bytes[i] = if c >= b'a' && c <= b'z' { c - 32 } else { c };
+    }
+
+    for n in 1u32..=9999 {
+        let suffix = alloc::format!("~{}", n);
+        let suffix_bytes = suffix.as_bytes();
+        let base_use = base_len.min(8 - suffix_bytes.len());
+
+        let mut short = [b' '; 11];
+        short[..base_use].copy_from_slice(&base_chars[..base_use]);
+        for (i, &c) in suffix_bytes.iter().enumerate() {
+            short[base_use + i] = c;
+        }
+        short[8]  = ext_bytes[0];
+        short[9]  = ext_bytes[1];
+        short[10] = ext_bytes[2];
+
+        // Accept if no existing entry has this alias.
+        let alias_str = short_name_to_str(&short, 0);
+        if lookup_in_dir(state, dir_cluster, &alias_str).is_none() {
+            return Some(short);
+        }
+    }
+    None
+}
+
+/// Find `count` consecutive free / deleted directory slots in the chain rooted
+/// at `dir_cluster`.  Extends the directory by allocating new FAT clusters when
+/// no suitable run exists.
+///
+/// Returns `(cluster, first_index)` of the run start, or `None` on failure.
+fn find_n_free_dir_slots(
+    state:       &mut Fat32State,
+    dir_cluster: u32,
+    count:       usize,
+) -> Option<(u32, u32)> {
+    if count <= 1 {
+        return find_free_dir_slot(state, dir_cluster);
+    }
+
+    let entries_per_cluster = (state.bytes_per_cluster / 32) as usize;
+    let mut cluster = dir_cluster;
+
+    while !is_eof(cluster) && !is_bad(cluster) {
+        if !read_cluster(state, cluster) { return None; }
+        let cluster_data = state.cluster_buf.clone();
+
+        let mut run_start: Option<u32> = None;
+        let mut run_len = 0usize;
+
+        for i in 0..entries_per_cluster {
+            let fb = cluster_data[i * 32];
+            if fb == DIR_ENTRY_FREE || fb == DIR_ENTRY_DELETED {
+                if run_len == 0 { run_start = Some(i as u32); }
+                run_len += 1;
+                if run_len >= count {
+                    return Some((cluster, run_start.unwrap()));
+                }
+                // 0x00 means all following entries in this cluster are also free.
+                if fb == DIR_ENTRY_FREE {
+                    let free_from_here = entries_per_cluster - run_start.unwrap() as usize;
+                    if free_from_here >= count {
+                        return Some((cluster, run_start.unwrap()));
+                    }
+                    break; // not enough in this cluster alone — extend below
+                }
+            } else {
+                run_len  = 0;
+                run_start = None;
+            }
+        }
+
+        match read_fat_entry(state, cluster) {
+            Some(n) if !is_eof(n) && !is_bad(n) => cluster = n,
+            _ => break,
+        }
+    }
+
+    // No suitable run found — append new cluster(s) at the end of the directory.
+    let clusters_needed = (count + entries_per_cluster - 1) / entries_per_cluster;
+    let mut first_new = 0u32;
+    for k in 0..clusters_needed {
+        let (new_c, _) = alloc_cluster(state, dir_cluster)?;
+        if k == 0 { first_new = new_c; }
+        state.cluster_buf.fill(0);
+        write_cluster(state, new_c);
+    }
+    Some((first_new, 0))
+}
+
+/// Write LFN entries (highest ordinal first) followed by the 8.3 directory
+/// entry, starting at `(start_cluster, start_index)`.  Crosses cluster
+/// boundaries by following the FAT chain.
+///
+/// Returns `(cluster, index)` of the written 8.3 entry, or `None` on error.
+fn write_lfn_and_83(
+    state:         &mut Fat32State,
+    start_cluster: u32,
+    start_index:   u32,
+    name:          &str,
+    short_name:    &[u8; 11],
+    attr:          u8,
+    file_cluster:  u32,
+    file_size:     u32,
+) -> Option<(u32, u32)> {
+    let checksum  = vfat_checksum(short_name);
+    let n_lfn     = lfn_entry_count(name);
+
+    // Encode name as UCS-2 LE (ASCII range only; non-ASCII mapped to '?').
+    let name_ucs2: Vec<u16> = name.chars()
+        .map(|c| if (c as u32) < 0x80 { c as u16 } else { b'?' as u16 })
+        .collect();
+
+    let entries_per_cluster = (state.bytes_per_cluster / 32) as usize;
+    let mut cur_cluster = start_cluster;
+    let mut cur_index   = start_index as usize;
+
+    // Load the first cluster to preserve any existing entries around our slots.
+    if !read_cluster(state, cur_cluster) { return None; }
+
+    // Write LFN entries from highest ordinal (first in directory, last chars)
+    // down to ordinal 1 (last before 8.3, first chars).
+    for lfn_num in (1..=(n_lfn as u8)).rev() {
+        let seg_start = (lfn_num as usize - 1) * 13;
+        let mut chars = [0xFFFFu16; 13];
+        for j in 0..13 {
+            let idx = seg_start + j;
+            if idx < name_ucs2.len() {
+                chars[j] = name_ucs2[idx];
+            } else if idx == name_ucs2.len() {
+                chars[j] = 0x0000; // null terminator
+            }
+            // else: 0xFFFF pad already set
+        }
+
+        // Highest ordinal gets the LAST_LONG_ENTRY flag.
+        let ord = if lfn_num == n_lfn as u8 { lfn_num | LFN_LAST_ENTRY } else { lfn_num };
+
+        let mut lfn_bytes = [0u8; 32];
+        lfn_bytes[0]  = ord;
+        for j in 0..5usize {
+            let le = chars[j].to_le_bytes();
+            lfn_bytes[1 + j * 2] = le[0];
+            lfn_bytes[2 + j * 2] = le[1];
+        }
+        lfn_bytes[11] = ATTR_LONG_NAME;
+        lfn_bytes[12] = 0; // entry_type
+        lfn_bytes[13] = checksum;
+        for j in 0..6usize {
+            let le = chars[5 + j].to_le_bytes();
+            lfn_bytes[14 + j * 2] = le[0];
+            lfn_bytes[15 + j * 2] = le[1];
+        }
+        lfn_bytes[26] = 0; // fst_clus_lo (must be 0)
+        lfn_bytes[27] = 0;
+        for j in 0..2usize {
+            let le = chars[11 + j].to_le_bytes();
+            lfn_bytes[28 + j * 2] = le[0];
+            lfn_bytes[29 + j * 2] = le[1];
+        }
+
+        // Flush current cluster and advance when crossing a cluster boundary.
+        if cur_index >= entries_per_cluster {
+            if !write_cluster(state, cur_cluster) { return None; }
+            let next = read_fat_entry(state, cur_cluster)?;
+            if is_eof(next) || is_bad(next) { return None; }
+            cur_cluster = next;
+            cur_index   = 0;
+            if !read_cluster(state, cur_cluster) { return None; }
+        }
+
+        let off = cur_index * 32;
+        state.cluster_buf[off..off + 32].copy_from_slice(&lfn_bytes);
+        cur_index += 1;
+    }
+
+    // Flush and advance before the 8.3 entry if at a cluster boundary.
+    if cur_index >= entries_per_cluster {
+        if !write_cluster(state, cur_cluster) { return None; }
+        let next = read_fat_entry(state, cur_cluster)?;
+        if is_eof(next) || is_bad(next) { return None; }
+        cur_cluster = next;
+        cur_index   = 0;
+        if !read_cluster(state, cur_cluster) { return None; }
+    }
+
+    // Write the 8.3 entry.
+    let mut entry_83 = Fat32DirEntry::default();
+    entry_83.name        = *short_name;
+    entry_83.attr        = attr;
+    entry_83.fst_clus_lo = (file_cluster & 0xFFFF) as u16;
+    entry_83.fst_clus_hi = ((file_cluster >> 16) & 0xFFFF) as u16;
+    entry_83.file_size   = file_size.to_le();
+
+    let entry_bytes = unsafe {
+        core::slice::from_raw_parts(&entry_83 as *const Fat32DirEntry as *const u8, 32)
+    };
+    let off = cur_index * 32;
+    state.cluster_buf[off..off + 32].copy_from_slice(entry_bytes);
+    if !write_cluster(state, cur_cluster) { return None; }
+
+    Some((cur_cluster, cur_index as u32))
+}
+
+/// Mark `count` consecutive directory entry slots as deleted (0xE5), starting
+/// at `(start_cluster, start_index)`.  Follows the FAT chain across cluster
+/// boundaries.  Used to remove the LFN entries that precede a deleted 8.3 entry.
+fn mark_entries_deleted(
+    state:         &mut Fat32State,
+    start_cluster: u32,
+    start_index:   u32,
+    count:         u32,
+) {
+    if count == 0 { return; }
+    let entries_per_cluster = (state.bytes_per_cluster / 32) as usize;
+    let mut cluster   = start_cluster;
+    let mut index     = start_index as usize;
+    let mut remaining = count as usize;
+
+    while remaining > 0 {
+        if !read_cluster(state, cluster) { return; }
+        let mut dirty = false;
+        while index < entries_per_cluster && remaining > 0 {
+            state.cluster_buf[index * 32] = DIR_ENTRY_DELETED;
+            index     += 1;
+            remaining -= 1;
+            dirty      = true;
+        }
+        if dirty { write_cluster(state, cluster); }
+        if remaining > 0 {
+            match read_fat_entry(state, cluster) {
+                Some(n) if !is_eof(n) && !is_bad(n) => { cluster = n; index = 0; }
+                _ => break,
+            }
+        }
+    }
 }
 
 /// Return (file_size, file_type) for a path. Returns None if not found.
@@ -1228,28 +1523,46 @@ pub fn fat32_unlink(path: &str) -> bool {
         _ => return false,
     };
 
-    let resolved = resolve_path(state, path);
-    let (entry, parent_cluster, entry_index) = match resolved {
-        Some(triple) => triple,
+    // Resolve path to parent dir cluster + filename.
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() { return false; }
+    let filename = match parts.last() { Some(s) => *s, None => return false };
+    let mut parent_cluster = state.root_cluster;
+    for part in &parts[..parts.len()-1] {
+        match lookup_in_dir(state, parent_cluster, part) {
+            Some(d) if d.entry.attr & ATTR_DIRECTORY != 0 => {
+                parent_cluster = entry_cluster(&d.entry);
+            }
+            _ => return false,
+        }
+    }
+
+    let found = match lookup_in_dir(state, parent_cluster, filename) {
+        Some(d) => d,
         None => return false,
     };
 
-    if entry.attr & ATTR_DIRECTORY != 0 { return false; }
-
-    let first_cluster = entry_cluster(&entry);
+    if found.entry.attr & ATTR_DIRECTORY != 0 { return false; }
 
     // Free cluster chain.
+    let first_cluster = entry_cluster(&found.entry);
     if first_cluster >= FIRST_DATA_CLUSTER {
         free_chain(state, first_cluster);
     }
 
-    // Mark directory entry as deleted.
-    if !read_cluster(state, parent_cluster) { return false; }
-    let offset = entry_index as usize * 32;
+    // Delete LFN entries.
+    if found.lfn_count > 0 {
+        mark_entries_deleted(state, found.lfn_start_cluster, found.lfn_start_index,
+                             found.lfn_count);
+    }
+
+    // Mark 8.3 entry as deleted.
+    if !read_cluster(state, found.cluster) { return false; }
+    let offset = found.entry_index as usize * 32;
     if offset < state.cluster_buf.len() {
         state.cluster_buf[offset] = DIR_ENTRY_DELETED;
     }
-    write_cluster(state, parent_cluster);
+    write_cluster(state, found.cluster);
     true
 }
 
@@ -1371,35 +1684,33 @@ impl Inode for Fat32DirInode {
                 ));
             }
 
-            // Find a free directory entry slot.
-            let (entry_cluster_num, entry_index) = find_free_dir_slot(state, dir_cluster)
-                .ok_or(FsError::OutOfMemory)?;
-
-            // Build short name.
-            let mut short_name = [b' '; 11];
-            let nt_res = name_to_short(&name_owned, &mut short_name);
-
-            // Write the new ARCHIVE directory entry.
-            let mut new_entry = Fat32DirEntry::default();
-            new_entry.name = short_name;
-            new_entry.nt_res = nt_res;
-            new_entry.attr = 0x20; // ARCHIVE
-            new_entry.file_size = 0;
-            new_entry.fst_clus_lo = 0;
-            new_entry.fst_clus_hi = 0;
-
-            if !read_cluster(state, entry_cluster_num) { return Err(FsError::IoError); }
-            let entry_offset = entry_index as usize * 32;
-            let entry_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &new_entry as *const Fat32DirEntry as *const u8,
-                    32,
-                )
+            // Write directory entry — with LFN if the name requires it.
+            let (entry_cluster_num, entry_index) = if needs_lfn(&name_owned) {
+                let short_name = generate_short_alias(state, dir_cluster, &name_owned)
+                    .ok_or(FsError::OutOfMemory)?;
+                let n_slots  = lfn_entry_count(&name_owned) + 1;
+                let (sc, si) = find_n_free_dir_slots(state, dir_cluster, n_slots)
+                    .ok_or(FsError::OutOfMemory)?;
+                write_lfn_and_83(state, sc, si, &name_owned, &short_name, 0x20, 0, 0)
+                    .ok_or(FsError::IoError)?
+            } else {
+                let mut short_name = [b' '; 11];
+                let nt_res = name_to_short(&name_owned, &mut short_name);
+                let (sc, si) = find_free_dir_slot(state, dir_cluster)
+                    .ok_or(FsError::OutOfMemory)?;
+                let mut new_entry = Fat32DirEntry::default();
+                new_entry.name   = short_name;
+                new_entry.nt_res = nt_res;
+                new_entry.attr   = 0x20;
+                if !read_cluster(state, sc) { return Err(FsError::IoError); }
+                let entry_bytes = unsafe {
+                    core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
+                };
+                state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
+                if !write_cluster(state, sc) { return Err(FsError::IoError); }
+                (sc, si)
             };
-            state.cluster_buf[entry_offset..entry_offset + 32].copy_from_slice(entry_bytes);
-            if !write_cluster(state, entry_cluster_num) { return Err(FsError::IoError); }
 
-            // entry_cluster_num is the cluster containing the new dir entry.
             Ok(Fat32FileInode::new(0, 0, entry_cluster_num, entry_index))
         }
     }
@@ -1449,27 +1760,34 @@ impl Inode for Fat32DirInode {
 
             if !write_cluster(state, new_cluster) { return Err(FsError::IoError); }
 
-            // Add directory entry in the parent.
-            let (entry_cluster_num, entry_index) = find_free_dir_slot(state, dir_cluster)
-                .ok_or(FsError::OutOfMemory)?;
-
-            let mut short_name = [b' '; 11];
-            let nt_res = name_to_short(&name_owned, &mut short_name);
-
-            let mut new_entry = Fat32DirEntry::default();
-            new_entry.name = short_name;
-            new_entry.nt_res = nt_res;
-            new_entry.attr = ATTR_DIRECTORY;
-            new_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
-            new_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
-
-            if !read_cluster(state, entry_cluster_num) { return Err(FsError::IoError); }
-            let entry_offset = entry_index as usize * 32;
-            let entry_bytes = unsafe {
-                core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
-            };
-            state.cluster_buf[entry_offset..entry_offset + 32].copy_from_slice(entry_bytes);
-            if !write_cluster(state, entry_cluster_num) { return Err(FsError::IoError); }
+            // Add directory entry in the parent — with LFN if the name requires it.
+            if needs_lfn(&name_owned) {
+                let short_name = generate_short_alias(state, dir_cluster, &name_owned)
+                    .ok_or(FsError::OutOfMemory)?;
+                let n_slots  = lfn_entry_count(&name_owned) + 1;
+                let (sc, si) = find_n_free_dir_slots(state, dir_cluster, n_slots)
+                    .ok_or(FsError::OutOfMemory)?;
+                write_lfn_and_83(state, sc, si, &name_owned, &short_name,
+                                  ATTR_DIRECTORY, new_cluster, 0)
+                    .ok_or(FsError::IoError)?;
+            } else {
+                let mut short_name = [b' '; 11];
+                let nt_res = name_to_short(&name_owned, &mut short_name);
+                let (sc, si) = find_free_dir_slot(state, dir_cluster)
+                    .ok_or(FsError::OutOfMemory)?;
+                let mut new_entry = Fat32DirEntry::default();
+                new_entry.name        = short_name;
+                new_entry.nt_res      = nt_res;
+                new_entry.attr        = ATTR_DIRECTORY;
+                new_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
+                new_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+                if !read_cluster(state, sc) { return Err(FsError::IoError); }
+                let entry_bytes = unsafe {
+                    core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
+                };
+                state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
+                if !write_cluster(state, sc) { return Err(FsError::IoError); }
+            }
 
             Ok(Fat32DirInode::new(new_cluster))
         }
@@ -1495,9 +1813,13 @@ impl Inode for Fat32DirInode {
                 free_chain(state, first_cluster);
             }
 
-            // Mark the directory entry as deleted.
-            // found.cluster is the cluster that holds this entry (may differ from
-            // dir_cluster if the directory spans multiple clusters).
+            // Delete any LFN entries that precede this 8.3 entry.
+            if found.lfn_count > 0 {
+                mark_entries_deleted(state, found.lfn_start_cluster, found.lfn_start_index,
+                                     found.lfn_count);
+            }
+
+            // Mark the 8.3 directory entry as deleted.
             if !read_cluster(state, found.cluster) { return Err(FsError::IoError); }
             let offset = found.entry_index as usize * 32;
             if offset < state.cluster_buf.len() {
