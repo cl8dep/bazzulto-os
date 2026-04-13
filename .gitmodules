@@ -1,0 +1,3 @@
+[submodule "kernel/src/fs/bafs"]
+	path = kernel/src/fs/bafs
+	url = https://github.com/cl8dep/bazzulto-bafs.git
