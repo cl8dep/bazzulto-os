@@ -123,21 +123,56 @@ typedef struct {
 } bz_stack_t;
 
 /* ---------------------------------------------------------------------------
+ * sigaction struct — matches the Linux rt_sigaction layout
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Signal action descriptor passed to and from bz_sigaction().
+ *
+ * Layout matches the Linux @c struct sigaction used by rt_sigaction(2), so
+ * that the kernel ABI is stable across future ABI extensions.
+ *
+ * Fields:
+ *   @c sa_handler  — one of @c BZ_SIG_DFL, @c BZ_SIG_IGN, or the virtual
+ *                    address of a @c void(*)(int) signal handler function.
+ *   @c sa_flags    — combination of @c BZ_SA_* flags controlling handler
+ *                    delivery (see sigaction_flags group above), or 0.
+ *   @c sa_restorer — must be set to 0; the signal return trampoline address
+ *                    is managed by the BSL runtime, not by the caller.
+ *   @c sa_mask     — 128-byte (16 × uint64_t) signal set of signals to block
+ *                    during handler execution.  Currently ignored by the
+ *                    kernel; zero-initialise for forward compatibility.
+ */
+typedef struct {
+    uint64_t sa_handler;    /**< BZ_SIG_DFL, BZ_SIG_IGN, or handler fn ptr. */
+    uint64_t sa_flags;      /**< Combination of BZ_SA_* flags, or 0. */
+    uint64_t sa_restorer;   /**< Set to 0; managed by the runtime. */
+    uint64_t sa_mask[16];   /**< Blocked signals during handler (currently ignored). */
+} bz_sigaction_t;
+
+/* ---------------------------------------------------------------------------
  * Functions
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Install or query a signal handler.
+ * @brief Install or query a signal action.
+ *
+ * Wraps the kernel's rt_sigaction ABI.  Either @p new_action or
+ * @p old_action_out may be NULL:
+ *   - Pass @p new_action = NULL to query the current action without changing it.
+ *   - Pass @p old_action_out = NULL to install a new action without retrieving
+ *     the previous one.
  *
  * @param signal_number   Signal to configure (one of the @c BZ_SIG* constants).
- * @param handler_va      New handler: @c BZ_SIG_DFL, @c BZ_SIG_IGN, or the
- *                        virtual address of a @c void(*)(int) function.
- * @param flags           Combination of @c BZ_SA_* flags, or 0.
- * @param old_handler_out Written with the previous handler value. May be NULL.
+ *                        @c BZ_SIGKILL and @c BZ_SIGSTOP cannot be caught or
+ *                        ignored — the kernel returns @c -BZ_EINVAL.
+ * @param new_action      New signal action to install, or NULL to query only.
+ * @param old_action_out  Written with the previous signal action. May be NULL.
  * @return 0 on success, or a negative errno value on failure.
  */
-int64_t bz_sigaction(int32_t signal_number, uint64_t handler_va,
-                     uint32_t flags, uint64_t *old_handler_out);
+int64_t bz_sigaction(int32_t signal_number,
+                     const bz_sigaction_t *new_action,
+                     bz_sigaction_t *old_action_out);
 
 /**
  * @brief Send a signal to a process.

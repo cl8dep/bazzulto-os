@@ -26,7 +26,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
         }
     };
 
-    let destination_fd = raw::raw_creat(destination.as_ptr(), destination.len());
+    let mut destination_buf = [0u8; 512];
+    let destination_len = destination.len().min(511);
+    destination_buf[..destination_len].copy_from_slice(&destination.as_bytes()[..destination_len]);
+    let destination_fd = raw::raw_creat(destination_buf.as_ptr(), 0o644);
     if destination_fd < 0 {
         write_stderr("cp: cannot create '");
         write_stderr(destination);

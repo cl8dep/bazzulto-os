@@ -7,8 +7,7 @@
  * process groups and sessions, current working directory, file-system helpers,
  * and directory enumeration via bz_getdents64().
  *
- * All path arguments are UTF-8 byte strings; the @p path_len parameter must
- * equal @c strlen(path) — the null terminator is NOT included.
+ * All path arguments are NUL-terminated UTF-8 C strings.
  */
 
 #include <stdint.h>
@@ -25,11 +24,10 @@ extern "C" {
 /**
  * @brief Spawn a child process from a ramfs path.
  *
- * @param path      Absolute path to the executable.
- * @param path_len  Byte length of @p path (not including the null terminator).
+ * @param path  NUL-terminated absolute path to the executable.
  * @return Child PID on success, or a negative errno value on failure.
  */
-int64_t bz_spawn(const char *path, size_t path_len);
+int64_t bz_spawn(const char *path);
 
 /**
  * @brief Fork the current process.
@@ -48,33 +46,40 @@ int64_t bz_fork(void);
  * This variant passes no environment — the new image starts with an empty
  * @c envp.  Prefer bz_execve() when environment propagation is needed.
  *
- * @param path      Absolute path to the new executable.
- * @param path_len  Byte length of @p path (not including the null terminator).
- * @param argv      Flat, null-separated argument buffer
- *                  ("arg0\0arg1\0…argN\0").
- * @param argv_len  Total byte length of @p argv.
+ * Follows the POSIX execv() convention: @p argv is a NULL-terminated array of
+ * NUL-terminated strings.  @c argv[0] is conventionally the program name.
+ *
+ * @param path  NUL-terminated absolute path to the new executable.
+ * @param argv  NULL-terminated array of NUL-terminated argument strings.
  * @return Negative errno value on failure.  Does not return on success.
  */
-int64_t bz_exec(const char *path, size_t path_len,
-                const char *argv, size_t argv_len);
+int64_t bz_exec(const char *path, char *const argv[]);
 
 /**
  * @brief Replace the current process image (argv + envp).
  *
- * POSIX-equivalent of execve().
+ * POSIX-equivalent of execve().  Both @p argv and @p envp follow the POSIX
+ * convention: NULL-terminated arrays of NUL-terminated strings.
+ * @p envp entries are conventionally @c "KEY=VALUE" strings.
  *
- * @param path      Absolute path to the new executable.
- * @param path_len  Byte length of @p path.
- * @param argv      Flat, null-separated argument buffer.
- * @param argv_len  Total byte length of @p argv.
- * @param envp      Flat, null-separated environment buffer
- *                  ("KEY=VALUE\0KEY2=VALUE2\0").
- * @param envp_len  Total byte length of @p envp.
+ * @param path  NUL-terminated absolute path to the new executable.
+ * @param argv  NULL-terminated array of NUL-terminated argument strings.
+ * @param envp  NULL-terminated array of NUL-terminated environment strings.
  * @return Negative errno value on failure.  Does not return on success.
  */
-int64_t bz_execve(const char *path, size_t path_len,
-                  const char *argv, size_t argv_len,
-                  const char *envp, size_t envp_len);
+int64_t bz_execve(const char *path, char *const argv[], char *const envp[]);
+
+/* ---------------------------------------------------------------------------
+ * bz_wait() options flags
+ * ------------------------------------------------------------------------- */
+
+/** @defgroup wait_options bz_wait() Options
+ *  @{
+ */
+/** Return immediately (with return value 0) if no child has exited yet,
+ *  instead of blocking.  Analogous to POSIX WNOHANG. */
+#define WNOHANG  1
+/** @} */
 
 /**
  * @brief Wait for a child process to exit.
@@ -82,9 +87,13 @@ int64_t bz_execve(const char *path, size_t path_len,
  * @param pid         PID to wait for, or -1 to wait for any child.
  * @param status_out  Pointer where the raw wait status is written (compatible
  *                    with POSIX WIFEXITED / WEXITSTATUS macros). May be NULL.
- * @return The PID of the child that exited, or a negative errno value.
+ * @param options     0 for blocking wait, or @c WNOHANG to return immediately
+ *                    if no child has exited.  When @c WNOHANG is set and no
+ *                    child has exited, returns 0 rather than blocking.
+ * @return The PID of the child that exited, 0 if @c WNOHANG was set and no
+ *         child has exited, or a negative errno value on error.
  */
-int64_t bz_wait(int32_t pid, int32_t *status_out);
+int64_t bz_wait(int32_t pid, int32_t *status_out, int32_t options);
 
 /**
  * @brief Terminate the current process.
@@ -191,11 +200,10 @@ int64_t bz_getcwd(char *buf, size_t buf_len);
 /**
  * @brief Change the current working directory.
  *
- * @param path      New working directory path.
- * @param path_len  Byte length of @p path.
+ * @param path  NUL-terminated new working directory path.
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_chdir(const char *path, size_t path_len);
+int64_t bz_chdir(const char *path);
 
 /* ---------------------------------------------------------------------------
  * Directory creation
@@ -204,13 +212,12 @@ int64_t bz_chdir(const char *path, size_t path_len);
 /**
  * @brief Create a directory.
  *
- * @param path      Path of the new directory.
- * @param path_len  Byte length of @p path.
- * @param mode      Permission bits (e.g. @c 0755); umask is applied.
+ * @param path  NUL-terminated path of the new directory.
+ * @param mode  Permission bits (e.g. @c 0755); umask is applied.
  * @return 0 on success, or a negative errno value (e.g. @c -BZ_EEXIST if the
  *         path already exists).
  */
-int64_t bz_mkdir(const char *path, size_t path_len, uint32_t mode);
+int64_t bz_mkdir(const char *path, uint32_t mode);
 
 /* ---------------------------------------------------------------------------
  * Directory enumeration — bz_getdents64

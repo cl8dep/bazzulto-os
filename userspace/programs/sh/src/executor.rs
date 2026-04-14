@@ -224,7 +224,7 @@ fn run_pipeline(pipeline: &Pipeline, state: &mut ShellState, _in_subshell: bool)
     for (i, pid) in pids.iter().enumerate() {
         if *pid >= 0 {
             let mut raw_status = 0i32;
-            raw::raw_wait(*pid, &mut raw_status as *mut i32);
+            raw::raw_wait(*pid, &mut raw_status as *mut i32, 0);
             let s = decode_wait_status(raw_status);
             statuses.push(s);
             if i == n - 1 { last_status = s; }
@@ -391,7 +391,7 @@ fn run_builtin_with_io(
     close_optional(redir_in);
     close_optional(redir_out);
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     decode_wait_status(raw_status)
 }
 
@@ -436,7 +436,7 @@ fn execute_no_command(
     close_optional(redir_in);
     close_optional(redir_out);
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     decode_wait_status(raw_status)
 }
 
@@ -472,7 +472,7 @@ fn execute_subshell(cmd: &SimpleCommand, in_fd: i32, out_fd: i32, state: &mut Sh
     close_optional(redir_in);
     close_optional(redir_out);
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     decode_wait_status(raw_status)
 }
 
@@ -512,7 +512,7 @@ fn execute_group(cmd: &SimpleCommand, in_fd: i32, out_fd: i32, state: &mut Shell
     close_optional(redir_in);
     close_optional(redir_out);
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     decode_wait_status(raw_status)
 }
 
@@ -955,7 +955,7 @@ pub fn command_substitution(cmd_text: &str, state: &mut ShellState) -> String {
     raw::raw_close(read_fd);
 
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     let exit_status = decode_wait_status(raw_status);
     state.last_exit_status = exit_status;
 
@@ -1028,24 +1028,32 @@ fn fork_and_exec_expanded(
         let mut fd = 3i32;
         while fd < 64 { raw::raw_close(fd); fd += 1; }
 
-        let mut argv_flat: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        for word in &cmd.words {
-            argv_flat.extend_from_slice(word.as_bytes());
-            argv_flat.push(0u8);
-        }
+        // Build NUL-terminated argv strings and a pointer array.
+        let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = cmd.words.iter().map(|w| {
+            let mut s = alloc::vec::Vec::from(w.as_bytes());
+            s.push(0u8);
+            s
+        }).collect();
+        let mut argv_ptrs: alloc::vec::Vec<*const u8> =
+            argv_strings.iter().map(|s| s.as_ptr()).collect();
+        argv_ptrs.push(core::ptr::null()); // NULL terminator
 
         // §2.5.3: Build envp from exported variables.
-        let (envp_flat, _envp_offsets) = state.vars.build_envp();
+        let (envp_flat, envp_offsets) = state.vars.build_envp();
+        let mut envp_ptrs: alloc::vec::Vec<*const u8> =
+            envp_offsets.iter().map(|&off| envp_flat[off..].as_ptr()).collect();
+        envp_ptrs.push(core::ptr::null());
 
-        raw::raw_execve(
-            path.as_ptr(), path.len(),
-            argv_flat.as_ptr(), argv_flat.len(),
-            envp_flat.as_ptr(), envp_flat.len(),
-        );
+        // NUL-terminate the path.
+        let mut path_buf = [0u8; 512];
+        let path_len = path.len().min(511);
+        path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+
+        raw::raw_exec(path_buf.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
 
         // ENOEXEC: check for shebang.
         let mut hdr = [0u8; 2];
-        let hdr_fd = raw::raw_open(path.as_ptr(), path.len());
+        let hdr_fd = raw::raw_open(path_buf.as_ptr(), 0 /* O_RDONLY */, 0);
         let is_script = if hdr_fd >= 0 {
             let n = raw::raw_read(hdr_fd as i32, hdr.as_mut_ptr(), 2);
             raw::raw_close(hdr_fd as i32);
@@ -1056,20 +1064,23 @@ fn fork_and_exec_expanded(
 
         if is_script {
             let sh_path = b"/system/bin/sh\0";
-            let mut new_argv: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-            new_argv.extend_from_slice(b"sh\0");
-            new_argv.extend_from_slice(path.as_bytes());
-            new_argv.push(0u8);
+            // argv: ["sh", path, ...original args from index 1...]
+            let mut new_argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec![
+                alloc::vec::Vec::from(b"sh\0".as_ref()),
+                { let mut s = alloc::vec::Vec::from(path.as_bytes()); s.push(0u8); s },
+            ];
             for word in cmd.words.iter().skip(1) {
-                new_argv.extend_from_slice(word.as_bytes());
-                new_argv.push(0u8);
+                let mut s = alloc::vec::Vec::from(word.as_bytes());
+                s.push(0u8);
+                new_argv_strings.push(s);
             }
-            raw::raw_execve(
-                sh_path.as_ptr(), sh_path.len() - 1,
-                new_argv.as_ptr(), new_argv.len(),
-                envp_flat.as_ptr(), envp_flat.len(),
-            );
+            let mut new_argv_ptrs: alloc::vec::Vec<*const u8> =
+                new_argv_strings.iter().map(|s| s.as_ptr()).collect();
+            new_argv_ptrs.push(core::ptr::null());
+            raw::raw_exec(sh_path.as_ptr(), new_argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
         }
+        // suppress unused warnings
+        let _ = &argv_strings;
 
         write_err(cmd.words[0].as_str());
         write_err(": cannot execute\n");
@@ -1081,7 +1092,7 @@ fn fork_and_exec_expanded(
 
     raw::raw_setfgpid(pid as i32);
     let mut raw_status = 0i32;
-    raw::raw_wait(pid as i32, &mut raw_status);
+    raw::raw_wait(pid as i32, &mut raw_status, 0);
     raw::raw_setfgpid(0);
 
     decode_wait_status(raw_status)
@@ -1111,7 +1122,10 @@ fn open_redirects(redirects: &[Redirect]) -> Option<(Option<i32>, Option<i32>)> 
     for redirect in redirects {
         match redirect {
             Redirect::StdinFrom(_fd, path) => {
-                let fd = raw::raw_open(path.as_ptr(), path.len());
+                let mut stdin_path_buf = [0u8; 512];
+                let stdin_path_len = path.len().min(511);
+                stdin_path_buf[..stdin_path_len].copy_from_slice(&path.as_bytes()[..stdin_path_len]);
+                let fd = raw::raw_open(stdin_path_buf.as_ptr(), 0, 0);
                 if fd < 0 {
                     write_err("sh: ");
                     write_err(path.as_str());
@@ -1125,7 +1139,10 @@ fn open_redirects(redirects: &[Redirect]) -> Option<(Option<i32>, Option<i32>)> 
             }
 
             Redirect::StdoutTo(_fd, path) | Redirect::StdoutNoclobber(_fd, path) => {
-                let fd = raw::raw_creat(path.as_ptr(), path.len());
+                let mut stdout_path_buf = [0u8; 512];
+                let stdout_path_len = path.len().min(511);
+                stdout_path_buf[..stdout_path_len].copy_from_slice(&path.as_bytes()[..stdout_path_len]);
+                let fd = raw::raw_creat(stdout_path_buf.as_ptr(), 0o644);
                 if fd < 0 {
                     write_err("sh: ");
                     write_err(path.as_str());
@@ -1139,7 +1156,11 @@ fn open_redirects(redirects: &[Redirect]) -> Option<(Option<i32>, Option<i32>)> 
             }
 
             Redirect::StdoutAppend(_fd, path) => {
-                let fd = raw::raw_creat_append(path.as_ptr(), path.len());
+                let mut append_path_buf = [0u8; 512];
+                let append_path_len = path.len().min(511);
+                append_path_buf[..append_path_len].copy_from_slice(&path.as_bytes()[..append_path_len]);
+                // O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400
+                let fd = raw::raw_open(append_path_buf.as_ptr(), 1 | 0x40 | 0x400, 0o666);
                 if fd < 0 {
                     write_err("sh: ");
                     write_err(path.as_str());
@@ -1154,7 +1175,11 @@ fn open_redirects(redirects: &[Redirect]) -> Option<(Option<i32>, Option<i32>)> 
             }
 
             Redirect::ReadWrite(_fd, path) => {
-                let fd = raw::raw_creat_append(path.as_ptr(), path.len());
+                let mut rw_path_buf = [0u8; 512];
+                let rw_path_len = path.len().min(511);
+                rw_path_buf[..rw_path_len].copy_from_slice(&path.as_bytes()[..rw_path_len]);
+                // O_RDWR|O_CREAT = 2|0x40
+                let fd = raw::raw_open(rw_path_buf.as_ptr(), 2 | 0x40, 0o666);
                 if fd < 0 {
                     write_err("sh: ");
                     write_err(path.as_str());
@@ -1274,7 +1299,10 @@ fn resolve_command_with_path(name: &str, state: &ShellState) -> Option<String> {
         let mut candidate = String::from(dir);
         if !candidate.ends_with('/') { candidate.push('/'); }
         candidate.push_str(name);
-        let fd = raw::raw_open(candidate.as_ptr(), candidate.len());
+        let mut resolve_path_buf = [0u8; 512];
+        let resolve_path_len = candidate.len().min(511);
+        resolve_path_buf[..resolve_path_len].copy_from_slice(&candidate.as_bytes()[..resolve_path_len]);
+        let fd = raw::raw_open(resolve_path_buf.as_ptr(), 0, 0);
         if fd >= 0 {
             raw::raw_close(fd as i32);
             return Some(candidate);

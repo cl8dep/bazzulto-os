@@ -239,9 +239,11 @@ fn spawn_with_binary(
 /// Perform the actual spawn syscall and update service state.
 fn do_spawn(service_state: &mut ServiceState, binary: &str) {
     let capability_mask = service_state.definition.capabilities;
+    let mut binary_buf = [0u8; 512];
+    let binary_len = binary.len().min(511);
+    binary_buf[..binary_len].copy_from_slice(&binary.as_bytes()[..binary_len]);
     let result = raw::raw_spawn_with_capabilities(
-        binary.as_ptr(),
-        binary.len(),
+        binary_buf.as_ptr(),
         capability_mask,
     );
     if result < 0 {

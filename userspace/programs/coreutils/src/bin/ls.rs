@@ -144,10 +144,37 @@ fn resolve_path(path: &str) -> String {
 }
 
 /// Call fstat for a path. Returns [size, file_type] or None.
+///
+/// file_type is mapped from the Linux stat64 mode field (S_IFMT bits) to
+/// the internal FTYPE_* constants used throughout ls.
 fn fstat(path: &str) -> Option<[u64; 2]> {
-    let mut buf = [0u64; 2];
-    let ret = raw::raw_fstat(path.as_ptr(), path.len(), buf.as_mut_ptr());
-    if ret < 0 { None } else { Some(buf) }
+    // Open the file to get an fd for the fd-based fstat.
+    let mut path_buf = [0u8; 512];
+    let path_len = path.len().min(511);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
+    if fd < 0 {
+        return None;
+    }
+    // 128-byte Linux stat64 struct: size at offset 40 (u64), mode at offset 16 (u32).
+    let mut stat_buf = [0u8; 128];
+    let ret = raw::raw_fstat(fd as i32, stat_buf.as_mut_ptr());
+    raw::raw_close(fd as i32);
+    if ret < 0 {
+        return None;
+    }
+    let size = u64::from_le_bytes(stat_buf[40..48].try_into().unwrap_or([0; 8]));
+    let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0; 4]));
+    // Map S_IFMT bits to internal FTYPE_* constants.
+    let file_type = match mode & 0xF000 {
+        0x8000 => FTYPE_REGULAR,    // S_IFREG
+        0x4000 => FTYPE_DIRECTORY,  // S_IFDIR
+        0x2000 => FTYPE_CHARDEV,    // S_IFCHR
+        0x1000 => FTYPE_FIFO,       // S_IFIFO
+        0xA000 => FTYPE_SYMLINK,    // S_IFLNK
+        _ => FTYPE_REGULAR,
+    };
+    Some([size, file_type])
 }
 
 /// Replace non-printable bytes in `name` with '?' if -q is set.
@@ -253,7 +280,10 @@ fn write_u64_right(value: u64, width: usize) {
 const DIRENT_HEADER: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
 
 fn read_entries(dir_path: &str, opts: &Options) -> Vec<Entry> {
-    let fd = raw::raw_open(dir_path.as_ptr(), dir_path.len());
+    let mut dir_path_buf = [0u8; 512];
+    let dir_path_len = dir_path.len().min(511);
+    dir_path_buf[..dir_path_len].copy_from_slice(&dir_path.as_bytes()[..dir_path_len]);
+    let fd = raw::raw_open(dir_path_buf.as_ptr(), 0, 0);
     if fd < 0 {
         return Vec::new();
     }
@@ -471,7 +501,10 @@ fn list_directory(dir_path: &str, opts: &Options, print_header: bool) -> bool {
     let mut entries = read_entries(&resolved, opts);
     if entries.is_empty() {
         // Distinguish "not found" from "empty directory".
-        let fd = raw::raw_open(resolved.as_ptr(), resolved.len());
+        let mut resolved_buf = [0u8; 512];
+        let resolved_len = resolved.len().min(511);
+        resolved_buf[..resolved_len].copy_from_slice(&resolved.as_bytes()[..resolved_len]);
+        let fd = raw::raw_open(resolved_buf.as_ptr(), 0, 0);
         if fd < 0 {
             write_stderr("ls: cannot access '");
             write_stderr(dir_path);
@@ -681,7 +714,10 @@ fn list_directory_no_header(dir_path: &str, opts: &Options) -> bool {
 
     let mut entries = read_entries(&resolved, opts);
     if entries.is_empty() {
-        let fd = raw::raw_open(resolved.as_ptr(), resolved.len());
+        let mut resolved_buf2 = [0u8; 512];
+        let resolved_len2 = resolved.len().min(511);
+        resolved_buf2[..resolved_len2].copy_from_slice(&resolved.as_bytes()[..resolved_len2]);
+        let fd = raw::raw_open(resolved_buf2.as_ptr(), 0, 0);
         if fd < 0 {
             write_stderr("ls: cannot access '");
             write_stderr(dir_path);

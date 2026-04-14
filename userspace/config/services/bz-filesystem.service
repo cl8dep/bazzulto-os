@@ -1,6 +1,0 @@
-[Service]
-name    = "bz-filesystem"
-binary  = "/system/bin/drivers/bz-filesystem-driver"
-after   = []
-restart = "exponential-backoff"
-max_retries = "5"

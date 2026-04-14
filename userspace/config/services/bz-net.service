@@ -1,6 +1,0 @@
-[Service]
-name    = "bz-net"
-binary  = "/system/bin/drivers/bz-net-driver"
-after   = ["bz-filesystem"]
-restart = "exponential-backoff"
-max_retries = "3"

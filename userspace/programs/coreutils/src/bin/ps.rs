@@ -18,8 +18,8 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
     let _ = argc;
 
     // Open /proc directory.
-    let proc_path = "/proc";
-    let proc_fd = raw::raw_open(proc_path.as_ptr(), proc_path.len());
+    let proc_path = b"/proc\0";
+    let proc_fd = raw::raw_open(proc_path.as_ptr(), 0, 0);
     if proc_fd < 0 {
         write_stderr("ps: cannot open /proc\n");
         raw::raw_exit(1);
@@ -98,7 +98,7 @@ fn print_process_info(pid_str: &str) {
     for b in pid_str.bytes() { comm_path[path_len] = b; path_len += 1; }
     for &b in suffix { comm_path[path_len] = b; path_len += 1; }
 
-    let comm_fd = raw::raw_open(comm_path.as_ptr(), path_len);
+    let comm_fd = raw::raw_open(comm_path.as_ptr(), 0, 0);
     if comm_fd >= 0 {
         let mut comm_buf = [0u8; 256];
         let n = raw::raw_read(comm_fd as i32, comm_buf.as_mut_ptr(), comm_buf.len());

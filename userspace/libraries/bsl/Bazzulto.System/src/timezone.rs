@@ -310,7 +310,10 @@ const MAX_TZIF_SIZE: usize = 128 * 1024;
 
 /// Read a TZif file and parse it into a `Timezone`.
 pub fn load_tzif_file(path: &str) -> Option<Timezone> {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut path_buf = [0u8; 512];
+    let path_len = path.len().min(511);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0 /* O_RDONLY */, 0);
     if fd < 0 { return None; }
     let fd = fd as i32;
 

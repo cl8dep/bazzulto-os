@@ -83,13 +83,16 @@ fn main() {
 
     // Step 5 — open the state fd (if supported by kernel; ignore error)
     let state_path = "/proc/bzinit/state";
-    let state_fd_result = raw::raw_creat(state_path.as_ptr(), state_path.len());
+    let mut state_path_buf = [0u8; 512];
+    let state_path_len = state_path.len().min(511);
+    state_path_buf[..state_path_len].copy_from_slice(&state_path.as_bytes()[..state_path_len]);
+    let state_fd_result = raw::raw_creat(state_path_buf.as_ptr(), 0o600);
     let state_fd: i32 = if state_fd_result >= 0 { state_fd_result as i32 } else { -1 };
 
     // Step 6 — wait loop
     loop {
         let mut exit_status: i32 = 0;
-        let child_pid = raw::raw_wait(-1, &mut exit_status as *mut i32);
+        let child_pid = raw::raw_wait(-1, &mut exit_status as *mut i32, 0);
 
         if child_pid > 0 {
             handle_child_exit(&mut services, child_pid as i32, exit_status, display_pipe.as_ref());

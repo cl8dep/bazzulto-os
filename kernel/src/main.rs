@@ -23,7 +23,7 @@ mod process;
 mod scheduler;
 mod smp;
 mod sync;
-mod syscall;
+mod systemcalls;
 mod vdso;
 
 use memory::heap::KernelGlobalAllocator;

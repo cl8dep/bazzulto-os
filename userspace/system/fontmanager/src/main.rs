@@ -142,7 +142,10 @@ fn command_install(source_path: &str) -> i32 {
     destination_path.push_str(file_name);
 
     // Write to destination.
-    let destination_fd = raw::raw_creat(destination_path.as_ptr(), destination_path.len());
+    let mut destination_path_buf = [0u8; 512];
+    let destination_path_len = destination_path.len().min(511);
+    destination_path_buf[..destination_path_len].copy_from_slice(&destination_path.as_bytes()[..destination_path_len]);
+    let destination_fd = raw::raw_creat(destination_path_buf.as_ptr(), 0o644);
     if destination_fd < 0 {
         write_stderr("bzfontd: cannot create '");
         write_stderr(&destination_path);

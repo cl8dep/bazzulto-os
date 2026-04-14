@@ -92,15 +92,13 @@ pub fn raw_yield() -> i64 {
     vdso_call0!(SLOT_YIELD)
 }
 
-/// Open a file by path for reading (O_RDONLY). `name` must be a valid UTF-8
-/// byte slice (not NUL-terminated). Returns fd >= 0 on success, negative errno
-/// on failure.
-///
-/// Passes flags=0 and mode=0 explicitly so uninitialized registers cannot
-/// accidentally set O_CREAT/O_EXCL/O_TRUNC and cause EEXIST on existing files.
+/// Open a file. `name` must be a NUL-terminated C string.
+/// `flags` is a combination of O_* constants; `mode` is the permission bits
+/// (only meaningful when O_CREAT is set).
+/// Returns fd >= 0 on success, negative errno on failure.
 #[inline]
-pub fn raw_open(name: *const u8, name_len: usize) -> i64 {
-    vdso_call4!(SLOT_OPEN, name, name_len, 0u64, 0u64)
+pub fn raw_open(name: *const u8, flags: i32, mode: u32) -> i64 {
+    vdso_call3!(SLOT_OPEN, name, flags, mode)
 }
 
 #[inline]
@@ -113,23 +111,24 @@ pub fn raw_seek(fd: i32, offset: i64, whence: i32) -> i64 {
     vdso_call3!(SLOT_SEEK, fd, offset as u64, whence)
 }
 
-/// Spawn a child process from a ramfs path. Returns child PID on success.
+/// Spawn a child process from a ramfs path. `name` must be NUL-terminated.
+/// Returns child PID on success, negative errno on failure.
 #[inline]
-pub fn raw_spawn(name: *const u8, name_len: usize) -> i64 {
-    vdso_call3!(SLOT_SPAWN, name, name_len, 0u64)
+pub fn raw_spawn(name: *const u8) -> i64 {
+    vdso_call2!(SLOT_SPAWN, name, 0u64)
 }
 
 /// Like `raw_spawn` but grants `capability_mask` to the new process.
 ///
 /// The caller must hold `CAP_SETCAP` and each capability in the mask.
+/// `name` must be NUL-terminated.
 /// Returns the child PID on success, negative errno on failure.
 #[inline]
 pub fn raw_spawn_with_capabilities(
     name:             *const u8,
-    name_len:         usize,
     capability_mask:  u64,
 ) -> i64 {
-    vdso_call3!(SLOT_SPAWN, name, name_len, capability_mask)
+    vdso_call2!(SLOT_SPAWN, name, capability_mask)
 }
 
 /// List ramfs entries. Copies entry name into `buf`. Returns name length or < 0.
@@ -139,10 +138,11 @@ pub fn raw_list(buf: *mut u8, buf_len: usize) -> i64 {
 }
 
 /// Wait for a child process. `pid = -1` waits for any child.
+/// `options`: 0 to block, 1 (WNOHANG) to return 0 immediately if no child exited.
 /// Returns child PID; writes exit status to `*status_out` if non-null.
 #[inline]
-pub fn raw_wait(pid: i32, status_out: *mut i32) -> i64 {
-    vdso_call2!(SLOT_WAIT, pid, status_out)
+pub fn raw_wait(pid: i32, status_out: *mut i32, options: i32) -> i64 {
+    vdso_call4!(SLOT_WAIT, pid, status_out, options, 0u64)
 }
 
 /// Create a pipe. Writes two fds into `fd_pair[0]` (read) and `fd_pair[1]` (write).
@@ -178,27 +178,15 @@ pub fn raw_fork() -> i64 {
     vdso_call0!(SLOT_FORK)
 }
 
-/// Replace current process image. `name` is the ramfs path.
+/// Replace current process image. `name` must be NUL-terminated.
 ///
-/// `argv_flat` is a flat buffer of NUL-separated argument strings
-/// (e.g. `"cat\0file.txt\0"`). Pass `core::ptr::null()` and `0` if no
-/// arguments are needed.
+/// `argv` is a NULL-terminated array of pointers to NUL-terminated strings
+/// (POSIX execv convention). Pass a pointer to a null pointer for no args.
+/// `envp` is a NULL-terminated array of `KEY=VALUE\0` NUL-terminated strings.
+/// Pass a pointer to a null pointer to inherit no environment.
 #[inline]
-pub fn raw_exec(name: *const u8, name_len: usize, argv_flat: *const u8, argv_len: usize) -> i64 {
-    vdso_call4!(SLOT_EXEC, name, name_len, argv_flat, argv_len)
-}
-
-/// `exec` with an explicit environment (passes all 6 args to the exec syscall).
-///
-/// `envp_flat` is a flat `NAME=value\0` byte array; `envp_len` is its length.
-/// The kernel parses this the same way it parses `argv_flat`.
-#[inline]
-pub fn raw_execve(
-    name: *const u8, name_len: usize,
-    argv_flat: *const u8, argv_len: usize,
-    envp_flat: *const u8, envp_len: usize,
-) -> i64 {
-    vdso_call6!(SLOT_EXEC, name, name_len, argv_flat, argv_len, envp_flat, envp_len)
+pub fn raw_exec(name: *const u8, argv: *const *const u8, envp: *const *const u8) -> i64 {
+    vdso_call3!(SLOT_EXEC, name, argv, envp)
 }
 
 #[inline]
@@ -221,9 +209,13 @@ pub fn raw_nanosleep(req: *const u64) -> i64 {
     vdso_call1!(SLOT_NANOSLEEP, req)
 }
 
+/// Install or query a signal action. `new_act` and `old_act` each point to
+/// a 152-byte rt_sigaction struct: {sa_handler:u64, sa_flags:u64,
+/// sa_restorer:u64, sa_mask:[u64;16]}. Pass null to skip either.
+/// `sigsetsize` must be 8 (size of the mask in bytes that the kernel reads).
 #[inline]
-pub fn raw_sigaction(signal_number: i32, handler_va: u64, old_handler: *mut u64) -> i64 {
-    vdso_call3!(SLOT_SIGACTION, signal_number, handler_va, old_handler)
+pub fn raw_sigaction(signal_number: i32, new_act: *const u8, old_act: *mut u8) -> i64 {
+    vdso_call4!(SLOT_SIGACTION, signal_number, new_act, old_act, 8u64)
 }
 
 #[inline]
@@ -231,33 +223,30 @@ pub fn raw_kill(pid: i32, signal_number: i32) -> i64 {
     vdso_call2!(SLOT_KILL, pid, signal_number)
 }
 
+/// Create or truncate a file. `name` must be NUL-terminated. `mode` sets
+/// permission bits (umask applied by kernel). Returns fd on success.
 #[inline]
-pub fn raw_creat(name: *const u8, name_len: usize) -> i64 {
-    vdso_call3!(SLOT_CREAT, name, name_len, 0usize) // flags=0 → truncate
+pub fn raw_creat(name: *const u8, mode: u32) -> i64 {
+    vdso_call2!(SLOT_CREAT, name, mode)
 }
 
-/// Open or create a file for writing WITHOUT truncating (for `>>` append).
+/// Unlink (delete) a file. `name` must be NUL-terminated.
 #[inline]
-pub fn raw_creat_append(name: *const u8, name_len: usize) -> i64 {
-    vdso_call3!(SLOT_CREAT, name, name_len, 1usize) // flags=1 → no truncate
+pub fn raw_unlink(name: *const u8) -> i64 {
+    vdso_call1!(SLOT_UNLINK, name)
 }
 
-#[inline]
-pub fn raw_unlink(name: *const u8, name_len: usize) -> i64 {
-    vdso_call2!(SLOT_UNLINK, name, name_len)
-}
-
-/// Get file metadata by path.
+/// Get file metadata by file descriptor.
 ///
-/// On success writes two u64 values into `stat_buf`:
-///   `[0]` — file size in bytes
-///   `[1]` — file type: 1=regular, 2=directory, 3=chardev, 4=fifo, 5=symlink
+/// On success writes a 128-byte Linux stat64 struct into `stat_buf`.
+/// Key offsets: size at +40 (u64), mode at +16 (u32), nlink at +20 (u32),
+/// ino at +8 (u64), blksize at +48 (u64), blocks at +56 (u64).
 ///
 /// Returns 0 on success or a negative errno on failure.
-/// `stat_buf` must point to at least 16 bytes of writable memory.
+/// `stat_buf` must point to at least 128 bytes of writable memory.
 #[inline]
-pub fn raw_fstat(name: *const u8, name_len: usize, stat_buf: *mut u64) -> i64 {
-    vdso_call3!(SLOT_FSTAT, name, name_len, stat_buf)
+pub fn raw_fstat(fd: i32, stat_buf: *mut u8) -> i64 {
+    vdso_call2!(SLOT_FSTAT, fd, stat_buf)
 }
 
 #[inline]
@@ -274,12 +263,12 @@ pub fn raw_getcwd(buf: *mut u8, buf_len: usize) -> i64 {
     vdso_call2!(SLOT_GETCWD, buf, buf_len)
 }
 
-/// Create directory at `path` with the given `mode`.
+/// Create directory at `path` with the given `mode`. `path` must be NUL-terminated.
 ///
 /// Returns 0 on success or a negative errno on failure.
 #[inline]
-pub fn raw_mkdir(path: *const u8, path_len: usize, mode: u32) -> i64 {
-    vdso_call3!(SLOT_MKDIR, path, path_len, mode)
+pub fn raw_mkdir(path: *const u8, mode: u32) -> i64 {
+    vdso_call2!(SLOT_MKDIR, path, mode)
 }
 
 /// Read directory entries into `buf`.
@@ -292,12 +281,12 @@ pub fn raw_getdents64(fd: i32, buf: *mut u8, buf_len: usize) -> i64 {
     vdso_call3!(SLOT_GETDENTS64, fd, buf, buf_len)
 }
 
-/// Change the current working directory.
+/// Change the current working directory. `path` must be NUL-terminated.
 ///
 /// Returns 0 on success or a negative errno on failure.
 #[inline]
-pub fn raw_chdir(path: *const u8, path_len: usize) -> i64 {
-    vdso_call2!(SLOT_CHDIR, path, path_len)
+pub fn raw_chdir(path: *const u8) -> i64 {
+    vdso_call1!(SLOT_CHDIR, path)
 }
 
 /// Retrieve resource usage for the current process or its children.
@@ -353,20 +342,16 @@ pub fn raw_machine_poweroff() -> ! {
     loop {}
 }
 
-/// Mount a filesystem.
+/// Mount a filesystem. All three string arguments must be NUL-terminated.
 ///
 /// `source`: Bazzulto Path Model device path (e.g. `"//dev:diskb:1/"`).
-/// `target`: mountpoint path (e.g. `"//home:user/"` or `"/home/user"`).
+/// `target`: mountpoint path (e.g. `"/home/user"`).
 /// `fstype`: filesystem type (`"fat32"`, `"bafs"`, `"tmpfs"`).
 ///
 /// Returns 0 on success or a negative errno on failure.
 #[inline]
-pub fn raw_mount(
-    source: *const u8, source_len: usize,
-    target: *const u8, target_len: usize,
-    fstype: *const u8, fstype_len: usize,
-) -> i64 {
-    vdso_call6!(SLOT_MOUNT, source, source_len, target, target_len, fstype, fstype_len)
+pub fn raw_mount(source: *const u8, target: *const u8, fstype: *const u8) -> i64 {
+    vdso_call3!(SLOT_MOUNT, source, target, fstype)
 }
 
 /// Enumerate mounted filesystems into `buf`.

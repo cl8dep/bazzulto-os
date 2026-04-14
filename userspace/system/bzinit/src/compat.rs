@@ -61,7 +61,10 @@ pub fn validate_compat_targets() {
         if path_exists(path) {
             continue;
         }
-        let result = raw::raw_mkdir(path.as_ptr(), path.len(), 0o755);
+        let mut mkdir_path_buf = [0u8; 512];
+        let mkdir_path_len = path.len().min(511);
+        mkdir_path_buf[..mkdir_path_len].copy_from_slice(&path.as_bytes()[..mkdir_path_len]);
+        let result = raw::raw_mkdir(mkdir_path_buf.as_ptr(), 0o755);
         if result < 0 {
             let _ = error_output.write_all(b"bzinit: warn: POSIX compat target '");
             let _ = error_output.write_all(path.as_bytes());
@@ -72,7 +75,10 @@ pub fn validate_compat_targets() {
 
 /// Return true if a path can be opened (proxy for existence check).
 fn path_exists(path: &str) -> bool {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut path_buf = [0u8; 512];
+    let path_len = path.len().min(511);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
     if fd >= 0 {
         raw::raw_close(fd as i32);
         true

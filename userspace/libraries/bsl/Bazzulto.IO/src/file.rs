@@ -24,7 +24,11 @@ pub struct File {
 impl File {
     /// Open an existing file at `path`. Returns `Ok(File)` or `Err(errno)`.
     pub fn open(path: &str) -> Result<File, i32> {
-        let result = raw::raw_open(path.as_ptr(), path.len());
+        let mut buf = [0u8; 512];
+        let len = path.len().min(511);
+        buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+        // buf[len] is already 0 (NUL terminator)
+        let result = raw::raw_open(buf.as_ptr(), 0 /* O_RDONLY */, 0);
         if result < 0 {
             Err(result as i32)
         } else {
@@ -34,7 +38,10 @@ impl File {
 
     /// Create (or truncate) a file at `path`. Returns `Ok(File)` or `Err(errno)`.
     pub fn create(path: &str) -> Result<File, i32> {
-        let result = raw::raw_creat(path.as_ptr(), path.len());
+        let mut buf = [0u8; 512];
+        let len = path.len().min(511);
+        buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+        let result = raw::raw_creat(buf.as_ptr(), 0o666);
         if result < 0 {
             Err(result as i32)
         } else {
@@ -127,7 +134,10 @@ impl Drop for File {
 
 /// Delete a file at `path`. Returns `Ok(())` or `Err(errno)`.
 pub fn unlink(path: &str) -> Result<(), i32> {
-    let result = raw::raw_unlink(path.as_ptr(), path.len());
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let result = raw::raw_unlink(buf.as_ptr());
     if result < 0 {
         Err(result as i32)
     } else {

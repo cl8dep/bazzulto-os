@@ -10,8 +10,7 @@
  *   - Filesystem mount / unmount via bz_mount().
  *   - Path manipulation helpers.
  *
- * Path strings are UTF-8, not NUL-terminated on input — every path function
- * takes an explicit @p path_len parameter equal to @c strlen(path).
+ * Path strings are NUL-terminated UTF-8 C strings.
  *
  * Standard file descriptors:
  *   - 0  stdin  (read)
@@ -122,15 +121,14 @@ typedef struct {
 /**
  * @brief Open a file or directory.
  *
- * @param path      UTF-8 path (not NUL-terminated).
- * @param path_len  Byte length of @p path.
- * @param flags     Combination of @c BZ_O_* flags.
- * @param mode      Permission bits applied when @c BZ_O_CREAT is set
- *                  (the umask is applied: effective = mode & ~umask).
- *                  Pass 0 for read-only opens.
+ * @param path   NUL-terminated UTF-8 path.
+ * @param flags  Combination of @c BZ_O_* flags.
+ * @param mode   Permission bits applied when @c BZ_O_CREAT is set
+ *               (the umask is applied: effective = mode & ~umask).
+ *               Pass 0 for read-only opens.
  * @return Non-negative file descriptor on success, or a negative errno value.
  */
-int64_t bz_open(const char *path, size_t path_len, int32_t flags, uint32_t mode);
+int64_t bz_open(const char *path, int32_t flags, uint32_t mode);
 
 /**
  * @brief Close a file descriptor.
@@ -171,34 +169,36 @@ int64_t bz_write(int32_t fd, const void *buf, size_t buf_len);
 int64_t bz_seek(int32_t fd, int64_t offset, int32_t whence);
 
 /**
- * @brief Query file metadata by path.
+ * @brief Query file metadata by file descriptor.
  *
- * @param path      UTF-8 path (not NUL-terminated).
- * @param path_len  Byte length of @p path.
+ * Wraps kernel sys_fstat(26).  The file descriptor must be open; no path
+ * lookup is performed.
+ *
+ * @param fd        Open file descriptor.
  * @param stat_out  Written with file metadata on success.
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_fstat(const char *path, size_t path_len, bz_stat_t *stat_out);
+int64_t bz_fstat(int32_t fd, bz_stat_t *stat_out);
 
 /**
  * @brief Create or truncate a file for writing.
  *
- * Equivalent to @c bz_open(path, BZ_O_WRONLY|BZ_O_CREAT|BZ_O_TRUNC, 0o666).
+ * Equivalent to @c bz_open(path, BZ_O_WRONLY|BZ_O_CREAT|BZ_O_TRUNC, mode).
+ * Matches POSIX creat() which accepts a mode parameter (umask is applied).
  *
- * @param path      UTF-8 path.
- * @param path_len  Byte length of @p path.
+ * @param path  NUL-terminated UTF-8 path.
+ * @param mode  Permission bits for the newly created file (umask applied).
  * @return Non-negative file descriptor on success, or a negative errno value.
  */
-int64_t bz_creat(const char *path, size_t path_len);
+int64_t bz_creat(const char *path, uint32_t mode);
 
 /**
  * @brief Delete a file.
  *
- * @param path      UTF-8 path.
- * @param path_len  Byte length of @p path.
+ * @param path  NUL-terminated UTF-8 path.
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_unlink(const char *path, size_t path_len);
+int64_t bz_unlink(const char *path);
 
 /**
  * @brief Flush pending writes to the underlying storage.
@@ -209,13 +209,27 @@ int64_t bz_unlink(const char *path, size_t path_len);
 int64_t bz_fsync(int32_t fd);
 
 /**
- * @brief Truncate a file to a given length via its file descriptor.
+ * @brief Truncate an open file to a given length via its file descriptor.
+ *
+ * Wraps kernel FTRUNCATE(124).  The file descriptor must be open for writing.
  *
  * @param fd      Open, writable file descriptor.
  * @param length  New file length in bytes.
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_truncate_fd(int32_t fd, uint64_t length);
+int64_t bz_ftruncate(int32_t fd, uint64_t length);
+
+/**
+ * @brief Truncate a file to a given length by path.
+ *
+ * Wraps kernel TRUNCATE(58).  The file does not need to be open; the kernel
+ * performs a path lookup.  The caller must have write permission on the file.
+ *
+ * @param path    NUL-terminated UTF-8 path.
+ * @param length  New file length in bytes.
+ * @return 0 on success, or a negative errno value.
+ */
+int64_t bz_truncate(const char *path, uint64_t length);
 
 /* ---------------------------------------------------------------------------
  * Pipe / dup
@@ -253,18 +267,15 @@ int64_t bz_dup2(int32_t src_fd, int32_t dst_fd);
 /**
  * @brief Mount a filesystem.
  *
- * @param source      Bazzulto Path Model device path (e.g. @c "//dev:diskb:1/")
- *                    or an empty string for virtual filesystems.
- * @param source_len  Byte length of @p source.
- * @param target      Mountpoint path (e.g. @c "/home/user").
- * @param target_len  Byte length of @p target.
- * @param fstype      Filesystem type: @c "fat32", @c "bafs", or @c "tmpfs".
- * @param fstype_len  Byte length of @p fstype.
+ * @param source  NUL-terminated Bazzulto Path Model device path
+ *                (e.g. @c "//dev:diskb:1/"), or an empty string for virtual
+ *                filesystems.
+ * @param target  NUL-terminated mountpoint path (e.g. @c "/home/user").
+ * @param fstype  NUL-terminated filesystem type: @c "fat32", @c "bafs",
+ *                or @c "tmpfs".
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_mount(const char *source, size_t source_len,
-                 const char *target, size_t target_len,
-                 const char *fstype, size_t fstype_len);
+int64_t bz_mount(const char *source, const char *target, const char *fstype);
 
 /**
  * @brief Enumerate mounted filesystems into @p buf.
@@ -287,25 +298,37 @@ int64_t bz_getmounts(void *buf, size_t buf_len);
 /**
  * @brief Create a named pipe (FIFO) at the given path.
  *
- * @param path      UTF-8 path.
- * @param path_len  Byte length of @p path.
- * @param mode      Permission bits (umask applied).
+ * @param path  NUL-terminated UTF-8 path.
+ * @param mode  Permission bits (umask applied).
  * @return 0 on success, or a negative errno value.
  */
-int64_t bz_mkfifo(const char *path, size_t path_len, uint32_t mode);
+int64_t bz_mkfifo(const char *path, uint32_t mode);
 
 /* ---------------------------------------------------------------------------
  * Random data
  * ------------------------------------------------------------------------- */
+
+/** @defgroup getrandom_flags bz_getrandom() Flags
+ *  @{
+ */
+/** Return @c -BZ_EAGAIN instead of blocking if the entropy pool is not yet
+ *  seeded.  Without this flag bz_getrandom() blocks until enough entropy is
+ *  available. */
+#define GRND_NONBLOCK  0x01u
+/** @} */
 
 /**
  * @brief Fill @p buf with cryptographically random bytes.
  *
  * @param buf      Output buffer.
  * @param buf_len  Number of bytes to generate.
+ * @param flags    0 for normal (blocking) operation, or @c GRND_NONBLOCK to
+ *                 return @c -BZ_EAGAIN immediately if the entropy pool is not
+ *                 yet ready.
  * @return Number of bytes written on success, or a negative errno value.
+ *         With @c GRND_NONBLOCK, returns @c -BZ_EAGAIN if entropy is not ready.
  */
-int64_t bz_getrandom(void *buf, size_t buf_len);
+int64_t bz_getrandom(void *buf, size_t buf_len, uint32_t flags);
 
 #ifdef __cplusplus
 } /* extern "C" */

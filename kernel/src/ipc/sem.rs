@@ -298,7 +298,7 @@ pub unsafe fn sys_sem_open(
     if name_ptr == 0 || name_length == 0 || name_length > SEMAPHORE_NAME_MAX_LENGTH {
         return EINVAL;
     }
-    if !crate::syscall::validate_user_pointer(name_ptr, name_length) {
+    if !crate::systemcalls::validate_user_pointer(name_ptr, name_length) {
         return EINVAL;
     }
 
@@ -551,7 +551,7 @@ pub unsafe fn sys_sem_unlink(name_ptr: u64, name_length: usize) -> i64 {
     if name_ptr == 0 || name_length == 0 || name_length > SEMAPHORE_NAME_MAX_LENGTH {
         return EINVAL;
     }
-    if !crate::syscall::validate_user_pointer(name_ptr, name_length) {
+    if !crate::systemcalls::validate_user_pointer(name_ptr, name_length) {
         return EINVAL;
     }
 
@@ -590,7 +590,7 @@ pub unsafe fn sys_sem_getvalue(fd: i32, value_ptr: u64) -> i64 {
         None => return EBADF,
     };
 
-    if !crate::syscall::validate_user_pointer(value_ptr, core::mem::size_of::<u32>()) {
+    if !crate::systemcalls::validate_user_pointer(value_ptr, core::mem::size_of::<u32>()) {
         return EFAULT;
     }
 

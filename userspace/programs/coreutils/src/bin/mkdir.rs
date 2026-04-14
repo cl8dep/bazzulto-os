@@ -172,11 +172,25 @@ fn write_errno_message(prefix: &str, path: &str, errno: i64) {
 // ---------------------------------------------------------------------------
 
 /// Check whether `path` already names an existing directory.
-/// Uses raw_fstat: file_type == 2 means directory.
+/// Opens the path, calls fd-based fstat, checks S_IFDIR in the mode field.
 fn is_existing_directory(path: &str) -> bool {
-    let mut buf = [0u64; 2];
-    let ret = raw::raw_fstat(path.as_ptr(), path.len(), buf.as_mut_ptr());
-    ret >= 0 && buf[1] == 2
+    let mut path_buf = [0u8; 512];
+    let path_len = path.len().min(511);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
+    if fd < 0 {
+        return false;
+    }
+    // 128-byte Linux stat64 struct: mode at offset 16 (u32).
+    let mut stat_buf = [0u8; 128];
+    let ret = raw::raw_fstat(fd as i32, stat_buf.as_mut_ptr());
+    raw::raw_close(fd as i32);
+    if ret < 0 {
+        return false;
+    }
+    let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0; 4]));
+    // S_IFDIR = 0x4000 (POSIX / Linux stat.h).
+    (mode & 0xF000) == 0x4000
 }
 
 /// Create all missing intermediate components of `path`, then create `path`
@@ -214,10 +228,13 @@ fn make_with_parents(path: &str, final_mode: u32) -> bool {
             }
         };
 
+        let mut component_buf = [0u8; 512];
+        let component_len = component.len().min(511);
+        component_buf[..component_len].copy_from_slice(&component.as_bytes()[..component_len]);
         let ret = if is_final {
-            raw::raw_mkdir(component.as_ptr(), component.len(), final_mode)
+            raw::raw_mkdir(component_buf.as_ptr(), final_mode)
         } else {
-            raw::raw_mkdir(component.as_ptr(), component.len(), inter_mode)
+            raw::raw_mkdir(component_buf.as_ptr(), inter_mode)
         };
 
         if ret < 0 && ret != EEXIST {
@@ -343,7 +360,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
                 any_error = true;
             }
         } else {
-            let ret = raw::raw_mkdir(dir.as_ptr(), dir.len(), mode);
+            let mut dir_buf = [0u8; 512];
+            let dir_len = dir.len().min(511);
+            dir_buf[..dir_len].copy_from_slice(&dir.as_bytes()[..dir_len]);
+            let ret = raw::raw_mkdir(dir_buf.as_ptr(), mode);
             if ret < 0 {
                 write_errno_message("mkdir: cannot create directory '", dir, ret);
                 any_error = true;

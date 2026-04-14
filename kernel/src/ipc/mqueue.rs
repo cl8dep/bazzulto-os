@@ -360,26 +360,51 @@ const O_NONBLOCK: i32 = 0x800;
 ///
 /// # Safety
 /// Must be called with IRQs disabled.
+/// Read a NUL-terminated C string from user space into a fixed-size buffer.
+///
+/// Returns `Some(len)` on success (len = number of bytes, not counting NUL),
+/// or `None` if the pointer is invalid or the string exceeds `buf.len() - 1`.
+///
+/// This mirrors `copy_user_cstr` in `crate::systemcalls` but is defined here
+/// to avoid a cross-crate dependency on a private systemcalls function.
+unsafe fn copy_nul_string(ptr: u64, buf: &mut [u8; 256]) -> Option<usize> {
+    const PAGE_SIZE: u64 = 4096;
+    if ptr < PAGE_SIZE || ptr >= crate::process::USER_ADDR_LIMIT {
+        return None;
+    }
+    let mut i = 0usize;
+    loop {
+        if i >= 255 {
+            return None; // string too long
+        }
+        let byte = core::ptr::read_volatile((ptr + i as u64) as *const u8);
+        if byte == 0 {
+            buf[i] = 0;
+            return Some(i);
+        }
+        buf[i] = byte;
+        i += 1;
+    }
+}
+
 pub unsafe fn sys_mq_open(
     name_ptr: u64,
-    name_length: usize,
     flags: i32,
     _mode: u32,
     attr_ptr: u64,
 ) -> i64 {
-    if name_ptr == 0 || name_length == 0 || name_length > MESSAGE_QUEUE_NAME_MAX_LENGTH {
-        return EINVAL;
-    }
-    if !crate::syscall::validate_user_pointer(name_ptr, name_length) {
-        return EFAULT;
-    }
-
-    // SAFETY: pointer validated above.
-    let name_bytes_slice = core::slice::from_raw_parts(name_ptr as *const u8, name_length);
+    // Read the NUL-terminated queue name from user space.
+    let mut name_buf = [0u8; 256];
+    let name_length = match copy_nul_string(name_ptr, &mut name_buf) {
+        Some(l) if l > 0 && l <= MESSAGE_QUEUE_NAME_MAX_LENGTH => l,
+        Some(0) | None => return EINVAL,
+        Some(_) => return EINVAL,
+    };
+    let name_bytes_slice = &name_buf[..name_length];
 
     // Optional attributes from user space.
     let (custom_max_messages, custom_max_message_size) = if attr_ptr != 0 {
-        if !crate::syscall::validate_user_pointer(attr_ptr, MQ_ATTR_SIZE) {
+        if !crate::systemcalls::validate_user_pointer(attr_ptr, MQ_ATTR_SIZE) {
             return EFAULT;
         }
         // SAFETY: validated above.
@@ -503,7 +528,7 @@ pub unsafe fn sys_mq_close(fd: i32) -> i64 {
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_mq_send(fd: i32, msg_ptr: u64, msg_length: usize, priority: u32) -> i64 {
-    if !crate::syscall::validate_user_pointer(msg_ptr, msg_length) {
+    if !crate::systemcalls::validate_user_pointer(msg_ptr, msg_length) {
         return EFAULT;
     }
 
@@ -598,7 +623,7 @@ pub unsafe fn sys_mq_receive(
     buf_length: usize,
     priority_ptr: u64,
 ) -> i64 {
-    if !crate::syscall::validate_user_pointer(buf_ptr, buf_length) {
+    if !crate::systemcalls::validate_user_pointer(buf_ptr, buf_length) {
         return EFAULT;
     }
 
@@ -631,7 +656,7 @@ pub unsafe fn sys_mq_receive(
 
             // Write priority if requested.
             if priority_ptr != 0
-                && crate::syscall::validate_user_pointer(priority_ptr, 4)
+                && crate::systemcalls::validate_user_pointer(priority_ptr, 4)
             {
                 // SAFETY: validated above.
                 *(priority_ptr as *mut u32) = message.priority;
@@ -677,16 +702,15 @@ pub unsafe fn sys_mq_receive(
 ///
 /// # Safety
 /// Must be called with IRQs disabled.
-pub unsafe fn sys_mq_unlink(name_ptr: u64, name_length: usize) -> i64 {
-    if name_ptr == 0 || name_length == 0 || name_length > MESSAGE_QUEUE_NAME_MAX_LENGTH {
-        return EINVAL;
-    }
-    if !crate::syscall::validate_user_pointer(name_ptr, name_length) {
-        return EFAULT;
-    }
-
-    // SAFETY: pointer validated above.
-    let name_bytes = core::slice::from_raw_parts(name_ptr as *const u8, name_length);
+pub unsafe fn sys_mq_unlink(name_ptr: u64) -> i64 {
+    // Read the NUL-terminated queue name from user space.
+    let mut name_buf = [0u8; 256];
+    let name_length = match copy_nul_string(name_ptr, &mut name_buf) {
+        Some(l) if l > 0 && l <= MESSAGE_QUEUE_NAME_MAX_LENGTH => l,
+        Some(0) | None => return EINVAL,
+        Some(_) => return EINVAL,
+    };
+    let name_bytes = &name_buf[..name_length];
 
     with_message_queue_table(|table| {
         match table.find_by_name(name_bytes) {
@@ -709,7 +733,7 @@ pub unsafe fn sys_mq_unlink(name_ptr: u64, name_length: usize) -> i64 {
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_mq_getattr(fd: i32, attr_ptr: u64) -> i64 {
-    if !crate::syscall::validate_user_pointer(attr_ptr, MQ_ATTR_SIZE) {
+    if !crate::systemcalls::validate_user_pointer(attr_ptr, MQ_ATTR_SIZE) {
         return EFAULT;
     }
 

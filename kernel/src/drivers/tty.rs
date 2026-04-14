@@ -387,7 +387,7 @@ fn tty_echo_bytes(state: &TtyState, bytes: &[u8]) {
 /// # Safety
 /// Must be called with IRQs disabled.
 unsafe fn deliver_signal_to_foreground(signal: u8) {
-    let pgid = crate::syscall::terminal_foreground_pgid();
+    let pgid = crate::systemcalls::terminal_foreground_pgid();
     crate::scheduler::with_scheduler(|scheduler| {
         if pgid != 0 {
             scheduler.send_signal_to_group(pgid, signal);

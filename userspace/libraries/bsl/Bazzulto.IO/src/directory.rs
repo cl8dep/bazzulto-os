@@ -26,7 +26,11 @@ const DIRENT_HEADER_SIZE: usize = 19;
 /// Returns bare entry names (no path prefix). "." and ".." are excluded.
 /// Returns an empty Vec if the directory cannot be opened or is empty.
 pub fn read_dir(path: &str) -> Vec<String> {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut path_buf = [0u8; 512];
+    let plen = path.len().min(511);
+    path_buf[..plen].copy_from_slice(&path.as_bytes()[..plen]);
+    // O_DIRECTORY=0x10000 | O_RDONLY=0
+    let fd = raw::raw_open(path_buf.as_ptr(), 0x10000, 0);
     if fd < 0 {
         return Vec::new();
     }

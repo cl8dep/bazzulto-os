@@ -465,7 +465,10 @@ pub enum FontError {
 // ---------------------------------------------------------------------------
 
 fn file_exists(path: &str) -> bool {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let fd = raw::raw_open(buf.as_ptr(), 0 /* O_RDONLY */, 0);
     if fd >= 0 {
         raw::raw_close(fd as i32);
         true
@@ -475,7 +478,10 @@ fn file_exists(path: &str) -> bool {
 }
 
 pub fn read_file(path: &str) -> Result<Vec<u8>, FontError> {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let fd = raw::raw_open(buf.as_ptr(), 0 /* O_RDONLY */, 0);
     if fd < 0 {
         return Err(FontError::IoError);
     }

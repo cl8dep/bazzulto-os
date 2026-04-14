@@ -30,10 +30,14 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
             write_stderr("tee: too many files (max 16)\n");
             break;
         }
+        let mut file_path_buf = [0u8; 512];
+        let file_path_len = file_path.len().min(511);
+        file_path_buf[..file_path_len].copy_from_slice(&file_path.as_bytes()[..file_path_len]);
         let fd = if append {
-            raw::raw_creat_append(file_path.as_ptr(), file_path.len())
+            // O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400
+            raw::raw_open(file_path_buf.as_ptr(), 1 | 0x40 | 0x400, 0o666)
         } else {
-            raw::raw_creat(file_path.as_ptr(), file_path.len())
+            raw::raw_creat(file_path_buf.as_ptr(), 0o666)
         };
         if fd < 0 {
             write_stderr("tee: cannot open: ");

@@ -149,7 +149,7 @@ impl SpawnedProcess {
     /// Wait for this process to exit. Returns the exit status.
     pub fn wait(&self) -> Result<i32, i32> {
         let mut status: i32 = 0;
-        let result = raw::raw_wait(self.pid, &mut status as *mut i32);
+        let result = raw::raw_wait(self.pid, &mut status as *mut i32, 0);
         if result < 0 {
             Err(result as i32)
         } else {
@@ -263,16 +263,26 @@ pub fn fork() -> Result<i32, i32> {
 }
 
 /// Replace the current process image with a ramfs binary.
+/// Passes no arguments and no environment.
 #[inline]
 pub fn exec(path: &str) -> Result<!, i32> {
-    let result = raw::raw_exec(path.as_ptr(), path.len(), core::ptr::null(), 0);
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    // argv: [path_ptr, null]  envp: [null]
+    let argv: [*const u8; 2] = [buf.as_ptr(), core::ptr::null()];
+    let envp: [*const u8; 1] = [core::ptr::null()];
+    let result = raw::raw_exec(buf.as_ptr(), argv.as_ptr(), envp.as_ptr());
     Err(result as i32)
 }
 
 /// Spawn a child process from a ramfs path. Returns child PID on success.
 #[inline]
 pub fn spawn(path: &str) -> Result<i32, i32> {
-    let result = raw::raw_spawn(path.as_ptr(), path.len());
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let result = raw::raw_spawn(buf.as_ptr());
     if result < 0 {
         Err(result as i32)
     } else {
@@ -280,11 +290,11 @@ pub fn spawn(path: &str) -> Result<i32, i32> {
     }
 }
 
-/// Wait for a child process.
+/// Wait for a child process (blocking).
 #[inline]
 pub fn wait(pid: i32) -> Result<(i32, i32), i32> {
     let mut status: i32 = 0;
-    let result = raw::raw_wait(pid, &mut status as *mut i32);
+    let result = raw::raw_wait(pid, &mut status as *mut i32, 0);
     if result < 0 {
         Err(result as i32)
     } else {

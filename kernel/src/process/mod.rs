@@ -870,6 +870,40 @@ pub struct Process {
     ///
     /// Slot 0 = stdin (TTY), 1 = stdout (TTY), 2 = stderr (TTY) by convention.
     pub file_descriptor_table: Arc<SpinLock<FileDescriptorTable>>,
+
+    // --- musl/Linux ABI compatibility fields ---
+
+    /// Address of the thread-ID storage word for `set_tid_address(2)`.
+    ///
+    /// The kernel writes 0 to this address when the thread exits, then wakes
+    /// futex waiters on it.  Used by musl's pthread_join implementation.
+    ///
+    /// Reference: Linux kernel set_tid_address(2).
+    pub clear_child_tid: u64,
+
+    /// Head of the robust futex list for this thread.
+    ///
+    /// Stored by `set_robust_list(2)`.  On thread exit the kernel walks this
+    /// list and unlocks any futexes the thread held, preventing deadlock.
+    ///
+    /// Reference: Linux robust_list(7).
+    pub robust_list_head: u64,
+
+    /// Base of the program heap (brk base).
+    ///
+    /// Set once when the first `brk()` call extends the heap beyond the initial
+    /// ELF BSS end.  Never moves downward; used to anchor the heap MmapRegion.
+    ///
+    /// Reference: Linux brk(2).
+    pub brk_base: u64,
+
+    /// Current program break (heap end).
+    ///
+    /// Tracks the current top of the heap as set by `brk()`.  A zero value
+    /// means brk has never been called for this process.
+    ///
+    /// Reference: Linux brk(2).
+    pub brk_current: u64,
 }
 
 impl Process {
@@ -961,6 +995,10 @@ impl Process {
             egid: 1000,
             alarm_deadline_tick: 0,
             file_descriptor_table: Arc::new(SpinLock::new(FileDescriptorTable::new_with_tty())),
+            clear_child_tid: 0,
+            robust_list_head: 0,
+            brk_base: 0,
+            brk_current: 0,
         })
     }
 

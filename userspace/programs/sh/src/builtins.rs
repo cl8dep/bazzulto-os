@@ -325,7 +325,10 @@ fn builtin_cd(args: &[String], state: &mut ShellState) -> i32 {
     // §2.5.3 OLDPWD: capture current PWD before changing.
     let old_pwd = state.vars.get("PWD").unwrap_or("").to_string();
 
-    let result = raw::raw_chdir(path.as_ptr(), path.len());
+    let mut chdir_buf = [0u8; 512];
+    let chdir_len = path.len().min(511);
+    chdir_buf[..chdir_len].copy_from_slice(&path.as_bytes()[..chdir_len]);
+    let result = raw::raw_chdir(chdir_buf.as_ptr());
     if result < 0 {
         write_err("sh: cd: ");
         write_err(path);
@@ -420,7 +423,10 @@ fn builtin_exec(args: &[String], state: &mut ShellState) -> i32 {
             let mut candidate = alloc::string::String::from(dir);
             if !candidate.ends_with('/') { candidate.push('/'); }
             candidate.push_str(cmd_name);
-            let fd = raw::raw_open(candidate.as_ptr(), candidate.len());
+            let mut candidate_buf = [0u8; 512];
+            let candidate_len = candidate.len().min(511);
+            candidate_buf[..candidate_len].copy_from_slice(&candidate.as_bytes()[..candidate_len]);
+            let fd = raw::raw_open(candidate_buf.as_ptr(), 0, 0);
             if fd >= 0 {
                 raw::raw_close(fd as i32);
                 found = Some(candidate);
@@ -438,17 +444,30 @@ fn builtin_exec(args: &[String], state: &mut ShellState) -> i32 {
         }
     };
 
-    // Build argv: args[1..] (first entry is the command name).
-    let mut argv_flat: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    for arg in &args[1..] {
-        argv_flat.extend_from_slice(arg.as_bytes());
-        argv_flat.push(0u8);
-    }
+    // Build NUL-terminated argv strings and pointer array.
+    let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = args[1..].iter().map(|w| {
+        let mut s = alloc::vec::Vec::from(w.as_bytes());
+        s.push(0u8);
+        s
+    }).collect();
+    let mut argv_ptrs: alloc::vec::Vec<*const u8> =
+        argv_strings.iter().map(|s| s.as_ptr()).collect();
+    argv_ptrs.push(core::ptr::null());
 
     // §2.9.1.6: replace process image with full environment.
-    let (envp_flat, _) = state.vars.build_envp();
-    raw::raw_execve(path.as_ptr(), path.len(), argv_flat.as_ptr(), argv_flat.len(),
-                    envp_flat.as_ptr(), envp_flat.len());
+    let (envp_flat, envp_offsets) = state.vars.build_envp();
+    let mut envp_ptrs: alloc::vec::Vec<*const u8> =
+        envp_offsets.iter().map(|&off| envp_flat[off..].as_ptr()).collect();
+    envp_ptrs.push(core::ptr::null());
+
+    // NUL-terminate the path.
+    let mut path_buf = [0u8; 512];
+    let path_buf_len = path.len().min(511);
+    path_buf[..path_buf_len].copy_from_slice(&path.as_bytes()[..path_buf_len]);
+
+    raw::raw_exec(path_buf.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    // suppress unused warnings
+    let _ = &argv_strings;
 
     // exec failed.
     write_err("sh: exec: ");
@@ -567,7 +586,10 @@ fn builtin_dot(args: &[String], state: &mut ShellState) -> i32 {
             let mut candidate = alloc::string::String::from(dir);
             if !candidate.ends_with('/') { candidate.push('/'); }
             candidate.push_str(filename);
-            let fd = raw::raw_open(candidate.as_ptr(), candidate.len());
+            let mut dot_candidate_buf = [0u8; 512];
+            let dot_candidate_len = candidate.len().min(511);
+            dot_candidate_buf[..dot_candidate_len].copy_from_slice(&candidate.as_bytes()[..dot_candidate_len]);
+            let fd = raw::raw_open(dot_candidate_buf.as_ptr(), 0, 0);
             if fd >= 0 {
                 raw::raw_close(fd as i32);
                 found = Some(candidate);
@@ -585,7 +607,10 @@ fn builtin_dot(args: &[String], state: &mut ShellState) -> i32 {
         }
     };
 
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut dot_path_buf = [0u8; 512];
+    let dot_path_len = path.len().min(511);
+    dot_path_buf[..dot_path_len].copy_from_slice(&path.as_bytes()[..dot_path_len]);
+    let fd = raw::raw_open(dot_path_buf.as_ptr(), 0, 0);
     if fd < 0 {
         write_err("sh: .: ");
         write_err(filename);
@@ -776,23 +801,29 @@ fn builtin_trap(args: &[String], state: &mut ShellState) -> i32 {
     let action = &args[1];
 
     if action == "-" {
-        // Reset signals to default.
+        // Reset signals to default (SIG_DFL = 0 at sa_handler offset 0).
+        // rt_sigaction struct: {sa_handler:u64, sa_flags:u64, sa_restorer:u64, sa_mask:[u64;16]}
+        // = 3*8 + 16*8 = 152 bytes total.
+        let mut sigact_default = [0u8; 152];
+        // sa_handler = 0 (SIG_DFL) — already zero-initialized.
         for sig_name in &args[2..] {
             let sig = signal_name_to_number(sig_name.as_str());
             if sig > 0 {
-                raw::raw_sigaction(sig, 0, core::ptr::null_mut());
+                raw::raw_sigaction(sig, sigact_default.as_ptr(), core::ptr::null_mut());
             }
         }
         return 0;
     }
 
     if action.is_empty() {
-        // Ignore signals.
+        // Ignore signals (SIG_IGN = 1 at sa_handler offset 0).
+        let mut sigact_ignore = [0u8; 152];
+        // sa_handler = 1 (SIG_IGN) stored as little-endian u64 at offset 0.
+        sigact_ignore[0] = 1u8;
         for sig_name in &args[2..] {
             let sig = signal_name_to_number(sig_name.as_str());
             if sig > 0 {
-                // SIG_IGN = 1 in POSIX convention.
-                raw::raw_sigaction(sig, 1, core::ptr::null_mut());
+                raw::raw_sigaction(sig, sigact_ignore.as_ptr(), core::ptr::null_mut());
             }
         }
         return 0;
@@ -838,7 +869,7 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
         // No args: wait for the most recent background process.
         if let Some(pid) = state.last_background_pid {
             let mut raw_status = 0i32;
-            raw::raw_wait(pid, &mut raw_status as *mut i32);
+            raw::raw_wait(pid, &mut raw_status as *mut i32, 0);
         }
         return 0;
     }
@@ -847,7 +878,7 @@ fn builtin_wait(args: &[String], state: &mut ShellState) -> i32 {
     for arg in &args[1..] {
         if let Some(pid) = parse_i32(arg) {
             let mut raw_status = 0i32;
-            raw::raw_wait(pid, &mut raw_status as *mut i32);
+            raw::raw_wait(pid, &mut raw_status as *mut i32, 0);
             last_status = ((raw_status as u32) & 0xFF) as i32;
         }
     }

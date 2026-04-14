@@ -37,18 +37,28 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
     if child_pid == 0 {
         // Child: exec the requested command.
         let command = &arguments[1];
-        // Build flat argv: "cmd\0arg1\0arg2\0"
-        let mut flat: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-        for argument in &arguments[1..] {
-            flat.extend_from_slice(argument.as_bytes());
-            flat.push(0);
-        }
+        // Build NUL-terminated argv pointer array.
+        let mut argv_strings: alloc::vec::Vec<alloc::vec::Vec<u8>> = arguments[1..].iter().map(|w| {
+            let mut s = alloc::vec::Vec::from(w.as_bytes());
+            s.push(0u8);
+            s
+        }).collect();
+        let mut argv_ptrs: alloc::vec::Vec<*const u8> =
+            argv_strings.iter().map(|s| s.as_ptr()).collect();
+        argv_ptrs.push(core::ptr::null());
+        // NUL-terminate the command path.
+        let mut command_buf = [0u8; 512];
+        let command_len = command.len().min(511);
+        command_buf[..command_len].copy_from_slice(&command.as_bytes()[..command_len]);
+        // Pass null envp (inherit nothing — kernel will inherit from parent).
+        let envp_null: *const *const u8 = &core::ptr::null();
         raw::raw_exec(
-            command.as_ptr(),
-            command.len(),
-            flat.as_ptr(),
-            flat.len(),
+            command_buf.as_ptr(),
+            argv_ptrs.as_ptr(),
+            envp_null,
         );
+        // suppress unused warnings
+        let _ = &argv_strings;
         // exec failed
         write_stderr("time: exec failed: ");
         write_stderr(command.as_str());
@@ -58,7 +68,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
 
     // Parent: wait for child.
     let mut exit_status: i32 = 0;
-    raw::raw_wait(child_pid as i32, &mut exit_status as *mut i32);
+    raw::raw_wait(child_pid as i32, &mut exit_status as *mut i32, 0);
 
     // Record wall clock end.
     let mut end_ts = [0u64; 2];

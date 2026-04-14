@@ -66,11 +66,29 @@ userspace/
   lib/bsl/       Bazzulto Standard Library
     Bazzulto.System/   syscall wrappers, global allocator, vDSO
     Bazzulto.IO/       file, path, stream abstractions
+  libraries/
+    libc/        POSIX C library headers (stubs) + musl submodule
   services/      TOML service definition files
   fonts/         Embedded fonts
 esp/             UEFI boot partition (EFI + Limine config)
 docs/            References and internal wiki
 ```
+
+## Third-party components
+
+### musl libc
+
+Bazzulto includes [musl](https://musl.libc.org/) as a git submodule at
+`userspace/libraries/libc/musl/`.
+
+musl is an MIT-licensed implementation of the standard C library written by
+Rich Felker and contributors. It targets the Linux syscall API; the Bazzulto
+port replaces `arch/aarch64/bits/syscall.h.in` with Bazzulto syscall numbers
+while keeping the rest of musl unchanged.
+
+- Homepage: <https://musl.libc.org/>
+- Repository: <https://git.musl-libc.org/cgit/musl>
+- License: MIT — see `userspace/libraries/libc/musl/COPYRIGHT`
 
 ## License
 

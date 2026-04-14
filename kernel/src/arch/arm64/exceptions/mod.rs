@@ -313,7 +313,7 @@ pub extern "C" fn exception_handler_sync_el0(frame: *mut ExceptionFrame) {
             // Extract syscall number from ESR_EL1.ISS[15:0].
             // ARM ARM DDI 0487, §D13.2.36: ISS for SVC is imm16 = bits [15:0].
             let syscall_number = unsafe { (*frame).esr & 0xFFFF };
-            crate::syscall::dispatch(frame, syscall_number);
+            crate::systemcalls::dispatch(frame, syscall_number);
         }
         ec::DATA_ABORT_EL0 | ec::INSTRUCTION_ABORT_EL0 => {
             let esr = unsafe { (*frame).esr };

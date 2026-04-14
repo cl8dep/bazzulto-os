@@ -408,4 +408,38 @@ impl FileDescriptorTable {
         };
         self.install(new_descriptor)
     }
+
+    /// Duplicate `source_fd` into the lowest available fd that is >= `min_fd`.
+    ///
+    /// This implements the F_DUPFD semantics from fcntl(2):
+    ///   "Find the lowest numbered available file descriptor >= arg and make it
+    ///    be a copy of fd."
+    ///
+    /// Returns the new fd number on success, or -9 (EBADF) on failure.
+    ///
+    /// Reference: POSIX.1-2017 fcntl(2) F_DUPFD.
+    pub fn dup_at_or_above(&mut self, source_fd: usize, min_fd: usize) -> i32 {
+        let new_descriptor = match self.slots.get(source_fd) {
+            Some(Some(descriptor)) => match descriptor.dup() {
+                Some(new_descriptor) => new_descriptor,
+                None => return -9,
+            },
+            _ => return -9, // EBADF
+        };
+        // Find the lowest free slot at or above min_fd.
+        let target_slot = (min_fd..self.slots.len())
+            .find(|&slot_index| {
+                self.slots.get(slot_index).map(|s| s.is_none()).unwrap_or(false)
+            })
+            .or_else(|| {
+                // If no free slot exists in the current range, append.
+                Some(self.slots.len())
+            });
+        match target_slot {
+            Some(slot_index) => {
+                self.install_at(slot_index, new_descriptor)
+            }
+            None => -9,
+        }
+    }
 }

@@ -42,7 +42,10 @@ impl FileInfo {
     ///
     /// Returns `true` if the kernel returns a valid file descriptor.
     pub fn exists(&self) -> bool {
-        let result = raw::raw_open(self.path.as_ptr(), self.path.len());
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let result = raw::raw_open(buf.as_ptr(), 0 /* O_RDONLY */, 0);
         if result >= 0 {
             raw::raw_close(result as i32);
             true
@@ -102,10 +105,13 @@ impl FileInfo {
     }
 
     /// Open the file for appending (create if it does not exist, no truncation).
-    ///
-    /// Uses `raw_creat_append` which passes `flags=1` to the kernel.
     pub fn open_append(&self) -> Result<File, i32> {
-        let result = raw::raw_creat_append(self.path.as_ptr(), self.path.len());
+        // O_WRONLY=1 | O_CREAT=0x40 | O_APPEND=0x400
+        let flags: i32 = 1 | 0x40 | 0x400;
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let result = raw::raw_open(buf.as_ptr(), flags, 0o666);
         if result < 0 {
             Err(result as i32)
         } else {
@@ -120,7 +126,10 @@ impl FileInfo {
 
     /// Delete the file. Returns `Err(errno)` on failure.
     pub fn delete(&self) -> Result<(), i32> {
-        let result = raw::raw_unlink(self.path.as_ptr(), self.path.len());
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let result = raw::raw_unlink(buf.as_ptr());
         if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 
@@ -154,14 +163,32 @@ impl FileInfo {
     }
 
     // -----------------------------------------------------------------------
-    // TODO(fstat): the following methods require the kernel to expose a
-    // `sys_fstat` (or equivalent `sys_stat`) syscall wired into the vDSO.
-    //
-    // Once SLOT_FSTAT is available via bazzulto_system::raw::raw_fstat():
-    //   pub fn length_in_bytes(&self) -> Result<u64, i32>
-    //   pub fn created_time(&self) -> Result<u64, i32>   // seconds since epoch
-    //   pub fn modified_time(&self) -> Result<u64, i32>
-    //   pub fn access_time(&self) -> Result<u64, i32>
-    //   pub fn permissions(&self) -> Result<u32, i32>    // Unix mode bits
+    // Metadata via fstat (fd-based)
     // -----------------------------------------------------------------------
+
+    /// Return the file size in bytes, or `Err(errno)` on failure.
+    pub fn length_in_bytes(&self) -> Result<u64, i32> {
+        let file = self.open_read()?;
+        let mut stat_buf = [0u8; 128];
+        let result = raw::raw_fstat(file.as_raw_fd(), stat_buf.as_mut_ptr());
+        if result < 0 {
+            return Err(result as i32);
+        }
+        // st_size is at offset 40 in the Linux stat64 struct (AArch64).
+        let size = u64::from_le_bytes(stat_buf[40..48].try_into().unwrap_or([0u8; 8]));
+        Ok(size)
+    }
+
+    /// Return the Unix mode bits (file type + permissions), or `Err(errno)`.
+    pub fn permissions(&self) -> Result<u32, i32> {
+        let file = self.open_read()?;
+        let mut stat_buf = [0u8; 128];
+        let result = raw::raw_fstat(file.as_raw_fd(), stat_buf.as_mut_ptr());
+        if result < 0 {
+            return Err(result as i32);
+        }
+        // st_mode is at offset 16 (u32).
+        let mode = u32::from_le_bytes(stat_buf[16..20].try_into().unwrap_or([0u8; 4]));
+        Ok(mode)
+    }
 }

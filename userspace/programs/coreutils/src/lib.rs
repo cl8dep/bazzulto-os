@@ -85,7 +85,10 @@ pub fn read_fd_to_end(fd: i32) -> Vec<u8> {
 
 /// Open a file for reading. Returns the fd on success or an error string.
 pub fn open_file(path: &str) -> Result<i32, &'static str> {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut path_buf = [0u8; 512];
+    let path_len = path.len().min(511);
+    path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
     if fd < 0 {
         Err("cannot open file")
     } else {

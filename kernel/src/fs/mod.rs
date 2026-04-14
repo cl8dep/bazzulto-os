@@ -19,4 +19,4 @@ pub use ramfs::{ramfs_find, ramfs_list, ramfs_register_file};
 pub use mount::{vfs_init, vfs_mount, vfs_resolve, vfs_resolve_parent, with_vfs,
                 vfs_mark_kernel_exec_only, vfs_is_kernel_exec_only,
                 vfs_for_each_mount};
-pub use inode::{Inode, InodeType, InodeStat, DirEntry, FsError};
+pub use inode::{Inode, InodeType, InodeStat, DirEntry, FsError, SymlinkInode};

@@ -561,7 +561,7 @@ pub unsafe fn sys_bind(sockfd: i32, addr_ptr: u64, addr_len: usize) -> i64 {
     if addr_len < 3 || addr_len > SOCKADDR_UN_SIZE {
         return EINVAL;
     }
-    if !crate::syscall::validate_user_pointer(addr_ptr, addr_len) {
+    if !crate::systemcalls::validate_user_pointer(addr_ptr, addr_len) {
         return EFAULT;
     }
 
@@ -687,8 +687,8 @@ pub unsafe fn sys_accept(
                 });
 
                 if let Some(path) = peer_path {
-                    if crate::syscall::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE)
-                        && crate::syscall::validate_user_pointer(addr_len_ptr, 4)
+                    if crate::systemcalls::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE)
+                        && crate::systemcalls::validate_user_pointer(addr_len_ptr, 4)
                     {
                         let addr_out = addr_ptr as *mut SockaddrUn;
                         // SAFETY: validated above.
@@ -751,7 +751,7 @@ pub unsafe fn sys_connect(sockfd: i32, addr_ptr: u64, addr_len: usize) -> i64 {
     if addr_len < 3 || addr_len > SOCKADDR_UN_SIZE {
         return EINVAL;
     }
-    if !crate::syscall::validate_user_pointer(addr_ptr, addr_len) {
+    if !crate::systemcalls::validate_user_pointer(addr_ptr, addr_len) {
         return EFAULT;
     }
 
@@ -848,7 +848,7 @@ pub unsafe fn sys_connect(sockfd: i32, addr_ptr: u64, addr_len: usize) -> i64 {
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_send(sockfd: i32, buf_ptr: u64, length: usize, _flags: i32) -> i64 {
-    if !crate::syscall::validate_user_pointer(buf_ptr, length) {
+    if !crate::systemcalls::validate_user_pointer(buf_ptr, length) {
         return EFAULT;
     }
 
@@ -873,7 +873,7 @@ pub unsafe fn sys_send(sockfd: i32, buf_ptr: u64, length: usize, _flags: i32) ->
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_recv(sockfd: i32, buf_ptr: u64, length: usize, _flags: i32) -> i64 {
-    if !crate::syscall::validate_user_pointer(buf_ptr, length) {
+    if !crate::systemcalls::validate_user_pointer(buf_ptr, length) {
         return EFAULT;
     }
 
@@ -932,10 +932,10 @@ pub unsafe fn sys_shutdown(sockfd: i32, how: i32) -> i64 {
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_getsockname(sockfd: i32, addr_ptr: u64, addr_len_ptr: u64) -> i64 {
-    if !crate::syscall::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE) {
+    if !crate::systemcalls::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE) {
         return EFAULT;
     }
-    if !crate::syscall::validate_user_pointer(addr_len_ptr, 4) {
+    if !crate::systemcalls::validate_user_pointer(addr_len_ptr, 4) {
         return EFAULT;
     }
 
@@ -976,10 +976,10 @@ pub unsafe fn sys_getsockname(sockfd: i32, addr_ptr: u64, addr_len_ptr: u64) -> 
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn sys_getpeername(sockfd: i32, addr_ptr: u64, addr_len_ptr: u64) -> i64 {
-    if !crate::syscall::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE) {
+    if !crate::systemcalls::validate_user_pointer(addr_ptr, SOCKADDR_UN_SIZE) {
         return EFAULT;
     }
-    if !crate::syscall::validate_user_pointer(addr_len_ptr, 4) {
+    if !crate::systemcalls::validate_user_pointer(addr_len_ptr, 4) {
         return EFAULT;
     }
 
@@ -1034,7 +1034,7 @@ pub unsafe fn sys_socketpair(
     if domain != 1 {
         return EAFNOSUPPORT;
     }
-    if !crate::syscall::validate_user_pointer(sv_ptr, 8) {
+    if !crate::systemcalls::validate_user_pointer(sv_ptr, 8) {
         return EFAULT;
     }
 

@@ -15,7 +15,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
     }
     let mut exit_code = 0i32;
     for path in &arguments[1..] {
-        let fd = raw::raw_creat(path.as_ptr(), path.len());
+        let mut path_buf = [0u8; 512];
+        let path_len = path.len().min(511);
+        path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
+        let fd = raw::raw_creat(path_buf.as_ptr(), 0o644);
         if fd < 0 {
             write_stderr("touch: cannot touch '");
             write_stderr(path);

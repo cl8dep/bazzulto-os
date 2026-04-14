@@ -1,6 +1,0 @@
-[Service]
-name    = "bz-gpu"
-binary  = "/system/bin/drivers/bz-gpu-driver"
-after   = ["bz-filesystem"]
-restart = "exponential-backoff"
-max_retries = "3"

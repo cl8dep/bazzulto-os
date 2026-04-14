@@ -56,7 +56,10 @@ impl DirectoryInfo {
     ///
     /// Returns `true` if the kernel returns a valid file descriptor for the path.
     pub fn exists(&self) -> bool {
-        let fd = raw::raw_open(self.path.as_ptr(), self.path.len());
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let fd = raw::raw_open(buf.as_ptr(), 0x10000 /* O_DIRECTORY */, 0);
         if fd >= 0 {
             raw::raw_close(fd as i32);
             true
@@ -96,14 +99,20 @@ impl DirectoryInfo {
     ///
     /// Returns `Err(errno)` on failure (e.g. parent does not exist).
     pub fn create(&self) -> Result<(), i32> {
-        let result = raw::raw_mkdir(self.path.as_ptr(), self.path.len(), 0o755);
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let result = raw::raw_mkdir(buf.as_ptr(), 0o755);
         if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 
     /// Delete a single file inside this directory by `filename` (bare name, no path).
     pub fn delete_file(&self, filename: &str) -> Result<(), i32> {
         let full_path = self.child_path(filename);
-        let result = raw::raw_unlink(full_path.as_ptr(), full_path.len());
+        let mut buf = [0u8; 512];
+        let len = full_path.len().min(511);
+        buf[..len].copy_from_slice(&full_path.as_bytes()[..len]);
+        let result = raw::raw_unlink(buf.as_ptr());
         if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 
@@ -165,7 +174,10 @@ impl DirectoryInfo {
 
     /// Enumerate raw entry names filtered by `d_type`.
     fn enumerate_entries_by_type(&self, target_type: u8) -> Vec<String> {
-        let fd = raw::raw_open(self.path.as_ptr(), self.path.len());
+        let mut buf = [0u8; 512];
+        let len = self.path.len().min(511);
+        buf[..len].copy_from_slice(&self.path.as_bytes()[..len]);
+        let fd = raw::raw_open(buf.as_ptr(), 0x10000 /* O_DIRECTORY */, 0);
         if fd < 0 {
             return Vec::new();
         }
@@ -228,7 +240,10 @@ fn getdents_filtered(fd: i32, type_filter: Option<u8>) -> Vec<String> {
 
 /// Read all non-`.`/`..` entry names from the directory at `path`.
 fn read_dir_entries(path: &str) -> Vec<String> {
-    let fd = raw::raw_open(path.as_ptr(), path.len());
+    let mut buf = [0u8; 512];
+    let len = path.len().min(511);
+    buf[..len].copy_from_slice(&path.as_bytes()[..len]);
+    let fd = raw::raw_open(buf.as_ptr(), 0x10000 /* O_DIRECTORY */, 0);
     if fd < 0 {
         return Vec::new();
     }

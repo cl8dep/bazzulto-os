@@ -88,10 +88,17 @@ pub use filesystem_watcher::FileSystemWatcher;
 ///
 /// Returns `Ok(())` on success or `Err(errno)` on failure.
 pub fn mount(source: &str, target: &str, fstype: &str) -> Result<(), i32> {
+    let mut src_buf  = [0u8; 512];
+    let mut tgt_buf  = [0u8; 512];
+    let mut fst_buf  = [0u8; 64];
+    let src_len = source.len().min(511);
+    let tgt_len = target.len().min(511);
+    let fst_len = fstype.len().min(63);
+    src_buf[..src_len].copy_from_slice(&source.as_bytes()[..src_len]);
+    tgt_buf[..tgt_len].copy_from_slice(&target.as_bytes()[..tgt_len]);
+    fst_buf[..fst_len].copy_from_slice(&fstype.as_bytes()[..fst_len]);
     let ret = bazzulto_system::raw::raw_mount(
-        source.as_ptr(), source.len(),
-        target.as_ptr(), target.len(),
-        fstype.as_ptr(), fstype.len(),
+        src_buf.as_ptr(), tgt_buf.as_ptr(), fst_buf.as_ptr(),
     );
     if ret < 0 { Err((-ret) as i32) } else { Ok(()) }
 }
@@ -243,10 +250,12 @@ pub fn create_dir_all(path: &str) {
     let bytes = posix.as_bytes();
     while i <= bytes.len() {
         if i == bytes.len() || bytes[i] == b'/' {
-            // SAFETY: posix is valid UTF-8 up to index i.
-            if let Ok(prefix) = core::str::from_utf8(&bytes[..i]) {
-                let _ = bazzulto_system::raw::raw_mkdir(prefix.as_ptr(), prefix.len(), 0o755);
-            }
+            // Build a NUL-terminated copy of the prefix for the kernel.
+            let prefix_len = i.min(511);
+            let mut mkdir_buf = [0u8; 512];
+            mkdir_buf[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
+            // mkdir_buf[prefix_len] is already 0.
+            let _ = bazzulto_system::raw::raw_mkdir(mkdir_buf.as_ptr(), 0o755);
         }
         i += 1;
     }

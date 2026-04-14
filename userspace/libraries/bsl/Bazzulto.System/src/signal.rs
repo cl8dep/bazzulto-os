@@ -27,6 +27,19 @@ pub enum Signal {
     Stop = 19,
 }
 
+// rt_sigaction struct layout (152 bytes):
+//   offset  0: sa_handler (u64)
+//   offset  8: sa_flags   (u64)
+//   offset 16: sa_restorer (u64) — must be 0
+//   offset 24: sa_mask    ([u64; 16]) = 128 bytes
+fn make_sigaction(handler_va: u64, flags: u64) -> [u8; 152] {
+    let mut buf = [0u8; 152];
+    buf[0..8].copy_from_slice(&handler_va.to_le_bytes());
+    buf[8..16].copy_from_slice(&flags.to_le_bytes());
+    // sa_restorer at 16 → 0, sa_mask at 24 → all zeros
+    buf
+}
+
 impl Signal {
     pub const TERM: Signal = Signal::Term;
     pub const KILL: Signal = Signal::Kill;
@@ -50,34 +63,23 @@ impl Signal {
 
     /// Install a handler for this signal.
     pub fn handle(signal: Signal, handler: unsafe extern "C" fn(i32)) -> Result<(), i32> {
-        let result = raw::raw_sigaction(signal as i32, handler as u64, core::ptr::null_mut());
-        if result < 0 {
-            Err(result as i32)
-        } else {
-            Ok(())
-        }
+        let act = make_sigaction(handler as u64, 0);
+        let result = raw::raw_sigaction(signal as i32, act.as_ptr(), core::ptr::null_mut());
+        if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 
-    /// Ignore this signal (SIG_IGN).
+    /// Ignore this signal (SIG_IGN = 1).
     pub fn ignore(signal: Signal) -> Result<(), i32> {
-        // SIG_IGN convention: handler VA = 1.
-        let result = raw::raw_sigaction(signal as i32, 1u64, core::ptr::null_mut());
-        if result < 0 {
-            Err(result as i32)
-        } else {
-            Ok(())
-        }
+        let act = make_sigaction(1, 0);
+        let result = raw::raw_sigaction(signal as i32, act.as_ptr(), core::ptr::null_mut());
+        if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 
-    /// Restore the default disposition for this signal (SIG_DFL).
+    /// Restore the default disposition for this signal (SIG_DFL = 0).
     pub fn reset(signal: Signal) -> Result<(), i32> {
-        // SIG_DFL convention: handler VA = 0.
-        let result = raw::raw_sigaction(signal as i32, 0u64, core::ptr::null_mut());
-        if result < 0 {
-            Err(result as i32)
-        } else {
-            Ok(())
-        }
+        let act = make_sigaction(0, 0);
+        let result = raw::raw_sigaction(signal as i32, act.as_ptr(), core::ptr::null_mut());
+        if result < 0 { Err(result as i32) } else { Ok(()) }
     }
 }
 
@@ -119,19 +121,26 @@ impl SigAction {
 }
 
 /// Install a signal action for `signal_number`.
+/// `old_action` receives the previous handler VA if provided.
 pub fn sigaction(
     signal_number: i32,
     action: SigAction,
     old_action: Option<&mut u64>,
 ) -> Result<(), i32> {
-    let old_ptr = match old_action {
-        Some(r) => r as *mut u64,
-        None    => core::ptr::null_mut(),
-    };
-    let result = raw::raw_sigaction(signal_number, action.as_va(), old_ptr);
-    if result < 0 {
-        Err(result as i32)
+    let act = make_sigaction(action.as_va(), 0);
+    let mut old_buf = [0u8; 152];
+    let old_ptr: *mut u8 = if old_action.is_some() {
+        old_buf.as_mut_ptr()
     } else {
-        Ok(())
+        core::ptr::null_mut()
+    };
+    let result = raw::raw_sigaction(signal_number, act.as_ptr(), old_ptr);
+    if result < 0 {
+        return Err(result as i32);
     }
+    if let Some(slot) = old_action {
+        // sa_handler is at offset 0 in the returned struct.
+        *slot = u64::from_le_bytes(old_buf[0..8].try_into().unwrap_or([0u8; 8]));
+    }
+    Ok(())
 }
