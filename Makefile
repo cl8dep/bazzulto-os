@@ -80,23 +80,23 @@ all: kernel disk disk2
 # ---------------------------------------------------------------------------
 
 .PHONY: bsl
-bsl:
+bsl: musl-patch
 	$(CARGO) build --release --target $(BSL_TARGET) \
 	  --manifest-path $(BSL_MANIFEST)
 
 .PHONY: bsl-debug
-bsl-debug:
+bsl-debug: musl-patch
 	$(CARGO) build --target $(BSL_TARGET) \
 	  --manifest-path $(BSL_MANIFEST)
 
 # Build a single crate from the BSL workspace (usage: make bsl-crate CRATE=bzinit)
 .PHONY: bsl-crate
-bsl-crate:
+bsl-crate: musl-patch
 	$(CARGO) build --release --target $(BSL_TARGET) \
 	  --manifest-path $(BSL_MANIFEST) -p $(CRATE)
 
 .PHONY: bsl-crate-debug
-bsl-crate-debug:
+bsl-crate-debug: musl-patch
 	$(CARGO) build --target $(BSL_TARGET) \
 	  --manifest-path $(BSL_MANIFEST) -p $(CRATE)
 
@@ -105,11 +105,11 @@ bsl-crate-debug:
 # ---------------------------------------------------------------------------
 
 .PHONY: kernel
-kernel:
+kernel: musl-patch
 	cd $(KERNEL_DIR) && $(CARGO) build
 
 .PHONY: kernel-release
-kernel-release:
+kernel-release: musl-patch
 	cd $(KERNEL_DIR) && $(CARGO) build --release
 
 # ---------------------------------------------------------------------------
