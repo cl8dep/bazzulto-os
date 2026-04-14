@@ -1,502 +1,319 @@
-# Bazzulto OS — Deuda Técnica Unificada
+# Bazzulto OS — Deuda Técnica
 
-Documento consolidado. Reemplaza los archivos individuales en `docs/debts/` y
-`docs/tech-debt/`. Cada sección indica severidad, área afectada y prerequisitos.
+Documento de deuda técnica activa. Documenta únicamente lo pendiente de implementar.
+Lo ya implementado no se registra aquí.
 
-**Actualizado:** 2026-04-13
-
----
-
-## Estado de implementación — resumen
-
-| Subsistema | Estado |
-|---|---|
-| Boot / Excepciones / EL0 trampoline | ✅ Completo |
-| Memoria física + virtual (4-level pgtable) | ✅ Funcional |
-| Heap kernel (slab + first-fit) | ✅ Funcional |
-| HAL: DTB, Platform trait, GICv2, PL031 RTC | ✅ Funcional |
-| Scheduler SMP per-CPU + work stealing + nice/priorities | ✅ Funcional |
-| SMP: AP boot, per-CPU GIC + timer | ✅ Funcional (70%) |
-| Proceso: fork CoW + exec + clone threads | ✅ Funcional |
-| ELF loader ET_EXEC + ET_DYN/PIE | ✅ Funcional |
-| Guard pages bajo kernel stack | ✅ Completo |
-| Señales + sigprocmask/sigpending/sigsuspend + SIGSTOP/CONT | ✅ Funcional |
-| Process groups + sessions + rlimits | ✅ Funcional |
-| Syscalls (~100 definidas, ~75 implementadas) | ⚠️ Parcial |
-| VFS + tmpfs + devfs + procfs + mount table | ✅ Funcional |
-| /proc/self symlink + resolución de symlinks en VFS | ✅ Completo |
-| SIGALRM / alarm() | ✅ Completo |
-| TLB shootdown (tlbi vmalle1is) | ✅ Completo |
-| IPC: pipes, FIFO, Unix sockets, semáforos, mqueues, futex | ✅ Funcional |
-| IPC discriminante nlinks (sem/socket/mqueue) | ✅ Completo |
-| epoll + poll + select | ✅ Funcional (select pendiente) |
-| PTY + ioctl(TIOCGWINSZ/TIOCSWINSZ) | ✅ Funcional |
-| Terminal signals (Ctrl+C/Z → SIGINT/SIGTSTP) | ✅ Completo |
-| POSIX threads (clone + TLS + shared FD) | ⚠️ FD table no compartida |
-| CLOCK_REALTIME + CLOCK_MONOTONIC | ✅ Funcional |
-| CoW fork | ✅ Funcional |
-| umask | ✅ Completo |
-| envp en exec | ✅ Completo |
-| sigaltstack + SA_ONSTACK | ✅ Completo |
-| vDSO clock_gettime acelerado | ✅ Completo |
-| Reboot / shutdown via PSCI | ✅ Completo |
-| bzinit (PID 1, service manager) | ✅ Funcional |
-| FAT32 | ⚠️ Parcial — sin instancia por volumen |
-| BlockDevice trait + multi-disk registry | ✅ Implementado (actualizar tabla de estado) |
-| Partition table (MBR/GPT) | ✅ Implementado (actualizar tabla de estado) |
-| Demand paging (lazy BSS) | ❌ No implementado |
-| MAP_SHARED + mmap file-backed | ❌ No implementado |
-| MAP_SHARED excluido de CoW en fork() | ❌ No implementado |
-| UID/GID + permisos de archivo POSIX | ❌ No implementado |
-| Binary Permission Model (kernel side) | ❌ No implementado |
-| Red (TCP/IP) | ❌ No implementado — explícitamente fuera de scope v1.0 |
-| Binary Permission Model (permissiond daemon) | ❌ Post-v1.0 |
-| Editor de texto | ❌ Post-v1.0 (userspace) |
+**Actualizado:** 2026-04-13 (post-v1.0)
 
 ---
 
-## Bloque 1 — FAT32 (P1)
+## Bloque 1 — Syscalls y comportamiento parcialmente implementado
 
-**Severidad:** Alta — sin esto no hay acceso a disco real.
+### 1a. `chmod` / `chown` / `fchmod` / `fchown` — stubs
 
-### Estado actual
+Retornan 0 sin hacer nada. Requieren almacenamiento de `owner_uid`/`owner_gid` por
+inode. FAT32 no tiene soporte nativo de permisos POSIX en disco. BAFS puede
+implementarlo como extended attribute.
 
-`Fat32DirInode` y `Fat32FileInode` implementan el trait `Inode` y funcionan.
-Problemas pendientes:
+**Prerequisito:** BAFS como filesystem oficial (post-v1.0), o xattrs en FAT32.
 
-- `fat32.rs` usa `static STATE: SyncCell<Option<Fat32State>>` — una única instancia
-  global. No soporta múltiples volúmenes ni particiones.
-- No existe un trait `BlockDevice` — el código llama funciones estáticas de virtio_blk.
-- No hay registro global de discos.
-- No hay parser de tabla de particiones (MBR/GPT).
-- FAT32 no se auto-monta vía la tabla VFS.
+### 1b. `CLOCK_REALTIME` retorna tiempo monotónico
 
-### Paso 1 — Trait BlockDevice (`kernel/src/hal/disk.rs`)
+`clock_gettime(CLOCK_REALTIME)` devuelve `CNTPCT_EL0`-derived ticks en lugar del
+tiempo de pared real. El PL031 RTC está inicializado pero su valor no se usa como
+base para `CLOCK_REALTIME`.
 
-```rust
-pub trait BlockDevice: Send + Sync {
-    fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> bool;
-    fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> bool;
-    fn sector_count(&self) -> u64;
-    fn sector_size(&self) -> u32 { 512 }
-    fn name(&self) -> &str;
-}
+**Fix:** Leer el RTC en boot (`pl031_read()`), almacenar `wall_clock_base_seconds`,
+y sumar el offset monotónico en `sys_clock_gettime` para `CLOCK_ID == 0`.
 
-static DISK_REGISTRY: SpinLock<Vec<Arc<dyn BlockDevice>>>;
-pub fn register_disk(dev: Arc<dyn BlockDevice>);
-pub fn disk_count() -> usize;
-pub fn get_disk(index: usize) -> Option<Arc<dyn BlockDevice>>;
-```
+**Archivo:** `syscall/mod.rs` (clock_gettime), `hal/pl031_rtc.rs`.
 
-Envolver `virtio_blk` en `VirtioBlkDevice: BlockDevice`. `platform_init()` llama
-`register_disk(...)` tras la enumeración virtio.
+### 1c. `MAP_SHARED` file-backed — stub
 
-### Paso 2 — Parser de particiones (`kernel/src/fs/partition.rs`, nuevo)
+`sys_mmap` con `MAP_SHARED | fd` cae en el path de `MAP_PRIVATE`. Dos procesos
+que mapeen el mismo inode con `MAP_SHARED` no verán escrituras del otro.
 
-MBR: leer sector 0, verificar `[510..512] == [0x55, 0xAA]`, parsear 4 entradas
-en offsets 446/462/478/494 (byte 4 = tipo, bytes 8..12 = LBA start, 12..16 = count).
+**Fix:** Implementar `FileBackedSharedPageRegistry` keyed por `(inode_id, page_index)`.
+En fork, páginas `MAP_SHARED` no se marcan CoW — se reutiliza la misma página física.
 
-GPT: entrada MBR tipo 0xEE → leer LBA 1, verificar `b"EFI PART"`, parsear GUID
-partition entries. FAT32 GUID = `{28732AC1-1FF8-D211-BA4B-00A0C93EC93B}`.
+**Archivos:** `process/mod.rs` (MmapBacking::SharedFile variant), `memory/mod.rs`
+(page fault handler), `scheduler/mod.rs` (fork).
 
-Sin MBR válido: un `Partition` cubriendo disco completo (start_lba=0).
+### 1d. FD table compartida en threads
 
-### Paso 3 — Fat32Volume por instancia (`kernel/src/fs/fat32.rs`)
+`clone(CLONE_VM | CLONE_THREAD)` copia la FD table en lugar de compartirla. Un
+`close(fd)` en un thread no afecta a los demás threads del mismo proceso.
 
-Eliminar `static STATE`. Añadir:
+**Fix:** Envolver `FdTable` en `Arc<SpinLock<FdTable>>`. `fork()` clona el Arc
+(copia independiente). `clone_thread()` clona el puntero (tabla compartida).
 
-```rust
-pub struct Fat32Volume {
-    partition: Partition,
-    bpb_bytes_per_sector: u32,
-    bpb_sectors_per_cluster: u32,
-    fat_start_lba: u64,
-    data_start_lba: u64,
-    root_cluster: u32,
-    inner: SpinLock<Fat32VolumeInner>,
-}
-```
+**Archivos:** `process/mod.rs`, `scheduler/mod.rs`, `syscall/mod.rs`.
 
-`Fat32DirInode` y `Fat32FileInode` pasan a mantener `Arc<Fat32Volume>`.
+### 1e. `sendmsg` / `recvmsg` SCM_RIGHTS
 
-### Paso 4 — Auto-mount
+`sendmsg`/`recvmsg` manejan datos normales pero no `SCM_RIGHTS` (transferencia de
+file descriptors via control message). Requerido por D-Bus, Wayland, ssh-agent.
 
-En `kernel/src/fs/mod.rs`, `disk_init_and_mount()`:
+**Fix:** Parsear `cmsghdr` con `cmsg_type == SCM_RIGHTS`; duplicar cada fd en la
+FD table del receptor. Validar contra `granted_permissions` del receptor
+(requiere Binary Permission Model Tier 2/3).
 
-```
-for each disk → enumerate_partitions() → Fat32Volume::probe() → vfs_mount("/mnt/disk0p0", root)
-```
-
-### Paso 5 — Eliminar bypass path
-
-- Eliminar rama `if path.starts_with("//disk:")` en `sys_open()`.
-- Eliminar variante `FileDescriptor::FatFile`.
-- Eliminar `strip_disk_prefix()`.
-
-**Archivos:** `hal/disk.rs`, `platform/qemu_virt/virtio_blk.rs`, `fs/partition.rs`
-(nuevo), `fs/fat32.rs`, `fs/vfs.rs`, `syscall/mod.rs`, `fs/mod.rs`.
+**Archivos:** `syscall/mod.rs` (sys_sendmsg, sys_recvmsg).
 
 ---
 
 ## Bloque 2 — Memoria
 
-**Severidad:** Media-Alta.
+### 2a. VMA sigue siendo `Vec`
 
-### 2a. Demand paging — lazy BSS
+`mmap_regions: Vec<MmapRegion>` tiene un cap implícito y búsqueda O(n). Bajo carga
+con muchos `mmap` / `munmap` esto degrada el rendimiento.
 
-Segmentos ELF donde `p_filesz < p_memsz`: mapear BSS como not-present (PTE
-present=0). En page fault (EC 0x24), si VA está en zona LazyZero → alojar página
-zerada, mapear RW.
+**Fix:** Reemplazar con `BTreeMap<u64, MmapRegion>` keyed por `start_address`.
+Eliminar el límite de 1024 regiones.
 
-Requiere `vm_areas: Vec<VmArea>` en `Process` con `(start_va, end_va, VmAreaKind)`.
+**Archivo:** `process/mod.rs`.
 
-**Archivos:** `loader/mod.rs`, `process/mod.rs`, `memory/virtual_memory.rs`.
+### 2b. Buddy allocator
 
-### 2b. MAP_SHARED excluido de CoW en fork()
+El allocator físico usa first-fit O(n). Bajo carga real con allocaciones/
+liberaciones frecuentes, la fragmentación crece.
 
-`cow_copy_user()` marca todas las páginas RW como CoW, incluyendo páginas de
-`MAP_SHARED`. Padre e hijo deben ver las mismas páginas físicas sin CoW.
-
-Fix: tras `cow_copy_user()`, recorrer la `SharedRegionTable` y restaurar el
-mapeo RW original en el hijo para cada región compartida.
-
-**Archivos:** `scheduler/mod.rs` (fork), `memory/virtual_memory.rs`.
-
-### 2c. Buddy allocator
-
-El allocator físico es una free-list (O(n)). Implementar buddy allocator binario
-(12 órdenes, 4 KB–16 MB) para evitar fragmentación bajo carga real.
+**Fix:** Buddy allocator binario (12 órdenes, 4 KB–16 MB). Mantener first-fit
+como fallback para rangos no-alineados.
 
 **Archivo:** `memory/physical.rs`.
 
-### 2d. ASLR entropy pool
+### 2c. ASLR entropy pool
 
-`CNTPCT_EL0` como única fuente de entropía es predecible. Añadir
-`memory/entropy.rs` con pool mezclado de `CNTPCT_EL0 + CNTFRQ_EL0 + MIDR_EL1 +
-PA_stack_inicial`. LFSR Galois de 64 bits tras cada extracción.
+`CNTPCT_EL0` como única fuente de entropía para ASLR es predecible bajo ciertas
+condiciones (boot determinístico en VM).
 
-**Archivos:** Nuevo `memory/entropy.rs`, `loader/mod.rs`, `process/mod.rs`.
+**Fix:** Pool mezclado de `CNTPCT_EL0 ^ CNTFRQ_EL0 ^ MIDR_EL1 ^ PA_stack_inicial`.
+LFSR Galois de 64 bits tras cada extracción.
 
-### 2e. Slab capacity dinámica
-
-`SlabCache::new()` usa capacity fija de 64 objetos. Calcular
-`capacity = PAGE_SIZE / object_size`. Reduce fragmentación interna.
-
-**Archivo:** `memory/heap.rs`.
+**Archivos:** Nuevo `memory/entropy.rs`; usar en `loader/mod.rs`, `process/mod.rs`.
 
 ---
 
-## Bloque 3 — Threads: FD table compartida
+## Bloque 3 — Filesystem
 
-**Severidad:** Alta para multi-threading correcto.
+### 3d. BAFS: truncate con extent freeing
 
-`clone(CLONE_VM | CLONE_THREAD)` copia la FD table en vez de compartirla. Un
-`close(fd)` en un thread no afecta a los demás.
+`BafsFileInode::truncate()` retorna `NotSupported`. Truncar un archivo no libera
+los extents que ya no son necesarios.
 
-Fix: envolver `FdTable` en `Arc<SpinLock<FdTable>>`. `fork()` clona el Arc (copia
-independiente). `clone_thread()` clona el puntero (tabla compartida).
+**Archivo:** `fs/bafs_driver.rs`, y el módulo `bafs` del submodule.
 
-**Archivos:** `process/mod.rs`, `scheduler/mod.rs`, `syscall/mod.rs`.
+### 3e. BAFS como filesystem por defecto
 
----
+FAT32 sigue siendo el filesystem del sistema. BAFS está soportado como driver
+opcional pero no es el default. Cambiar esto requiere:
+- Herramienta `bafs-mkfs` en userspace para crear imágenes BAFS.
+- Decisión de migración del rootfs.
 
-## Bloque 4 — Syscalls pendientes
-
-**Severidad:** Media. Requeridas para compatibilidad POSIX.
-
-| Syscall | Estado | Notas |
-|---|---|---|
-| `select()` | ❌ | Implementable como thin wrapper sobre epoll; `fd_set = [u64; 16]` |
-| `sendmsg` / `recvmsg` (SCM_RIGHTS) | ❌ | Requerido por D-Bus, Wayland, ssh-agent |
-| `chmod` / `chown` / `fchmod` / `fchown` | ❌ | Requiere UID/GID primero |
-| `setuid` / `setgid` / `geteuid` / `getegid` | ❌ | Bloque 5 |
-| ELF `PT_INTERP` (dynamic linker) | ❌ | Requiere aux vector en stack |
-| `getrandom` (pool real) | ⚠️ | Existe el syscall; sin entropy pool real (Bloque 2d) |
-
-**`select()`** es la más urgente — muchos programas POSIX la usan directamente.
-Implementación: iterar bits de `fd_set`, llamar `check_fd_readiness()` por cada
-bit activo. Reusar lógica de `epoll.rs`.
-
-**SCM_RIGHTS** requiere `msghdr` + `cmsghdr` con array de fds; duplicar cada fd
-en la FD table del receptor.
+**Prerequisito:** userspace tooling, no kernel.
 
 ---
 
-## Bloque 5 — Seguridad y permisos
+## Bloque 4 — Seguridad y permisos (post-v1.0)
 
-**Severidad:** Alta antes de multi-usuario o producción.
+Estos ítems requieren `permissiond` en userspace o componentes aún no disponibles.
+El lado kernel del Binary Permission Model (Tier 1/4, `granted_permissions`,
+`vfs_open` check, `sys_mount` check) está implementado en v1.0.
 
-### 5a. UID/GID por proceso
+### 4a. Tier 2 — policy store
 
-`sys_getuid()` / `sys_getgid()` devuelven 0 siempre. Añadir a `Process`:
+`//sys:policy:{sha256}` en `vfs_open()`: verifica política firmada almacenada
+por `permissiond`. Requiere daemon corriendo y protocolo IPC definido.
 
-```rust
-pub uid: u32, pub gid: u32, pub euid: u32, pub egid: u32,
-```
+### 4b. Tier 3 — ELF section + approval prompt
 
-Init hereda uid=0. Hijos heredan del padre. `exec()` aplica set-uid bit del ELF.
+Binarios con `.bazzulto_permissions` ELF section que declaran sus permisos
+explícitamente. Requiere `permissiond` + UI (terminal o gráfica) para el prompt
+de aprobación del usuario.
 
-Nuevos syscalls: `getuid`, `getgid`, `geteuid`, `getegid`, `setuid`, `setgid`.
+### 4c. Ed25519 Tier 1 signature verification
 
-### 5b. Permisos de archivo en VFS
+Verificar `.baz_sig` ELF note contra clave pública embedded en kernel. Actualmente
+`//system:/bin/**` recibe full trust por path sin verificación criptográfica.
 
-`InodeStat.mode` existe pero nunca se verifica. Añadir `owner_uid` / `owner_gid`
-a `InodeStat`. En `sys_open()`, verificar bits de permiso según `euid`/`egid`.
-Root (euid=0) bypasa todo excepto execute sin bit x.
+**Prerequisito:** herramienta de signing en toolchain Bazzulto.
 
-### 5c. copy_from_user / copy_to_user con validación completa
+### 4d. `sys_request_cap` — runtime elevation
 
-El chequeo actual valida rango pero no verifica que las páginas estén mapeadas.
-Añadir walk de page-table antes de dereferenciar punteros de usuario.
+Syscall para que un proceso pida permisos adicionales en tiempo de ejecución.
+Con rate limiting de 3 denials/60s. Requiere `permissiond`.
 
-### 5d. kill() permission check
+### 4e. `sys_powerbox_open` — file picker sin exponer path
 
-`sys_kill()` envía señal a cualquier PID sin restricción. Verificar:
-`sender_euid == 0 || sender_uid == target_uid || sender_euid == target_uid`.
+File picker que retorna un fd al proceso sin revelar el path. Requiere `permissiond`
++ UI gráfica o terminal.
 
-### 5e. Binary Permission Model (permissiond)
+### 4f. `sys_restrict_self` — reducción irreversible de privilegios
 
-Ver `docs/features/Binary Permission Model.md`. Requiere 5a–5b como prerequisito.
-Deferred post-v1.0.
+Para interpreters (Python, Lua, etc.) que quieren ejecutar código no confiable.
+Requiere Tier 2/3 completos.
 
----
+### 4g. Password re-prompt para acciones Authenticated
 
-## Bloque 6 — Red (TCP/IP)
+`//sys:mount/**`, `//sys:driver/**`, etc. actualmente solo verifican que el
+proceso tenga el `ActionPermission` en `granted_actions`. El re-prompt de
+contraseña real requiere `permissiond` + credenciales.
 
-**Severidad:** Baja para v1.0, Alta para server workloads.
+### 4h. IPC fd re-validation en SCM_RIGHTS
 
-No hay networking. Implementación completa requiere:
+Al recibir un fd via `recvmsg(SCM_RIGHTS)`, verificar que el receptor tiene los
+permisos de acceso correspondientes al inode subyacente. Requiere Binary
+Permission Model Tier 2/3.
 
-1. **VirtIO-net driver** (`platform/qemu_virt/virtio_net.rs`) — device ID=1,
-   features `VIRTIO_NET_F_MAC`, dos virtqueues (RX/TX).
-2. **Ethernet + ARP** — dispatch por ethertype, ARP cache (max 64 entradas, LRU).
-3. **IPv4 + ICMP** — checksum, dispatch por protocolo, echo reply para `ping`.
-4. **UDP** — demux por puerto, checksum con pseudo-header.
-5. **TCP** — state machine, retransmission timer, ring buffers 64 KB RX/TX, sliding window.
-   Alternativa: integrar `smoltcp` (no_std Rust TCP/IP stack).
-6. **BSD socket API** — `socket(AF_INET,...)`, `bind`, `connect`, `listen`,
-   `accept`, `send`, `recv`, `setsockopt`.
-7. **DHCP client** (userspace) — para obtener IP de QEMU NAT.
+### 4i. Saved-set-UID
 
----
+`setuid()` con semántica POSIX completa requiere tres UIDs: real, effective,
+saved. Actualmente solo se manejan real y effective.
 
-## Bloque 7 — bzinit y userspace
+### 4j. `seccomp` filter
 
-Deuda de `docs/tech-debt/bzinit-v1.md`.
+Filtrado de syscalls por proceso. Deferred hasta que el modelo de seguridad
+esté estable con Tier 2/3.
 
-### 7.0 bzinit: kernel-only invocation
+### 4k. TPM binding para policy entries
 
-`bzinit` debe ser el único proceso que puede invocarlo el kernel directamente.
-Ningún proceso de userspace debe poder hacer `exec("//system:/bin/bzinit")` —
-si alguien lo ejecuta manualmente, el kernel debe retornar `EPERM`.
+Policy entries firmadas y enlazadas a un TPM específico. Deferred hasta
+hardware real (no QEMU).
 
-**Mecanismo:** Añadir un flag `INODE_KERNEL_EXEC_ONLY` en el inodo de bzinit
-(o en su entrada de política Tier 1). En `sys_exec()`, antes del tier dispatch:
+### 4l. Merkle root de dependencias dinámicas
 
-```rust
-if inode.flags & INODE_KERNEL_EXEC_ONLY != 0 {
-    if !caller_is_kernel_bootstrap() {
-        return Err(FsError::PermissionDenied);  // EPERM
-    }
-}
-```
-
-`caller_is_kernel_bootstrap()` es true solo cuando el PID del caller es el
-proceso idle (PID 0) durante el bootstrap inicial — es decir, cuando el kernel
-mismo ejecuta el primer proceso.
-
-Alternativamente: marcar el inodo de bzinit con un bit especial en `stat().mode`
-(`S_ISVTX` extendido o un bit Bazzulto-específico en los bits [63:12]) que el
-loader verifica. Este bit solo puede ser seteado por el kernel en `vfs_init()`,
-no por ningún syscall de userspace.
-
-**Archivos:** `fs/inode.rs` (flag INODE_KERNEL_EXEC_ONLY), `fs/tmpfs.rs` o
-`fs/vfs.rs` (verificación en sys_exec), `fs/mount.rs` (setear el flag en
-vfs_init al registrar bzinit).
-
-| Item | Estado | Prerequisito |
-|---|---|---|
-| `errno` en libc_compat | ❌ | TLS o per-process errno page |
-| `bzctl start/stop` via IPC | ❌ | Named pipe o fd de control en /proc/bzinit |
-| `bzctl logs <name>` | ❌ | Redirigir stdout/stderr de servicio a pipe |
-| `bzctl timeline/graph` | ❌ | Ring buffer de eventos en bzinit |
-| Symlinks reales en boot (`/bin` → `/system/bin`) | ✅ | VFS Symlink ya implementado |
-| `mkdir/rmdir/rename` en libc_compat | ⚠️ | Stubs — VFS soporta mkdir/unlink, falta rename |
-| `execve` con envp en libc_compat | ✅ | envp implementado en kernel |
-| Directorios de servicios por usuario | ❌ | readdir en tmpfs |
-| Boot snapshot (estado persistente entre reboots) | ❌ | FAT32 write + fsync |
-| Dynamic BDL loader | ❌ | ELF PLT/GOT, stable BSL ABI |
-| Directory.watch() (inotify) | ❌ | Fuente de eventos de filesystem en kernel |
-| App sandbox / capabilities | ❌ | Binary Permission Model (Bloque 5e) |
+Para Tier 1 con dynamic linking: computar Merkle root incluyendo todas las `.so`
+dependencias. Requiere dynamic linker.
 
 ---
 
-## Bloque 8 — Teclado / Console
+## Bloque 5 — IPC avanzado (post-v1.0)
 
-**Severidad:** Baja-Media.
+### 5a. `FUTEX_REQUEUE` / `FUTEX_WAIT_BITSET`
 
-| Item | Archivo |
-|---|---|
-| console_putc() no thread-safe (UTF-8 buffer sin spinlock) | `drivers/console/console.c` |
-| Key repeat rate no configurable desde el guest | `platform/qemu_virt/keyboard_virtio.c` |
-| Glifos Latin Extended generados programáticamente, sin validación visual | `drivers/console/font_latin_extended.c` |
-| keymap_parse() no reporta línea ni razón de error | `drivers/keyboard/keymap.c` |
+Operaciones futex avanzadas para compatibilidad con glibc condvars. `FUTEX_WAIT`
+y `FUTEX_WAKE` básicos están implementados.
 
----
+### 5b. `CLONE_SIGHAND` / `CLONE_FS` / `CLONE_NEWNS`
 
-## Bloque 9 — Editor de texto
+Flags de clone avanzados. `CLONE_VM | CLONE_THREAD` está implementado.
 
-**Severidad:** Media — requerido para v1.0 usable.
+### 5c. `splice()` / `vmsplice()`
 
-No existe editor de texto en userspace. Mínimo viable: editor modal tipo `vi`
-o editor de línea tipo `nano`.
-
-Prerequisitos para nano-like:
-- PTY raw mode (ya funciona via `ioctl(TCSETSW)`).
-- `TIOCGWINSZ` para obtener dimensiones del terminal (ya implementado).
-- `open/read/write/close` sobre VFS (ya funciona).
-- Ningún requisito de kernel adicional.
-
-Implementación sugerida: `userspace/bin/edit/` — editor de línea minimalista
-con búsqueda, cortar/pegar de líneas, guardado atómico (write a tmp + rename).
+Zero-copy transfer entre pipes y fds. No implementado.
 
 ---
 
-## Bloque 10 — FD Capabilities (Fuchsia-inspired)
+## Bloque 6 — Scheduling (post-v1.0)
 
-**Severidad:** Baja — post-v1.0.
+### 6a. `Arc<PageTable>` en clone de threads
 
-Añadir campo `rights: u32` a cada file descriptor. Verificar en cada syscall que
-use un fd (`read`, `write`, `seek`, `dup`, `send_fd`). `dup()` solo puede reducir
-rights, nunca escalar. Ver `docs/FEATURES.md` para diseño completo.
+`clone()` de threads usa raw pointer para compartir el page table en lugar de
+`Arc<PageTable>`. Documentado como TECHNICAL DEBT en el código.
 
----
+### 6b. Orphan reparenting completo
 
-## Orden de implementación sugerido
-
-```
-Bloque 1: FAT32 completo (BlockDevice + particiones + Fat32Volume por instancia)
-    ↓
-Bloque 2a: Demand paging lazy BSS
-Bloque 2b: MAP_SHARED CoW fix
-    ↓
-Bloque 3: FD table compartida en threads
-    ↓
-Bloque 4: select() + SCM_RIGHTS
-    ↓
-Bloque 5a–5d: UID/GID + permisos de archivo + kill() check
-    ↓
-Bloque 9: Editor de texto (sin deps de kernel)
-    ↓
-Bloque 6: Red (VirtIO-net → smoltcp → BSD sockets)
-    ↓
-Bloque 5e: Binary Permission Model
-    ↓
-Bloque 10: FD Capabilities
-```
-
-Bloque 7 (bzinit) y Bloque 8 (teclado/console) son independientes y pueden
-hacerse en cualquier punto del orden anterior.
+Cuando un proceso padre muere, sus hijos huérfanos deben ser reparentados a
+PID 1 (bzinit). El mecanismo existe pero no está garantizado para todos los
+escenarios de exit.
 
 ---
 
-## Deuda resuelta en sesiones recientes
+## Bloque 7 — Red (explícitamente fuera de scope)
 
-Los siguientes ítems estaban abiertos y fueron completados:
+No hay networking. Deferred indefinidamente.
 
-| Item | Sesión |
-|---|---|
-| SIGALRM / alarm() | 2026-04-12 |
-| TLB shootdown (`tlbi vmalle1is`) | 2026-04-12 |
-| Reboot / shutdown (PSCI) | 2026-04-12 |
-| IPC nlinks discriminante (sem=1, socket=2, mqueue=3) | 2026-04-12 |
-| /proc/self symlink | 2026-04-12 |
-| procfs por inodos (ProcfsRootInode, ProcPidDirInode) | 2026-04-12 |
-| VFS resolución de symlinks (follow_symlinks, MAX_DEPTH=8) | 2026-04-12 |
-| InodeType::Symlink + SymlinkInode | 2026-04-12 |
-| umask | 2026-04-11 |
-| envp en exec | 2026-04-11 |
-| sigaltstack + SA_ONSTACK + signal frame save/restore | 2026-04-11 |
-| Terminal signals Ctrl+C/Z/\\ (ya estaba implementado, verificado) | 2026-04-12 |
-| vDSO clock_gettime acelerado (CNTPCT_EL0, data page 0x3000) | 2026-04-11 |
+- VirtIO-net driver (device ID=1, features `VIRTIO_NET_F_MAC`)
+- Ethernet + ARP cache
+- IPv4 + ICMP + UDP + TCP
+- BSD socket API (`AF_INET`)
+- DHCP client
+- DNS stub resolver
+
+Alternativa: integrar `smoltcp` (no_std Rust TCP/IP stack) cuando se retome.
 
 ---
 
-## Post-v1.0 — Deuda documentada para v2.0+
+## Bloque 8 — Userspace / BDL (no es kernel)
 
-Estas deudas son trabajo real y fueron consideradas para v1.0, pero están explícitamente diferidas post-v1.0 porque requieren userspace estable o componentes que dependen de características aún no implementadas.
+Estos ítems son trabajo de userspace, no de kernel. Se documentan aquí porque
+bloquean funcionalidad end-to-end.
 
-### Seguridad / Modelo de permisos (post-v1.0)
+### 8a. `permissiond` daemon
 
-**Contexto:** El Binary Permission Model está completamente especificado en `docs/features/Binary Permission Model.md`. En v1.0, se implementa el lado kernel (granted_permissions, vfs_open check, Tier 1/4 parcial). El lado permissiond + Ed25519 + IPC + prompts va post-v1.0.
+Primer binario Tier 1 del sistema. Gestiona el policy store (Tier 2), los prompts
+de aprobación (Tier 3), y los re-prompts de contraseña (Authenticated).
 
-- **Tier 2 policy store** (`//sys:policy:{sha256}`): requiere permissiond corriendo en userspace. Kernel ya tendrá la infraestructura en v1.0.
-- **Tier 3 ELF section + approval prompt**: requiere permissiond + UI terminal/gráfica. Ver paso 7 en `docs/features/Binary Permission Model.md`.
-- **Ed25519 Tier 1 signature verification**: requiere clave pública embedded en kernel + herramienta de signing en toolchain. Prerequisito: binarios del sistema firmados.
-- **Merkle root computation**: depende de dynamic linker para resolver `.so` deps.
-- **`sys_request_cap`** (runtime elevation) + rate limiting: requiere permissiond.
-- **`sys_powerbox_open`** (file picker sin exponer path): requiere permissiond + UI.
-- **`sys_restrict_self`** (irreversible privilege reduction para interpreters): requiere Tier 2/3.
-- **IPC fd re-validation** en `recvmsg` SCM_RIGHTS: requiere Tier 2/3 completos.
-- **Password re-prompt** para permisos Authenticated: requiere permissiond + credenciales.
-- **TPM binding** para policy entries: deferred hasta hardware real.
-- **Saved-set-UID**: `setuid` con semántica POSIX completa (tres UIDs: real, effective, saved).
-- **`seccomp` filter**: deferred hasta que modelo de seguridad esté estable.
+**Prerequisito:** scheduler + IPC estables en kernel (✅ ya disponibles).
 
-### Memoria (post-v1.0)
+### 8b. Dynamic linker / PT_INTERP
 
-- **Buddy allocator**: el first-fit actual es funcional. Buddy es una optimización de fragmentación para reducir wastage bajo carga real.
-- **`vmalloc`**: para objetos grandes del kernel. El slab+first-fit es suficiente para v1.0.
-- **Memory hotplug**: añadir RAM en vivo — requiere arquitectura más sofisticada.
+`sys_exec` detecta `PT_INTERP` pero no lo ejecuta. El dynamic linker es userspace.
 
-### IPC (post-v1.0)
+**Prerequisito:** `mmap` file-backed MAP_PRIVATE (✅ implementado en v1.0).
 
-- **`sendmsg` / `recvmsg` SCM_RIGHTS**: requiere fd re-validation contra granted_permissions de receiver. Requiere Binary Permission Model Tier 2/3.
-- **`FUTEX_REQUEUE` / `FUTEX_WAIT_BITSET`**: operaciones futex avanzadas para compatibilidad glibc.
-- **`CLONE_SIGHAND` / `CLONE_FS` / `CLONE_NEWNS`**: flags de clone avanzados.
-- **`splice()` / `vmsplice()`**: zero-copy syscalls para pipes.
+### 8c. `baz` package manager — `grant_permissions()`
 
-### Scheduling (post-v1.0)
+El package manager necesita un mecanismo para otorgar permisos a los paquetes
+instalados. Requiere `permissiond`.
 
-- **`Arc<PageTable>`** en clone de threads: actualmente raw pointer documentado como TECHNICAL DEBT. Requiere ownership model mejor.
-- **Orphan reparenting completo** a PID 1: parcialmente implementado. Falta garantía de que todos los huérfanos se reasignan.
+### 8d. Text editor (nano-like)
 
-### Filesystem (post-v1.0)
+No existe editor de texto en userspace. Todos los prerequisitos de kernel
+(PTY raw mode, `TIOCGWINSZ`, VFS read/write) están disponibles.
 
-- **BAFS como filesystem nativo por defecto**: una vez que BAFS v1 esté maduro y testeado en kernel. FAT32 sigue siendo el bootloader/alternativo.
-- **FSInfo writeback** en FAT32: el free cluster count no se escribe de vuelta al FSInfo sector. Bajo impacto.
-- **`rename` en FAT32 y BAFS**: `Inode::link_child()` retorna `NotSupported` actualmente.
-- **Non-ASCII filenames** en FAT32: `lfn_char_to_ascii()` convierte a `?` todo código >= U+0080.
-- **Hard links en BAFS**: la V1 del spec no incluye hard links, solo symlinks.
-- **Extended attributes** (xattrs): `baz.*` namespace para hints de permisos (post-v1.0).
+### 8e. Bazzulto Standard Library (BSL)
 
-### Red (explícitamente fuera de scope)
+API stable para userspace: I/O, memory, permissions, IPC, crypto. Sin versión
+estable publicada.
 
-- **TCP/IP stack completo**: VirtIO-net driver, Ethernet, ARP, IPv4, ICMP, UDP, TCP. Explícitamente deferred indefinidamente.
-- **DHCP client**: configuración automática de IP.
-- **DNS resolver**: IANA zone file o stub resolver.
+### 8f. `bzctl` timeline / dependency graph
 
-### Userspace / BDL (no es kernel, pero bloqueante para ciertos features)
+`bzctl start/stop` básico funciona. El timeline de arranque y el grafo de
+dependencias de servicios no está implementado en bzinit.
 
-- **`permissiond` daemon**: primer binario Tier 1 que debe escribirse en userspace (Rust o C). Requiere scheduler + IPC estables en kernel.
-- **Dynamic linker / PT_INTERP**: requiere `mmap` file-backed (MAP_PRIVATE) en kernel (Fase D). Linker muestra símbolos + relocations.
-- **Text editor (nano-like)**: BDL/userspace, no kernel.
-- **`bzctl` + service manager avanzado**: control de servicio con timeline/dependency graph.
-- **Package manager (`baz`)**: ya existe userspace, requiere syscall `grant_permissions()` en kernel (permissiond).
-- **Bazzulto Standard Library (BSL)**: API stable para userspace (I/O, memory, permissions, IPC, crypto).
+---
 
-### v1.0 blockers reales — qué debe estar hecho
+## Bloque 9 — Console / Teclado
 
-Para declarar v1.0, el kernel debe tener:
+### 9a. `console_putc()` no thread-safe
 
-1. ✅ FAT32 per-volume (Fase A)
-2. ✅ Demand paging + MAP_SHARED file-backed (Fases C, D)
-3. ✅ UIDs/GIDs POSIX (Fase E)
-4. ✅ Binary Permission Model kernel side — granted_permissions + vfs_open check (Fase E2)
-5. ✅ fsync + VMA tree + ASLR (Fase F)
-6. ✅ TLB shootdown SMP fix (Fase B)
-7. ✅ Stubs menores filled in (Fase G)
-8. ✅ BAFS driver opcional soportado (Fase G)
-9. ✅ docs/DEBT.md actualizado con deuda post-v1.0
+El buffer UTF-8 interno de `console_putc()` no tiene spinlock. Escrituras
+concurrentes desde múltiples cores pueden corromper la secuencia UTF-8.
 
-Una vez hecho, el kernel es "estable v1.0". Ninguno de los post-v1.0 items anterior bloquea ese hito.
+**Archivo:** `drivers/console/console.c`.
+
+### 9b. Key repeat rate no configurable
+
+La tasa de repetición de teclas no es configurable desde el guest.
+
+**Archivo:** `platform/qemu_virt/keyboard_virtio.c`.
+
+---
+
+## Notas de diseño activas
+
+### BAFS vs FAT32
+
+FAT32 es el filesystem del sistema para v1.0. BAFS está soportado como driver
+opcional. El cambio a BAFS como default requiere `bafs-mkfs` en userspace y
+una decisión de migración explícita — no es deuda de kernel.
+
+### Binary Permission Model — estado en v1.0
+
+Implementado en kernel: Tier 1 (system binary path → full trust), Tier 4
+(sin `.bazzulto_permissions` section → hereda del padre + warning), checks en
+`vfs_open()`, checks en `sys_mount()`/`sys_umount()`, `INODE_KERNEL_EXEC_ONLY`
+para bzinit, `granted_permissions`/`granted_actions` en Process, herencia en
+fork(), limpieza en exec() con re-asignación por tier.
+
+Deferred: Tier 2 (policy store), Tier 3 (ELF section + prompt), Ed25519, SCM_RIGHTS
+re-validation, password re-prompt, `sys_request_cap`, `sys_powerbox_open`,
+`sys_restrict_self`.
+
+### Red
+
+TCP/IP está explícitamente fuera del scope de v1.0 y post-v1.0 sin fecha definida.
+No es deuda — es una decisión de prioridad documentada.

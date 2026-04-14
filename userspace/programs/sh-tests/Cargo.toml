@@ -1,0 +1,22 @@
+[package]
+name    = "sh-tests"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies — test modules include sh source files directly via #[path].
+
+[[test]]
+name = "lexer"
+path = "tests/lexer.rs"
+
+[[test]]
+name = "parser"
+path = "tests/parser.rs"
+
+[[test]]
+name = "vars"
+path = "tests/vars.rs"
+
+[[test]]
+name = "expand"
+path = "tests/expand.rs"

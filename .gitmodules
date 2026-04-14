@@ -1,3 +1,9 @@
 [submodule "kernel/src/fs/bafs"]
 	path = kernel/src/fs/bafs
 	url = https://github.com/cl8dep/bazzulto-bafs.git
+[submodule "third_party/tz"]
+	path = third_party/tz
+	url = https://github.com/eggert/tz.git
+[submodule "userspace/libraries/libc/musl"]
+	path = userspace/libraries/libc/musl
+	url = git://git.musl-libc.org/musl

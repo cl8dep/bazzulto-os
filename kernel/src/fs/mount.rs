@@ -28,6 +28,38 @@ use core::cell::UnsafeCell;
 use super::inode::{FsError, Inode, InodeType};
 
 // ---------------------------------------------------------------------------
+// Kernel-exec-only path registry
+// ---------------------------------------------------------------------------
+
+/// Static list of paths that userspace is not allowed to exec().
+///
+/// Entries are added by `vfs_mark_kernel_exec_only()` during boot and are
+/// checked by `sys_exec()` before loading the binary.
+///
+/// Invariant: only written during boot (single-threaded, IRQs disabled).
+struct SyncKernelExecOnlyPaths(UnsafeCell<Vec<String>>);
+unsafe impl Sync for SyncKernelExecOnlyPaths {}
+
+static KERNEL_EXEC_ONLY_PATHS: SyncKernelExecOnlyPaths =
+    SyncKernelExecOnlyPaths(UnsafeCell::new(Vec::new()));
+
+/// Mark `path` as kernel-exec-only: `sys_exec(path)` from userspace returns `EPERM`.
+///
+/// # Safety
+/// Must be called single-threaded with IRQs disabled (boot path only).
+pub unsafe fn vfs_mark_kernel_exec_only(path: &str) {
+    (*KERNEL_EXEC_ONLY_PATHS.0.get()).push(String::from(path));
+}
+
+/// Return `true` if `path` has been marked kernel-exec-only.
+///
+/// # Safety
+/// Must be called with IRQs disabled.
+pub unsafe fn vfs_is_kernel_exec_only(path: &str) -> bool {
+    (*KERNEL_EXEC_ONLY_PATHS.0.get()).iter().any(|p| p == path)
+}
+
+// ---------------------------------------------------------------------------
 // MountEntry
 // ---------------------------------------------------------------------------
 
@@ -36,6 +68,11 @@ struct MountEntry {
     prefix: String,
     /// Root inode of the mounted filesystem.
     root: Arc<dyn Inode>,
+    /// Source device path in Bazzulto Path Model (e.g. "//dev:diska:1/").
+    /// Empty string for virtual filesystems (tmpfs, devfs, procfs).
+    source: String,
+    /// Filesystem type string (e.g. "fat32", "bafs", "tmpfs", "devfs", "procfs").
+    fstype: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,17 +94,34 @@ impl MountTable {
 
     /// Mount `root` at `path`.
     ///
+    /// `source` is the device path (e.g. "//dev:diska:1/") or empty for virtual filesystems.
+    /// `fstype` is the filesystem type string (e.g. "fat32", "tmpfs", "procfs").
+    ///
     /// Longer paths take precedence over shorter ones (longest-match).
     /// Re-mounting an existing path replaces the previous entry.
-    pub fn mount(&mut self, path: &str, root: Arc<dyn Inode>) {
+    pub fn mount(&mut self, path: &str, root: Arc<dyn Inode>, source: &str, fstype: &str) {
         // Remove any existing entry for this path.
         self.entries.retain(|entry| entry.prefix != path);
         self.entries.push(MountEntry {
             prefix: path.to_string(),
             root,
+            source: source.to_string(),
+            fstype: fstype.to_string(),
         });
         // Sort longest-prefix first so resolve() finds the best match quickly.
         self.entries.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+    }
+
+    /// Call `callback` once for each mount entry, passing `(prefix, source, fstype, root)`.
+    ///
+    /// Used by `sys_getmounts` to enumerate all mounted filesystems.
+    pub fn for_each_mount<F>(&self, mut callback: F)
+    where
+        F: FnMut(&str, &str, &str, &Arc<dyn Inode>),
+    {
+        for entry in &self.entries {
+            callback(&entry.prefix, &entry.source, &entry.fstype, &entry.root);
+        }
     }
 
     /// Resolve an absolute path to its inode.
@@ -236,10 +290,10 @@ pub unsafe fn vfs_init() {
     let _ = root.mkdir("etc");
     root.insert("dev", devfs_create()); // /dev
 
-    table.mount("/", root);
+    table.mount("/", root, "", "tmpfs");
 
     // Mount the virtual procfs at "/proc".
-    table.mount("/proc", super::procfs::ProcfsRootInode::new());
+    table.mount("/proc", super::procfs::ProcfsRootInode::new(), "", "procfs");
 
     // Seed entropy from CNTPCT_EL0 (available after Phase 3).
     let cntpct: u64;
@@ -263,10 +317,27 @@ where
 
 /// Mount an additional filesystem at `path`.
 ///
+/// `source` is the device path in Bazzulto Path Model (e.g. "//dev:diskb:1/"),
+/// or empty string for virtual filesystems.
+/// `fstype` is the filesystem type (e.g. "fat32", "bafs", "tmpfs").
+///
 /// # Safety
 /// Must be called with IRQs disabled.
-pub unsafe fn vfs_mount(path: &str, root: Arc<dyn Inode>) {
-    with_vfs(|table| table.mount(path, root));
+pub unsafe fn vfs_mount(path: &str, root: Arc<dyn Inode>, source: &str, fstype: &str) {
+    with_vfs(|table| table.mount(path, root, source, fstype));
+}
+
+/// Enumerate all mount entries.
+///
+/// Calls `callback` for each entry with `(mountpoint, source, fstype, root_inode)`.
+///
+/// # Safety
+/// Must be called with IRQs disabled.
+pub unsafe fn vfs_for_each_mount<F>(callback: F)
+where
+    F: FnMut(&str, &str, &str, &alloc::sync::Arc<dyn Inode>),
+{
+    with_vfs(|table| table.for_each_mount(callback));
 }
 
 /// Resolve an absolute or relative path to an inode.

@@ -309,26 +309,42 @@ pub unsafe fn pipe_read_blocking(
     }
 }
 
+/// Result of `pipe_write_blocking`.
+///
+/// Distinguishes a successful write from a broken-pipe condition so that
+/// the syscall layer can send `SIGPIPE` and return `EPIPE` as POSIX requires.
+pub enum PipeWriteResult {
+    /// Bytes were written successfully.  Payload is the total byte count.
+    Written(usize),
+    /// The read end of the pipe is closed.  POSIX requires SIGPIPE + EPIPE.
+    /// Payload is the number of bytes written *before* the broken-pipe was
+    /// detected (may be > 0 for partial writes on large buffers).
+    BrokenPipe(usize),
+}
+
 /// Write all of `source` into the pipe, blocking if the buffer is full.
 ///
-/// Returns the number of bytes written, or 0 if all read ends are closed (EPIPE).
+/// Returns `PipeWriteResult::Written(n)` on success or
+/// `PipeWriteResult::BrokenPipe(n)` if all read ends are closed.
 ///
 /// # Safety
 /// Must be called with IRQs disabled.
 pub unsafe fn pipe_write_blocking(
     handle: &PipeHandle,
     source: &[u8],
-) -> usize {
+) -> PipeWriteResult {
     let mut total_written = 0usize;
     let mut remaining = source;
 
     loop {
         if remaining.is_empty() {
-            return total_written;
+            return PipeWriteResult::Written(total_written);
         }
         let buf = handle.buffer_mut();
         if buf.is_read_closed() {
-            return total_written; // EPIPE
+            // POSIX.1-2017 write(2): if all read ends are closed, the write
+            // shall fail with EPIPE and SIGPIPE shall be generated.
+            return PipeWriteResult::BrokenPipe(total_written);
         }
         let written = buf.write_bytes(remaining);
         if written > 0 {

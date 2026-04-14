@@ -1,0 +1,15 @@
+# disk-mounts — Bazzulto system disk mount configuration
+#
+# Processed by bzinit at boot, before services are started.
+# The root filesystem (//dev:diska:1/) is always mounted by the kernel.
+# List only additional disks that bzinit should mount.
+#
+# Columns: device              mountpoint      filesystem
+# Paths use the Bazzulto Path Model (//dev:diskb:1/, //home:user/, etc.)
+#
+# device:     //dev:disk{x}:{y}/  — x = disk letter (a=first, b=second, …)
+#                                    y = partition number (1-based)
+# mountpoint: //home:user/        — or POSIX path /home/user
+# filesystem: fat32 | bafs | tmpfs
+
+//dev:diskb:1/    //home:user/    fat32

@@ -1,0 +1,31 @@
+[package]
+name    = "fontmanager"
+version = "0.1.0"
+edition = "2021"
+
+# fontmanager — Bazzulto font management CLI.
+#
+# Usage:
+#   fontmanager list                    — list installed fonts
+#   fontmanager install <path>          — install a TTF font into /usr/share/fonts/
+#   fontmanager verify  <name>          — verify a font parses correctly
+#   fontmanager help                    — show usage
+
+[[bin]]
+name = "fontmanager"
+path = "src/main.rs"
+
+[dependencies]
+bazzulto-system  = { path = "../../libraries/bsl/Bazzulto.System" }
+bazzulto-display = { path = "../../libraries/bsl/Bazzulto.Display" }
+bazzulto-io      = { path = "../../libraries/bsl/Bazzulto.IO" }
+fontdue          = { version = "0.7", default-features = false }
+
+[profile.release]
+panic     = "abort"
+opt-level = "s"
+lto       = true
+strip     = true
+
+[profile.dev]
+panic = "abort"

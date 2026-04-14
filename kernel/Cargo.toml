@@ -7,6 +7,11 @@ edition = "2021"
 name = "bazzulto"
 path = "src/main.rs"
 
+[dependencies]
+# BAFS filesystem driver.  The `kernel` feature activates no_std+alloc mode
+# and exposes the `volume` API used by `fs/bafs_driver.rs`.
+bafs = { path = "src/fs/bafs", features = ["kernel"] }
+
 [profile.dev]
 panic = "abort"
 opt-level = 1

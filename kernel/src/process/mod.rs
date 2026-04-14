@@ -355,16 +355,52 @@ pub fn nice_to_priority_level(nice: i8) -> usize {
 // MmapRegion
 // ---------------------------------------------------------------------------
 
-/// One anonymous mmap region owned by a process.
+/// One mmap region owned by a process.
 ///
-/// Used to validate `munmap()` addresses and to clean up the address space
-/// on process exit.
-#[derive(Clone, Copy, Debug)]
+/// Used to validate `munmap()` addresses, drive demand paging, and clean up
+/// the address space on process exit.
+///
+/// Demand regions (`demand == true`) are registered in the process's region
+/// list but are NOT backed by physical pages at creation time.  A translation
+/// fault within `[base, base + length)` causes the page fault handler to
+/// allocate pages on the fly according to `backing`:
+///   - `Anonymous` → zeroed page.
+///   - `File(..)` → page read from the backing inode (MAP_PRIVATE CoW).
+///
+/// `MmapRegion` is `Clone` but not `Copy` because it may hold an
+/// `Arc<dyn Inode>` reference for file-backed mappings.
+#[derive(Clone)]
 pub struct MmapRegion {
     /// Starting virtual address of the region (page-aligned).
     pub base: u64,
     /// Length in bytes (page-aligned).
     pub length: u64,
+    /// If `true`, pages within this region are demand-allocated on first access
+    /// (translation fault) rather than pre-mapped at region creation.
+    pub demand: bool,
+    /// Backing store for demand pages in this region.
+    pub backing: MmapBacking,
+}
+
+/// Backing store kind for an mmap region.
+#[derive(Clone)]
+pub enum MmapBacking {
+    /// Anonymous mapping — demand pages are zeroed.
+    Anonymous,
+    /// File-backed MAP_PRIVATE mapping.
+    ///
+    /// On a translation fault, the kernel reads a page from `inode` at byte
+    /// offset `file_offset + (fault_va - region_base)` and maps it CoW.
+    ///
+    /// `file_offset` is the byte offset within the file corresponding to
+    /// `base` of the region (the `offset` argument to `mmap()`).
+    ///
+    /// Reference: POSIX.1-2017 `mmap(2)`, MAP_PRIVATE.
+    File {
+        inode: Arc<dyn crate::fs::Inode>,
+        /// Byte offset in the file corresponding to `MmapRegion::base`.
+        file_offset: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +808,48 @@ pub struct Process {
     /// See `capability` constants below.
     pub capabilities: u64,
 
+    // --- Syscall time accounting ---
+    /// Number of scheduler ticks spent in kernel (syscall) context.
+    ///
+    /// Incremented once per syscall dispatch.  Converted to a `timeval` by
+    /// `getrusage()` for `ru_stime`.  Does not measure actual kernel execution
+    /// time, just syscall count × tick interval (a conservative estimate).
+    pub sys_time_ticks: u64,
+
+    // --- Binary Permission Model ---
+    /// Access permission set (path patterns).
+    ///
+    /// Each entry is a canonical path glob (`//user:/**`, `//net:**`, …).
+    /// `sys_open()` checks this list before resolving the inode to prevent
+    /// path enumeration by unprivileged processes.
+    ///
+    /// Empty → Tier-4 transitional mode (bypass check, inherit from parent).
+    /// `[PathPattern::wildcard()]` → full access (Tier-1 system binaries).
+    ///
+    /// Reference: docs/features/Binary Permission Model.md §Access Permissions.
+    pub granted_permissions: Vec<crate::permission::PathPattern>,
+
+    /// Action permission set (capability tokens).
+    ///
+    /// Each entry gates a privileged kernel operation (`MountFilesystem`,
+    /// `LoadKernelDriver`, …).  Checked in the corresponding syscall handler.
+    ///
+    /// `GrantPermissions` is never present — the kernel hard-rejects it
+    /// regardless of this list.
+    ///
+    /// Reference: docs/features/Binary Permission Model.md §Action Permissions.
+    pub granted_actions: Vec<crate::permission::ActionPermission>,
+
+    // --- POSIX UID/GID ---
+    /// Real user ID.  Default 1000 for user processes; 0 for kernel/bzinit.
+    pub uid: u32,
+    /// Real group ID.
+    pub gid: u32,
+    /// Effective user ID.  Used for permission checks.
+    pub euid: u32,
+    /// Effective group ID.
+    pub egid: u32,
+
     // --- POSIX alarm ---
     /// Scheduler-tick deadline for SIGALRM delivery.
     ///
@@ -807,6 +885,25 @@ impl Process {
     pub fn new(pid: Pid, parent_pid: Option<Pid>) -> Option<Self> {
         let kernel_stack = KernelStack::allocate()?;
         let pid_u32 = pid.index as u32;
+
+        // Apply a small random offset to the mmap base so that each process
+        // gets a distinct mmap region layout.  We use CNTPCT_EL0 (physical
+        // counter) XOR'd with the PID, then mask to page-aligned multiples of
+        // up to 256 MiB (65536 pages of 4 KiB = 0x10000 * 0x1000 = 256 MiB).
+        //
+        // This is the same entropy source the stack ASLR uses; good enough for
+        // a probabilistic mitigation.
+        //
+        // Reference: ARM ARM DDI 0487 §D14.8.22 (CNTPCT_EL0).
+        let mmap_aslr_offset = {
+            let cntpct: u64;
+            unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) cntpct, options(nostack, nomem)) };
+            // Mix in the PID so two processes created in rapid succession differ.
+            let mixed = cntpct ^ (pid_u32 as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            // Keep bits [27:12] (pages 0–65535) → page-aligned offset 0–255 MiB.
+            (mixed & 0xFFFF) << 12
+        };
+
         Some(Self {
             pid,
             parent_pid,
@@ -827,7 +924,7 @@ impl Process {
             on_signal_stack: false,
             user_ticks: 0,
             exit_code: 0,
-            mmap_next_va: MMAP_USER_BASE,
+            mmap_next_va: MMAP_USER_BASE + mmap_aslr_offset,
             mmap_regions: Vec::new(),
             cow_pages: BTreeMap::new(),
             cwd: None,
@@ -838,6 +935,30 @@ impl Process {
             tls_base: 0,
             is_thread: false,
             capabilities: 0,
+            sys_time_ticks: 0,
+            // bzinit (PID 1) boots with full trust — it distributes narrower
+            // permission sets to its children.  All other processes start with
+            // empty sets (Tier-4 transitional mode) until exec() resolves their tier.
+            granted_permissions: if pid.index == 1 {
+                alloc::vec![crate::permission::PathPattern::wildcard()]
+            } else {
+                Vec::new()
+            },
+            granted_actions: if pid.index == 1 {
+                alloc::vec![
+                    crate::permission::ActionPermission::MountFilesystem,
+                    crate::permission::ActionPermission::LoadKernelDriver,
+                    crate::permission::ActionPermission::ModifyNetworkConfig,
+                    crate::permission::ActionPermission::InstallPackage,
+                    crate::permission::ActionPermission::ModifyKernelParams,
+                ]
+            } else {
+                Vec::new()
+            },
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
             alarm_deadline_tick: 0,
             file_descriptor_table: Arc::new(SpinLock::new(FileDescriptorTable::new_with_tty())),
         })

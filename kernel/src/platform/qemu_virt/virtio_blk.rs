@@ -152,10 +152,15 @@ impl DiskState {
     }
 }
 
+/// Maximum number of simultaneously supported virtio-blk instances.
+const MAX_BLKS: usize = 4;
+
 struct SyncCell<T>(core::cell::UnsafeCell<T>);
 unsafe impl<T> Sync for SyncCell<T> {}
 
-static DISK_STATE: SyncCell<DiskState> = SyncCell(core::cell::UnsafeCell::new(DiskState::uninit()));
+static DISK_STATES: SyncCell<[DiskState; MAX_BLKS]> = SyncCell(core::cell::UnsafeCell::new([
+    DiskState::uninit(), DiskState::uninit(), DiskState::uninit(), DiskState::uninit(),
+]));
 
 // ---------------------------------------------------------------------------
 // MMIO helpers
@@ -263,20 +268,26 @@ unsafe fn blk_do_request(
 // Public API (implements hal::disk)
 // ---------------------------------------------------------------------------
 
-/// Initialise the virtio-blk device.
+/// Initialise the N-th virtio-blk instance (0-indexed).
+///
+/// Returns `true` if a device was found and initialised, `false` if no
+/// device at that index exists.  Callers should loop from index 0 upward
+/// until this function returns `false`.
 ///
 /// # Safety
-/// Must be called after virtio_mmio::enumerate() and HHDM mapping.
-pub unsafe fn disk_init(hhdm_offset: u64) {
-    let state = &mut *DISK_STATE.0.get();
+/// Must be called after `virtio_mmio::enumerate()` and HHDM mapping.
+pub unsafe fn disk_init_instance(hhdm_offset: u64, instance: usize) -> bool {
+    if instance >= MAX_BLKS {
+        return false;
+    }
+    let state = &mut (*DISK_STATES.0.get())[instance];
     *state = DiskState::uninit();
 
-    // Find the virtio-blk device (DeviceID 2).
-    let (physical_base, slot) = match virtio_mmio::find_device(2) {
+    // Find the N-th virtio-blk device (DeviceID 2).
+    let (physical_base, slot) = match virtio_mmio::find_device_by_index(2, instance) {
         Some(pair) => pair,
         None => {
-            crate::drivers::uart::puts("[blk] no virtio-blk device found\r\n");
-            return;
+            return false;
         }
     };
 
@@ -314,7 +325,7 @@ pub unsafe fn disk_init(hhdm_offset: u64) {
         None => {
             crate::drivers::uart::puts("[blk] failed to alloc virtqueue page\r\n");
             mmio_write(base, REG_STATUS, STATUS_FAILED);
-            return;
+            return false;
         }
     };
 
@@ -339,7 +350,7 @@ pub unsafe fn disk_init(hhdm_offset: u64) {
         None => {
             crate::drivers::uart::puts("[blk] failed to alloc DMA bounce buffer\r\n");
             mmio_write(base, REG_STATUS, STATUS_FAILED);
-            return;
+            return false;
         }
     };
     let dma_virt = hhdm_offset + dma_phys;
@@ -353,7 +364,7 @@ pub unsafe fn disk_init(hhdm_offset: u64) {
     if queue_num_max < BLK_VIRTQUEUE_SIZE as u32 {
         crate::drivers::uart::puts("[blk] device queue too small\r\n");
         mmio_write(base, REG_STATUS, STATUS_FAILED);
-        return;
+        return false;
     }
 
     mmio_write(base, REG_QUEUE_NUM, BLK_VIRTQUEUE_SIZE as u32);
@@ -369,20 +380,25 @@ pub unsafe fn disk_init(hhdm_offset: u64) {
 
     state.initialized = true;
 
-    crate::drivers::uart::puts("[blk] virtio-blk initialized, capacity=");
+    crate::drivers::uart::puts("[blk] disk");
+    crate::drivers::uart::putc(b'a' + instance as u8);
+    crate::drivers::uart::puts(" initialized, capacity=");
     crate::drivers::uart::put_hex(state.capacity_sectors);
     crate::drivers::uart::puts(" sectors\r\n");
+
+    true
 }
 
-/// Read `count` 512-byte sectors starting at `lba` into `buf`.
+/// Read `count` 512-byte sectors starting at `lba` into `buf`, using disk `disk_index`.
 ///
 /// Uses the pre-allocated DMA bounce buffer (HHDM VA, known physical address)
 /// for each sector, then copies the result into the caller's buffer.  This
 /// avoids the assumption that the caller's buffer resides in HHDM virtual
 /// space — heap allocations (Vec, Box) live at kernel-image VAs and their
 /// physical addresses cannot be derived by subtracting hhdm_offset.
-pub unsafe fn disk_read_sectors(lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    let state = &mut *DISK_STATE.0.get();
+pub unsafe fn disk_read_sectors(disk_index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    if disk_index >= MAX_BLKS { return false; }
+    let state = &mut (*DISK_STATES.0.get())[disk_index];
     if !state.initialized || count == 0 {
         return false;
     }
@@ -409,11 +425,12 @@ pub unsafe fn disk_read_sectors(lba: u64, count: u32, buf: &mut [u8]) -> bool {
     true
 }
 
-/// Write `count` 512-byte sectors starting at `lba` from `buf`.
+/// Write `count` 512-byte sectors starting at `lba` from `buf`, using disk `disk_index`.
 ///
 /// Copies each sector into the DMA bounce buffer before issuing the request.
-pub unsafe fn disk_write_sectors(lba: u64, count: u32, buf: &[u8]) -> bool {
-    let state = &mut *DISK_STATE.0.get();
+pub unsafe fn disk_write_sectors(disk_index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    if disk_index >= MAX_BLKS { return false; }
+    let state = &mut (*DISK_STATES.0.get())[disk_index];
     if !state.initialized || count == 0 {
         return false;
     }
@@ -440,16 +457,19 @@ pub unsafe fn disk_write_sectors(lba: u64, count: u32, buf: &[u8]) -> bool {
     true
 }
 
-pub fn disk_capacity() -> u64 {
-    unsafe { (*DISK_STATE.0.get()).capacity_sectors }
+pub fn disk_capacity(disk_index: usize) -> u64 {
+    if disk_index >= MAX_BLKS { return 0; }
+    unsafe { (*DISK_STATES.0.get())[disk_index].capacity_sectors }
 }
 
-pub fn disk_get_irq_id() -> u32 {
-    unsafe { (*DISK_STATE.0.get()).irq_intid }
+pub fn disk_get_irq_id(disk_index: usize) -> u32 {
+    if disk_index >= MAX_BLKS { return 0; }
+    unsafe { (*DISK_STATES.0.get())[disk_index].irq_intid }
 }
 
-pub unsafe fn disk_irq_handler() {
-    let state = &mut *DISK_STATE.0.get();
+pub unsafe fn disk_irq_handler(disk_index: usize) {
+    if disk_index >= MAX_BLKS { return; }
+    let state = &mut (*DISK_STATES.0.get())[disk_index];
     if !state.initialized {
         return;
     }

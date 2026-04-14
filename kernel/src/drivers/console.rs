@@ -156,10 +156,11 @@ pub unsafe fn init(address: *mut u32, width: u64, height: u64, pitch_bytes: u64)
         ansi_current_param: 0,
     };
 
-    // Fill background.
+    // Fill framebuffer with black — userspace (bzdisplayd) owns the display
+    // from the first frame.  Kernel output goes to UART only.
     let pixel_count = (height as usize) * pitch_pixels;
     for i in 0..pixel_count {
-        write_volatile(address.add(i), COLOR_BG);
+        write_volatile(address.add(i), 0x00000000u32);
     }
 
     // Tell the TTY driver about our dimensions.
@@ -336,12 +337,17 @@ unsafe fn put_char_at(codepoint: u32, col: usize, row: usize) {
     draw_glyph(codepoint, col, row);
 }
 
+/// Print a string.
+///
+/// During normal boot all kernel output is sent to UART only — the framebuffer
+/// is left blank so that userspace (bzinit / bzdisplayd) can take full control
+/// of the display from the first frame.
+///
+/// The framebuffer console machinery (`print_char`, `scroll_up`, etc.) is
+/// retained for the kernel panic screen, which must remain visible even when
+/// the display server is not running.
 pub fn print_str(s: &str) {
-    unsafe {
-        for c in s.chars() {
-            print_char(c);
-        }
-    }
+    crate::drivers::uart::puts(s);
 }
 
 pub unsafe fn print_char(c: char) {

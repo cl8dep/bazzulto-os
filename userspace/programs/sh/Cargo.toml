@@ -1,0 +1,17 @@
+[package]
+name    = "sh"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sh"
+path = "src/main.rs"
+
+[dependencies]
+bazzulto-system = { path = "../../libraries/bsl/Bazzulto.System" }
+
+[profile.release]
+panic     = "abort"
+opt-level = "s"
+lto       = true
+strip     = true

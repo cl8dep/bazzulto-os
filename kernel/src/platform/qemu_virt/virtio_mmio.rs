@@ -112,10 +112,23 @@ pub unsafe fn enumerate(hhdm_offset: u64) {
 
 /// Find a device by ID. Returns (physical_base, slot_index) or None.
 pub fn find_device(device_id: u32) -> Option<(u64, u32)> {
+    find_device_by_index(device_id, 0)
+}
+
+/// Return the N-th device with the given device_id (0-indexed).
+///
+/// Used to enumerate multiple devices of the same type (e.g. two virtio-blk
+/// instances).  `instance = 0` returns the first match, `instance = 1` the
+/// second, and so on.
+pub fn find_device_by_index(device_id: u32, instance: usize) -> Option<(u64, u32)> {
     let state = unsafe { &*STATE.0.get() };
+    let mut count = 0usize;
     for i in 0..state.count {
         if state.slots[i].device_id == device_id {
-            return Some((state.slots[i].physical_base, state.slots[i].slot_index));
+            if count == instance {
+                return Some((state.slots[i].physical_base, state.slots[i].slot_index));
+            }
+            count += 1;
         }
     }
     None

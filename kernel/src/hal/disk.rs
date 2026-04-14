@@ -44,29 +44,42 @@ pub trait BlockDevice: Send + Sync {
 // VirtioBlkDevice — wraps the virtio-blk platform functions
 // ---------------------------------------------------------------------------
 
-/// `BlockDevice` implementation backed by the QEMU virt virtio-blk device.
+/// `BlockDevice` implementation backed by one QEMU virt virtio-blk instance.
 ///
+/// `index` identifies which physical device (0 = diska, 1 = diskb, …).
 /// All I/O is delegated to `platform::qemu_virt::virtio_blk`.
 /// Safety: single-core kernel with IRQs disabled at call sites.
-pub struct VirtioBlkDevice;
+pub struct VirtioBlkDevice {
+    index: usize,
+}
 
 unsafe impl Send for VirtioBlkDevice {}
 unsafe impl Sync for VirtioBlkDevice {}
 
 impl BlockDevice for VirtioBlkDevice {
     fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-        unsafe { crate::platform::qemu_virt::virtio_blk::disk_read_sectors(lba, count, buf) }
+        unsafe { crate::platform::qemu_virt::virtio_blk::disk_read_sectors(self.index, lba, count, buf) }
     }
 
     fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> bool {
-        unsafe { crate::platform::qemu_virt::virtio_blk::disk_write_sectors(lba, count, buf) }
+        unsafe { crate::platform::qemu_virt::virtio_blk::disk_write_sectors(self.index, lba, count, buf) }
     }
 
     fn sector_count(&self) -> u64 {
-        crate::platform::qemu_virt::virtio_blk::disk_capacity()
+        crate::platform::qemu_virt::virtio_blk::disk_capacity(self.index)
     }
 
-    fn name(&self) -> &str { "virtio-blk0" }
+    fn name(&self) -> &str {
+        // Return a static string for the first four disks; fall back to "virtio-blk?"
+        // for higher indices (not expected in practice).
+        match self.index {
+            0 => "diska",
+            1 => "diskb",
+            2 => "diskc",
+            3 => "diskd",
+            _ => "disk?",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -104,39 +117,49 @@ pub fn get_disk(index: usize) -> Option<Arc<dyn BlockDevice>> {
 // Legacy free functions — kept for callers that have not been updated
 // ---------------------------------------------------------------------------
 
-/// Initialise the virtio-blk device and register it in the disk registry.
+/// Initialise all virtio-blk instances and register them in the disk registry.
+///
+/// Loops from index 0 upward, initialising each instance until
+/// `disk_init_instance` returns `false` (no more devices).
 ///
 /// # Safety
 /// Must be called once during kernel boot with IRQs disabled.
 pub unsafe fn init(hhdm_offset: u64) {
-    crate::platform::qemu_virt::virtio_blk::disk_init(hhdm_offset);
-    // Register the virtio-blk device so the rest of the kernel can reach it
-    // through the BlockDevice trait without knowing the concrete type.
-    let device: Arc<dyn BlockDevice> = Arc::new(VirtioBlkDevice);
-    register_disk(device);
+    let mut instance = 0usize;
+    loop {
+        if !crate::platform::qemu_virt::virtio_blk::disk_init_instance(hhdm_offset, instance) {
+            break;
+        }
+        let device: Arc<dyn BlockDevice> = Arc::new(VirtioBlkDevice { index: instance });
+        register_disk(device);
+        instance += 1;
+    }
 }
 
-/// Read `count` 512-byte sectors starting at `lba` into `buf`.
+/// Read `count` 512-byte sectors from disk 0 starting at `lba` into `buf`.
 /// Returns true on success.
 pub fn read_sectors(lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    unsafe { crate::platform::qemu_virt::virtio_blk::disk_read_sectors(lba, count, buf) }
+    unsafe { crate::platform::qemu_virt::virtio_blk::disk_read_sectors(0, lba, count, buf) }
 }
 
-/// Write `count` 512-byte sectors starting at `lba` from `buf`.
+/// Write `count` 512-byte sectors to disk 0 starting at `lba` from `buf`.
 /// Returns true on success.
 pub fn write_sectors(lba: u64, count: u32, buf: &[u8]) -> bool {
-    unsafe { crate::platform::qemu_virt::virtio_blk::disk_write_sectors(lba, count, buf) }
+    unsafe { crate::platform::qemu_virt::virtio_blk::disk_write_sectors(0, lba, count, buf) }
 }
 
-/// Total capacity in 512-byte sectors.
+/// Total capacity in 512-byte sectors for disk 0.
 pub fn capacity() -> u64 {
-    crate::platform::qemu_virt::virtio_blk::disk_capacity()
+    crate::platform::qemu_virt::virtio_blk::disk_capacity(0)
 }
 
 pub fn get_irq_id() -> u32 {
-    crate::platform::qemu_virt::virtio_blk::disk_get_irq_id()
+    crate::platform::qemu_virt::virtio_blk::disk_get_irq_id(0)
 }
 
 pub fn irq_handler() {
-    unsafe { crate::platform::qemu_virt::virtio_blk::disk_irq_handler() };
+    // Dispatch to all initialised disks.
+    for i in 0..4 {
+        unsafe { crate::platform::qemu_virt::virtio_blk::disk_irq_handler(i) };
+    }
 }

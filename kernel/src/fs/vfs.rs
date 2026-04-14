@@ -141,7 +141,13 @@ impl FileDescriptor {
                 if handle.end() != PipeEnd::WriteEnd {
                     return -9; // EBADF
                 }
-                pipe_write_blocking(handle, source) as i64
+                match pipe_write_blocking(handle, source) {
+                    crate::fs::pipe::PipeWriteResult::Written(n) => n as i64,
+                    // Returning a dedicated sentinel so the syscall layer can
+                    // send SIGPIPE before returning EPIPE to userspace.
+                    // POSIX.1-2017 write(2): SIGPIPE is generated; errno = EPIPE.
+                    crate::fs::pipe::PipeWriteResult::BrokenPipe(_) => i64::MIN,
+                }
             }
             FileDescriptor::Tty => {
                 for &byte in source {
@@ -221,9 +227,15 @@ impl FileDescriptor {
 pub struct FileDescriptorTable {
     slots: Vec<Option<FileDescriptor>>,
     /// Bitmask of file descriptors with O_CLOEXEC set (bit N = fd N).
-    pub cloexec_mask: u64,
+    ///
+    /// Stored as 16 × u64 words to cover up to 1024 file descriptors without
+    /// aliasing.  Word index = fd / 64, bit index within word = fd % 64.
+    /// Reference: POSIX.1-2017 fcntl(2) FD_CLOEXEC.
+    pub cloexec_mask: [u64; 16],
     /// Bitmask of file descriptors with O_NONBLOCK set (bit N = fd N).
-    pub nonblock_mask: u64,
+    ///
+    /// Same layout as `cloexec_mask`.
+    pub nonblock_mask: [u64; 16],
 }
 
 impl FileDescriptorTable {
@@ -233,12 +245,12 @@ impl FileDescriptorTable {
         slots.push(Some(FileDescriptor::Tty)); // fd 0: stdin
         slots.push(Some(FileDescriptor::Tty)); // fd 1: stdout
         slots.push(Some(FileDescriptor::Tty)); // fd 2: stderr
-        Self { slots, cloexec_mask: 0, nonblock_mask: 0 }
+        Self { slots, cloexec_mask: [0u64; 16], nonblock_mask: [0u64; 16] }
     }
 
     /// Create an empty table (all None).
     pub fn empty() -> Self {
-        Self { slots: Vec::new(), cloexec_mask: 0, nonblock_mask: 0 }
+        Self { slots: Vec::new(), cloexec_mask: [0u64; 16], nonblock_mask: [0u64; 16] }
     }
 
     /// Deep-clone all descriptors for fork().
@@ -250,7 +262,7 @@ impl FileDescriptorTable {
         for slot in &self.slots {
             new_slots.push(slot.as_ref().and_then(|fd| fd.dup()));
         }
-        Self { slots: new_slots, cloexec_mask: self.cloexec_mask, nonblock_mask: self.nonblock_mask }
+        Self { slots: new_slots, cloexec_mask: self.cloexec_mask, nonblock_mask: self.nonblock_mask  }
     }
 
     /// Allocate the lowest free file descriptor and install `descriptor`.
@@ -307,6 +319,38 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Return the word index and bit mask for `fd` within a 1024-bit mask array.
+    ///
+    /// `fd` must be < MAX_OPEN_FILE_DESCRIPTORS (1024).
+    /// Returns `(word_index, bit_mask)` where `mask[word_index] & bit_mask` tests the fd.
+    #[inline]
+    fn fd_mask_pos(fd: usize) -> (usize, u64) {
+        let word = fd / 64;
+        let bit  = 1u64 << (fd % 64);
+        (word, bit)
+    }
+
+    /// Set a flag bit for `fd` in `mask`.
+    #[inline]
+    pub fn mask_set(mask: &mut [u64; 16], fd: usize) {
+        let (word, bit) = Self::fd_mask_pos(fd);
+        mask[word] |= bit;
+    }
+
+    /// Clear a flag bit for `fd` in `mask`.
+    #[inline]
+    pub fn mask_clear(mask: &mut [u64; 16], fd: usize) {
+        let (word, bit) = Self::fd_mask_pos(fd);
+        mask[word] &= !bit;
+    }
+
+    /// Test a flag bit for `fd` in `mask`.
+    #[inline]
+    pub fn mask_test(mask: &[u64; 16], fd: usize) -> bool {
+        let (word, bit) = Self::fd_mask_pos(fd);
+        mask[word] & bit != 0
+    }
+
     /// Close all open file descriptors (called on process exit).
     pub fn close_all(&mut self) {
         for slot in self.slots.iter_mut() {
@@ -340,7 +384,15 @@ impl FileDescriptorTable {
             Some(descriptor) => descriptor,
             None => return -9,
         };
-        self.install_at(destination_fd, new_descriptor)
+        let result = self.install_at(destination_fd, new_descriptor);
+        if result >= 0 {
+            // POSIX.1-2017 dup2(2): "The FD_CLOEXEC flag associated with the
+            // new file descriptor shall be cleared to keep the file descriptor
+            // open across calls to one of the exec functions."
+            // O_NONBLOCK is inherited from the source fd's nonblock_mask.
+            Self::mask_clear(&mut self.cloexec_mask, destination_fd);
+        }
+        result
     }
 
     /// Duplicate `source_fd` into the lowest available slot (dup semantics).

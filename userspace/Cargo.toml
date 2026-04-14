@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    # System programs — privileged OS components (init, daemons, control tools)
+    "system/bzinit",
+    "system/bzdisplayd",
+    "system/bzctl",
+    "system/fontmanager",
+
+    # User programs — shell and POSIX utilities
+    "programs/sh",
+    "programs/sh-tests",
+    "programs/coreutils",
+]
+
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

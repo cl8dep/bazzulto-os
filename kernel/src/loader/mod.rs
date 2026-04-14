@@ -220,6 +220,15 @@ pub struct LoadedImage {
     /// outside of the `with_physical_allocator` closure, avoiding re-entrant
     /// access to the global memory state.
     pub page_table: PageTable,
+    /// Base virtual address of the demand-paged stack region.
+    ///
+    /// The physical page at `stack_top - page_size` is mapped immediately (it
+    /// holds argv/envp).  The rest of `[stack_demand_base, stack_top - page_size)`
+    /// is registered as a demand region: the page fault handler maps pages there
+    /// on first access.
+    pub stack_demand_base: u64,
+    /// Virtual address one past the end of the stack demand region (== stack top).
+    pub stack_demand_top: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -435,25 +444,25 @@ pub unsafe fn load_elf(
     let stack_top = USER_STACK_TOP_BASE - stack_aslr;
     let stack_bottom = stack_top - USER_STACK_PAGES as u64 * page_size;
 
-    // Map stack pages (guard page is just not mapped — below stack_bottom).
-    let mut stack_top_page_phys = PhysicalAddress::new(0);
-    for page_index in 0..USER_STACK_PAGES {
-        let phys = allocator.alloc().ok_or(LoaderError::OutOfPhysicalMemory)?;
-        let phys_virt = phys.to_virtual(hhdm_offset).as_ptr::<u8>();
-        core::ptr::write_bytes(phys_virt, 0, page_size as usize);
-        let va = stack_bottom + page_index as u64 * page_size;
-        page_table
-            .map(
-                VirtualAddress::new(va),
-                phys,
-                PAGE_FLAGS_USER_DATA,
-                allocator,
-            )
-            .map_err(LoaderError::MappingFailed)?;
-        if page_index == USER_STACK_PAGES - 1 {
-            stack_top_page_phys = phys;
-        }
-    }
+    // Demand-paging stack: only the topmost page (which holds argv/envp) is
+    // mapped immediately.  All other pages in [stack_bottom, stack_top - page)
+    // are left unmapped; the page fault handler will allocate them on first
+    // access.  The guard page below stack_bottom is left unmapped as a sentinel.
+    //
+    // This reduces memory usage from USER_STACK_PAGES * 4 KiB to 1 page at
+    // exec time while still providing the full stack virtual address range.
+    let top_page_va = stack_top - page_size;
+    let stack_top_page_phys = allocator.alloc().ok_or(LoaderError::OutOfPhysicalMemory)?;
+    let phys_virt = stack_top_page_phys.to_virtual(hhdm_offset).as_ptr::<u8>();
+    core::ptr::write_bytes(phys_virt, 0, page_size as usize);
+    page_table
+        .map(
+            VirtualAddress::new(top_page_va),
+            stack_top_page_phys,
+            PAGE_FLAGS_USER_DATA,
+            allocator,
+        )
+        .map_err(LoaderError::MappingFailed)?;
 
     // Build the AArch64 SYSV ABI argv/envp layout in the topmost stack page.
     let (initial_stack_pointer, argc, argv_va, envp_va) = build_argv_on_stack(
@@ -483,6 +492,8 @@ pub unsafe fn load_elf(
         argv_va,
         envp_va,
         page_table,
+        stack_demand_base: stack_bottom,
+        stack_demand_top:  stack_top,
     })
 }
 
@@ -521,6 +532,15 @@ pub unsafe fn spawn_from_ramfs(
         .ok_or(LoaderError::OutOfPhysicalMemory)?;
 
     child.page_table = Some(page_table_box);
+
+    // Register the demand-paged stack region.  The top page is already mapped
+    // (it holds argv/envp); the rest of the range will be faulted in on access.
+    child.mmap_regions.push(crate::process::MmapRegion {
+        base:   loaded.stack_demand_base,
+        length: loaded.stack_demand_top - loaded.stack_demand_base,
+        demand: true,
+        backing: crate::process::MmapBacking::Anonymous,
+    });
 
     // Build the initial ExceptionFrame on the child's kernel stack.
     use crate::arch::arm64::exceptions::ExceptionFrame;
@@ -588,6 +608,14 @@ pub unsafe fn spawn_from_vfs(
         .ok_or(LoaderError::OutOfPhysicalMemory)?;
 
     child.page_table = Some(page_table_box);
+
+    // Register the demand-paged stack region.
+    child.mmap_regions.push(crate::process::MmapRegion {
+        base:   loaded.stack_demand_base,
+        length: loaded.stack_demand_top - loaded.stack_demand_base,
+        demand: true,
+        backing: crate::process::MmapBacking::Anonymous,
+    });
 
     use crate::arch::arm64::exceptions::ExceptionFrame;
     let frame_ptr = (child.kernel_stack.top as usize
@@ -672,16 +700,21 @@ unsafe fn build_argv_on_stack(
         |strings: &[&[u8]], slot_base: usize, mut cursor: usize| -> usize {
             for (index, s) in strings.iter().enumerate() {
                 let remaining = (page_size as usize).saturating_sub(cursor);
-                let copy_len = s.len().min(remaining.saturating_sub(1));
-                if copy_len == 0 {
+                // Empty strings still need a NUL byte in the string area so that
+                // the pointer in the slot is non-NULL and points to "\0".
+                // An empty string with remaining == 0 is dropped (no space left).
+                if remaining == 0 {
                     let slot = page_ptr.add(slot_base + index * 8) as *mut u64;
                     core::ptr::write(slot, 0u64);
                     continue;
                 }
-                core::ptr::copy_nonoverlapping(s.as_ptr(), page_ptr.add(cursor), copy_len);
-                if cursor + copy_len < page_size as usize {
-                    *page_ptr.add(cursor + copy_len) = 0u8;
+                let copy_len = s.len().min(remaining.saturating_sub(1));
+                // Write string bytes (may be zero for an empty string).
+                if copy_len > 0 {
+                    core::ptr::copy_nonoverlapping(s.as_ptr(), page_ptr.add(cursor), copy_len);
                 }
+                // Always write the NUL terminator.
+                *page_ptr.add(cursor + copy_len) = 0u8;
                 let string_va = page_va + cursor as u64;
                 let slot = page_ptr.add(slot_base + index * 8) as *mut u64;
                 core::ptr::write(slot, string_va);

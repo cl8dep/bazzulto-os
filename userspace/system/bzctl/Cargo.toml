@@ -1,0 +1,21 @@
+[package]
+name = "bzctl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bzctl"
+path = "src/main.rs"
+
+[dependencies]
+bazzulto-system = { path = "../../libraries/bsl/Bazzulto.System" }
+bazzulto-io     = { path = "../../libraries/bsl/Bazzulto.IO" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true
+
+[profile.dev]
+panic = "abort"

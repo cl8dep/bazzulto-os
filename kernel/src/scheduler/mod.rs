@@ -695,7 +695,7 @@ impl Scheduler {
         }
 
         // Copy mmap state, signal handlers, FD table, cwd, environ, umask,
-        // and signal stack from parent to child.
+        // signal stack, and Binary Permission Model sets from parent to child.
         let (
             child_mmap_next_va,
             child_mmap_regions,
@@ -706,11 +706,13 @@ impl Scheduler {
             child_environ,
             child_umask,
             child_signal_stack,
+            child_granted_permissions,
+            child_granted_actions,
         ) = {
             let parent = self.pool.get(parent_pid).ok_or(ForkError::InternalError)?;
             let regions: alloc::vec::Vec<MmapRegion> = parent.mmap_regions
                 .iter()
-                .copied()
+                .cloned()
                 .collect();
             // fork(): deep-clone into an independent FD table (POSIX fork semantics).
             let fd_table_clone = {
@@ -725,7 +727,10 @@ impl Scheduler {
             let umask = parent.umask;
             // signal_stack is inherited; on_signal_stack is NOT (child starts fresh).
             let signal_stack = parent.signal_stack;
-            (parent.mmap_next_va, regions, parent.signal_handlers, child_fd_table_arc, cwd, cwd_path, environ, umask, signal_stack)
+            // Binary Permission Model: permissions are inherited across fork().
+            let granted_permissions = parent.granted_permissions.clone();
+            let granted_actions = parent.granted_actions.clone();
+            (parent.mmap_next_va, regions, parent.signal_handlers, child_fd_table_arc, cwd, cwd_path, environ, umask, signal_stack, granted_permissions, granted_actions)
         };
 
         // Build the child's initial kernel stack frame (copy of parent's ExceptionFrame
@@ -750,6 +755,9 @@ impl Scheduler {
         child.umask = child_umask;
         child.signal_stack = child_signal_stack;
         child.on_signal_stack = false; // child starts outside the alt stack
+        // Binary Permission Model: child inherits parent's permission sets.
+        child.granted_permissions = child_granted_permissions;
+        child.granted_actions = child_granted_actions;
         // POSIX: pending alarm is not inherited — child starts with no alarm.
         child.alarm_deadline_tick = 0;
 
@@ -829,7 +837,7 @@ impl Scheduler {
             let cwd = parent.cwd.clone();
             let cwd_path = parent.cwd_path.clone();
             let regions: alloc::vec::Vec<crate::process::MmapRegion> =
-                parent.mmap_regions.iter().copied().collect();
+                parent.mmap_regions.iter().cloned().collect();
             (
                 parent.tgid,
                 parent.nice,
@@ -1077,6 +1085,23 @@ impl Scheduler {
         Some((zombie_pid, exit_code))
     }
 
+    /// Return true if `parent_pid` has at least one child process (in any
+    /// state, including zombie).  Used by `sys_wait` to distinguish "no
+    /// children exist" (ECHILD) from "children exist but none have exited yet"
+    /// (block and wait).
+    ///
+    /// Reference: POSIX.1-2017 wait(2) — ECHILD if no unwaited children.
+    pub fn has_children(&self, parent_pid: Pid) -> bool {
+        for slot in self.pool.slots.iter() {
+            if let ProcessSlot::Occupied(process) = slot {
+                if process.parent_pid == Some(parent_pid) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // -----------------------------------------------------------------------
     // Blocking
     // -----------------------------------------------------------------------
@@ -1287,6 +1312,8 @@ impl Scheduler {
         process.mmap_regions.push(crate::process::MmapRegion {
             base: base_va,
             length: pages as u64 * page_size,
+            demand: false,
+            backing: crate::process::MmapBacking::Anonymous,
         });
 
         Some(base_va)
@@ -1339,6 +1366,8 @@ impl Scheduler {
         process.mmap_regions.push(crate::process::MmapRegion {
             base:   base_va,
             length: region_length,
+            demand: false,
+            backing: crate::process::MmapBacking::Anonymous,
         });
 
         Some(base_va)

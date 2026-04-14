@@ -52,16 +52,16 @@ pub const VDSO_DATA_VA: usize = 0x3000;
 /// Number of syscall slots in the vDSO.
 ///
 /// Must be ≥ (highest syscall number + 1). Increase when adding syscalls.
-/// Current highest: MACHINE_POWEROFF = 101 → need at least 102 slots.
-pub const VDSO_SLOT_COUNT: usize = 102;
+/// Current highest: GETMOUNTS = 114 → need at least 115 slots.
+pub const VDSO_SLOT_COUNT: usize = 115;
 
 /// Bytes per slot: 4 instructions × 4 bytes.
 pub const VDSO_SLOT_SIZE: usize = 16;
 
 /// Word index within the code page where the fast clock_gettime implementation
-/// begins.  Must be > VDSO_SLOT_COUNT * 4 (last slot word = 101*4+3 = 407).
-/// Using 416 (word offset 0x680 / byte offset 0x6800 → 1664 bytes from page start).
-const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 416;
+/// begins.  Must be > VDSO_SLOT_COUNT * 4 (last slot word = 114*4+3 = 459).
+/// Using 464 (word offset 0x730 / byte offset 0x1CC0 from page start).
+const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 464;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -173,7 +173,7 @@ const CMP_X0_0: u32 = 0xF100001F;
 ///
 /// Laid out as `PAGE_SIZE / 4` u32 words. Slot N occupies words [N*4 .. N*4+4].
 /// Words beyond `VDSO_SLOT_COUNT * 4` are all NOP, except slot 19 (replaced
-/// with B → fast_clock_gettime) and the fast implementation itself at word 288.
+/// with B → fast_clock_gettime) and the fast implementation itself at word 464.
 #[repr(C, align(4096))]
 struct VdsoPage([u32; PAGE_SIZE / 4]);
 

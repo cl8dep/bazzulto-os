@@ -22,14 +22,17 @@ disk.img
 # Cargo build output — kernel
 kernel/target/
 
-# Cargo build output — userspace / BSL workspace
-userspace/bin/target/
+# Cargo build output — unified userspace workspace
+userspace/target/
 
 # Cargo build output — all BSL library crates (includes rustdoc HTML under target/doc/)
-userspace/lib/**/target/
+userspace/libraries/**/target/
 
 # Internal tools — not tracked in the repository
 tools/
+
+# Compiled IANA TZif binaries — generated at build time from third_party/tz
+third_party/zoneinfo/
 
 # ---------------------------------------------------------------------------
 # Documentation — generated output
@@ -46,6 +49,8 @@ docs/wiki/
 
 # Reference PDFs — large binary files, not tracked in git
 docs/*.pdf
+
+docs/posix-spec
 
 # MkDocs Python virtualenv / dependencies
 docs/requirements.txt.lock

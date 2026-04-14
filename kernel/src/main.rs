@@ -17,6 +17,7 @@ mod ipc;
 mod limine;
 mod loader;
 mod memory;
+mod permission;
 mod platform;
 mod process;
 mod scheduler;
@@ -258,6 +259,38 @@ fn volume_label_matches(label: &[u8; 11], name: &[u8]) -> bool {
         .map(|pos| &label[..=pos])
         .unwrap_or(&label[..0]);
     trimmed.eq_ignore_ascii_case(name)
+}
+
+/// Parse a `root=UUID=XXXX-XXXX` value into a FAT32 Volume Serial Number.
+///
+/// Accepts 8 uppercase hex digits with an optional '-' separator in the
+/// middle (e.g. `UUID=BAZ7-0001` or `UUID=BAZ70001`).
+/// Returns `None` if the value does not start with `UUID=` or is not valid hex.
+fn parse_uuid_root(value: &[u8]) -> Option<u32> {
+    let prefix = b"UUID=";
+    if value.len() < prefix.len() || !value[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let hex_part = &value[prefix.len()..];
+    // Accept "XXXX-XXXX" (9 chars) or "XXXXXXXX" (8 chars).
+    let hex_str = core::str::from_utf8(hex_part).ok()?;
+    let hex_clean: &str;
+    let buf: [u8; 8];
+    if hex_str.len() == 9 && hex_str.as_bytes()[4] == b'-' {
+        // Rebuild without the dash into a stack buffer.
+        buf = [
+            hex_str.as_bytes()[0], hex_str.as_bytes()[1],
+            hex_str.as_bytes()[2], hex_str.as_bytes()[3],
+            hex_str.as_bytes()[5], hex_str.as_bytes()[6],
+            hex_str.as_bytes()[7], hex_str.as_bytes()[8],
+        ];
+        hex_clean = core::str::from_utf8(&buf).ok()?;
+    } else if hex_str.len() == 8 {
+        hex_clean = hex_str;
+    } else {
+        return None;
+    }
+    u32::from_str_radix(hex_clean, 16).ok()
 }
 
 // kernel_main — called from start.S via `bl kernel_main`
@@ -623,47 +656,88 @@ pub extern "C" fn kernel_main() -> ! {
             };
             let partitions = fs::partition::enumerate_partitions(disk, disk_index);
             for partition in partitions {
-                if !partition.is_fat32_candidate() { continue; }
-                if !fs::fat32::fat32_init_partition(
-                    partition.disk.as_ref(), partition.start_lba
-                ) {
-                    continue;
-                }
-                let Some(fat32_root) = fs::fat32::fat32_root_inode() else { continue };
-
-                // Decide whether this partition should become the root mount.
-                // - If root= was supplied: match by volume label.
-                // - If root= was absent:   mount the first FAT32 found as root.
-                let is_root_candidate = match root_label {
-                    Some(label) => {
-                        let vol = fs::fat32::fat32_volume_label();
-                        volume_label_matches(&vol, label)
-                    }
-                    None => !root_mounted,
-                };
-
-                if is_root_candidate && !root_mounted {
-                    // Mount as the root filesystem.
-                    unsafe { fs::vfs_mount("/", fat32_root); }
-                    uart::puts("[storage] FAT32 mounted as /\r\n");
-                    root_mounted = true;
-                } else {
-                    // Subsequent partitions go under /mnt/disk{letter}{N}.
+                // ── BAFS probe ──────────────────────────────────────────────
+                // Check for BAFS magic before FAT32.  Any partition type may
+                // carry a BAFS filesystem (BAFS does not have a reserved MBR
+                // type byte yet).  The probe reads one sector and is cheap.
+                if fs::bafs_driver::bafs_probe(&partition.disk, partition.start_lba) {
+                    let bafs_root = match fs::bafs_driver::bafs_mount_partition(
+                        partition.disk.clone(), partition.start_lba
+                    ) {
+                        Some(root) => root,
+                        None => {
+                            uart::puts("[storage] BAFS probe passed but mount failed — skipping\r\n");
+                            continue;
+                        }
+                    };
                     let mount_path = partition.mount_path();
                     unsafe {
                         let dir_name = mount_path.trim_start_matches("/mnt/");
                         if let Ok((mnt_inode, _)) = fs::vfs_resolve_parent("/mnt/placeholder") {
                             let _ = mnt_inode.mkdir(dir_name);
                         }
-                        fs::vfs_mount(&mount_path, fat32_root);
+                        fs::vfs_mount(&mount_path, bafs_root, &partition.device_path(), "bafs");
                     }
-                    uart::puts("[storage] FAT32 mounted at ");
+                    uart::puts("[storage] BAFS mounted at ");
                     uart::puts(&mount_path);
                     uart::puts("\r\n");
+                    continue;
+                }
+
+                // ── FAT32 probe ─────────────────────────────────────────────
+                if !partition.is_fat32_candidate() { continue; }
+                let fat32_volume = match fs::fat32::fat32_init_partition(
+                    partition.disk.clone(), partition.start_lba
+                ) {
+                    Some(vol) => vol,
+                    None => continue,
+                };
+                let Some(fat32_root) = fs::fat32::fat32_root_inode(fat32_volume.clone()) else { continue };
+
+                // Decide whether this partition should become the root mount.
+                // - If root=UUID=XXXX-XXXX: match by FAT32 Volume Serial Number.
+                // - If root=LABEL:          match by volume label (fallback for
+                //                           development without a fixed UUID).
+                // - If root= absent:        mount the first FAT32 found as root.
+                let is_root_candidate = match root_label {
+                    Some(label) => {
+                        if let Some(target_uuid) = parse_uuid_root(label) {
+                            let vol_uuid = fs::fat32::fat32_volume_uuid(&fat32_volume);
+                            vol_uuid == target_uuid
+                        } else {
+                            let vol = fs::fat32::fat32_volume_label(&fat32_volume);
+                            volume_label_matches(&vol, label)
+                        }
+                    }
+                    None => !root_mounted,
+                };
+
+                if is_root_candidate && !root_mounted {
+                    // Mount as the root filesystem.
+                    // The root partition is always named //dev:diska:1/ by convention —
+                    // it is the canonical "first data disk" regardless of which physical
+                    // virtio-mmio slot it occupies (that slot depends on firmware/QEMU
+                    // enumeration order, not on OS-level disk identity).
+                    unsafe { fs::vfs_mount("/", fat32_root, "//dev:diska:1/", "fat32"); }
+                    uart::puts("[storage] FAT32 mounted as /\r\n");
+                    root_mounted = true;
+                } else {
+                    // Additional partition — deferred to bzinit via
+                    // /system/config/disk-mounts.  Do not mount here.
+                    uart::puts("[storage] additional partition found, deferred to bzinit\r\n");
                 }
             }
         }
         if !root_mounted {
+            if root_label.is_some() {
+                // A specific root= was requested but not found — this is fatal.
+                // The system cannot boot without a root filesystem.
+                uart::puts("[storage] FATAL: root partition not found — kernel cannot continue\r\n");
+                uart::puts("[storage] Check that root= in limine.conf matches the disk UUID or label.\r\n");
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
             uart::puts("[storage] WARNING: no FAT32 disk found — /system/bin/bzinit must be in ramfs\r\n");
         }
     }
@@ -675,6 +749,11 @@ pub extern "C" fn kernel_main() -> ! {
     // embedded in the kernel binary.  The kernel simply reads bzinit from
     // /system/bin/bzinit and launches it; bzinit then starts all services.
     unsafe {
+        // Mark bzinit as kernel-exec-only before spawning it.
+        // This ensures no userspace process can re-exec bzinit after boot.
+        // Reference: docs/features/Binary Permission Model.md §INODE_KERNEL_EXEC_ONLY.
+        fs::vfs_mark_kernel_exec_only("/system/bin/bzinit");
+
         // Spawn bzinit as PID 1.
         let spawn_result = scheduler::with_scheduler(|sched| {
             loader::spawn_from_vfs(sched, "/system/bin/bzinit")

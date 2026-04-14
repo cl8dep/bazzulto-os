@@ -134,6 +134,20 @@ pub mod numbers {
     pub const ALARM:            u64 = 99;
     pub const MACHINE_REBOOT:   u64 = 100;
     pub const MACHINE_POWEROFF: u64 = 101;
+    // Phase 19 — POSIX UID/GID
+    pub const GETEUID:  u64 = 102;
+    pub const GETEGID:  u64 = 103;
+    pub const SETUID:   u64 = 104;
+    pub const SETGID:   u64 = 105;
+    pub const SETEUID:  u64 = 106;
+    pub const SETEGID:  u64 = 107;
+    pub const CHMOD:    u64 = 108;
+    pub const FCHMOD:   u64 = 109;
+    pub const CHOWN:    u64 = 110;
+    pub const FCHOWN:   u64 = 111;
+    pub const LCHOWN:   u64 = 112;
+    pub const MOUNT:      u64 = 113;
+    pub const GETMOUNTS:  u64 = 114;
 }
 
 use numbers::*;
@@ -142,17 +156,24 @@ use numbers::*;
 // Error codes (negated POSIX errno values)
 // ---------------------------------------------------------------------------
 
-const EPERM:   i64 = -1;
-const ENOENT:  i64 = -2;
-const ESRCH:   i64 = -3;
-const EINTR:   i64 = -4;
-const EBADF:   i64 = -9;
-const EAGAIN:  i64 = -11;
-const ENOMEM:  i64 = -12;
-const EINVAL:  i64 = -22;
-const EMFILE:  i64 = -24;
-const ENOSYS:  i64 = -38;
-const EPIPE:   i64 = -32;
+const EPERM:    i64 = -1;
+const ENOENT:   i64 = -2;
+const ESRCH:    i64 = -3;
+const EINTR:    i64 = -4;
+const ENOEXEC:  i64 = -8;
+const EBADF:    i64 = -9;
+const ECHILD:   i64 = -10;
+const EAGAIN:   i64 = -11;
+const ENOMEM:   i64 = -12;
+const EACCES:   i64 = -13;
+const EFAULT:   i64 = -14;
+const EEXIST:   i64 = -17;
+const ENOTDIR:  i64 = -20;
+const EINVAL:   i64 = -22;
+const EMFILE:   i64 = -24;
+const EPIPE:    i64 = -32;
+const ENOSYS:   i64 = -38;
+const ESPIPE:   i64 = -29;
 
 // ---------------------------------------------------------------------------
 // mmap flags (Linux ABI values for AArch64)
@@ -306,6 +327,15 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
     let arg4 = unsafe { (*frame).x[4] };
     let arg5 = unsafe { (*frame).x[5] };
 
+    // Increment per-process kernel time counter.  Each syscall counts as one
+    // tick regardless of actual duration.  Used by getrusage() ru_stime.
+    unsafe {
+        crate::scheduler::with_scheduler(|scheduler| {
+            if let Some(process) = scheduler.current_process_mut() {
+                process.sys_time_ticks = process.sys_time_ticks.saturating_add(1);
+            }
+        });
+    }
 
     let return_value: i64 = unsafe {
         match syscall_number {
@@ -322,14 +352,14 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             PIPE          => sys_pipe(arg0 as *mut i32),
             DUP           => sys_dup(arg0 as i32),
             DUP2          => sys_dup2(arg0 as i32, arg1 as i32),
-            MMAP          => sys_mmap(arg0, arg1, arg2 as i32, arg3 as i32),
+            MMAP          => sys_mmap(arg0, arg1, arg2 as i32, arg3 as i32, arg4 as i32, arg5),
             MUNMAP        => sys_munmap(arg0, arg1),
             FORK          => sys_fork(frame),
             EXEC          => sys_exec(frame, arg0 as *const u8, arg1 as usize, arg2 as *const u8, arg3 as usize, arg4 as *const u8, arg5 as usize),
             GETPID        => sys_getpid(),
             GETPPID       => sys_getppid(),
             CLOCK_GETTIME => sys_clock_gettime(arg0 as i32, arg1 as *mut u64),
-            NANOSLEEP     => sys_nanosleep(arg0 as *const u64),
+            NANOSLEEP     => sys_nanosleep(arg0 as *const u64, arg1 as *mut u64),
             SIGACTION     => sys_sigaction(arg0 as i32, arg1, arg2 as *mut u64, arg3 as u32),
             KILL          => sys_kill(arg0 as i32, arg1 as i32),
             SIGRETURN     => sys_sigreturn(frame),
@@ -360,8 +390,8 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             PRCTL         => sys_prctl(arg0 as i32, arg1 as *const u8, arg2 as usize),
             GETTIMEOFDAY  => sys_gettimeofday(arg0 as *mut u64),
             POLL          => sys_poll(arg0 as *mut u64, arg1 as usize, arg2 as i32),
-            GETUID        => 0, // stub: always root
-            GETGID        => 0, // stub: always root
+            GETUID        => sys_getuid(),
+            GETGID        => sys_getgid(),
             // Phase 10 — Terminal
             IOCTL         => sys_ioctl(arg0 as i32, arg1 as u32, arg2),
             TCGETATTR     => sys_tcgetattr(arg0 as i32, arg1 as *mut u8),
@@ -386,7 +416,7 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             RENAME        => sys_rename(arg0 as *const u8, arg1 as usize, arg2 as *const u8, arg3 as usize),
             GETDENTS64    => sys_getdents64(arg0 as i32, arg1 as *mut u8, arg2 as usize),
             TRUNCATE      => sys_truncate_fd(arg0 as i32, arg1 as u64),
-            FSYNC         => 0, // stub: no writeback needed for tmpfs
+            FSYNC         => sys_fsync(arg0 as i32),
             // Phase 14 — FIFOs and POSIX semaphores
             MKFIFO        => sys_mkfifo(arg0, arg1 as usize),
             SEM_OPEN      => crate::ipc::sem::sys_sem_open(arg0, arg1 as usize, arg2 as i32, arg3 as u32),
@@ -424,7 +454,21 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             ALARM            => sys_alarm(arg0),
             MACHINE_REBOOT   => sys_machine_reboot(),
             MACHINE_POWEROFF => sys_machine_poweroff(),
-            _                 => ENOSYS,
+            // Phase 19 — POSIX UID/GID
+            GETEUID  => sys_geteuid(),
+            GETEGID  => sys_getegid(),
+            SETUID   => sys_setuid(arg0 as u32),
+            SETGID   => sys_setgid(arg0 as u32),
+            SETEUID  => sys_seteuid(arg0 as u32),
+            SETEGID  => sys_setegid(arg0 as u32),
+            CHMOD    => sys_chmod(arg0, arg1 as usize, arg2 as u32),
+            FCHMOD   => sys_fchmod(arg0 as i32, arg1 as u32),
+            CHOWN    => sys_chown(arg0, arg1 as usize, arg2 as u32, arg3 as u32),
+            FCHOWN   => sys_fchown(arg0 as i32, arg1 as u32, arg2 as u32),
+            LCHOWN   => sys_chown(arg0, arg1 as usize, arg2 as u32, arg3 as u32), // no symlinks yet
+            MOUNT      => sys_mount(arg0, arg1 as usize, arg2, arg3 as usize, arg4, arg5 as usize),
+            GETMOUNTS  => sys_getmounts(arg0 as *mut u8, arg1 as usize),
+            _          => ENOSYS,
         }
     };
 
@@ -599,7 +643,8 @@ unsafe fn sys_write(fd: i32, buffer_ptr: *const u8, length: usize) -> i64 {
         return EBADF;
     }
     if !validate_user_pointer(buffer_ptr as u64, length) {
-        return EINVAL;
+        // POSIX.1-2017 write(2): EFAULT if buf is outside the accessible address space.
+        return EFAULT;
     }
     let source_slice = core::slice::from_raw_parts(buffer_ptr, length);
 
@@ -612,11 +657,30 @@ unsafe fn sys_write(fd: i32, buffer_ptr: *const u8, length: usize) -> i64 {
         None => return EBADF,
     };
     let mut guard = fd_table_arc.lock();
-    if let Some(descriptor) = guard.get_mut(fd as usize) {
+    let result = if let Some(descriptor) = guard.get_mut(fd as usize) {
         descriptor.write(source_slice)
     } else {
-        EBADF
+        return EBADF;
+    };
+    drop(guard);
+
+    // i64::MIN is the sentinel returned by FileDescriptor::write when the
+    // read end of a pipe is closed.  POSIX.1-2017 write(2) requires:
+    //   1. SIGPIPE is generated for the process.
+    //   2. -1 is returned with errno set to EPIPE.
+    // If SIGPIPE is set to SIG_IGN the signal is not delivered but EPIPE is
+    // still returned — the signal handler check inside deliver_pending_signals
+    // handles the SIG_IGN case automatically.
+    if result == i64::MIN {
+        const SIGPIPE: u8 = 13;
+        crate::scheduler::with_scheduler(|scheduler| {
+            let pid = scheduler.current_pid();
+            scheduler.send_signal_to(pid, SIGPIPE);
+        });
+        return EPIPE;
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +692,8 @@ unsafe fn sys_read(fd: i32, buffer_ptr: *mut u8, length: usize) -> i64 {
         return EBADF;
     }
     if !validate_user_pointer(buffer_ptr as u64, length) {
-        return EINVAL;
+        // POSIX.1-2017 read(2): EFAULT if buf is outside the accessible address space.
+        return EFAULT;
     }
     let destination_slice = core::slice::from_raw_parts_mut(buffer_ptr, length);
 
@@ -641,8 +706,7 @@ unsafe fn sys_read(fd: i32, buffer_ptr: *mut u8, length: usize) -> i64 {
         None => return EBADF,
     };
     let mut guard = fd_table_arc.lock();
-    let bit: u64 = 1u64 << (fd as u64 & 63);
-    let is_nonblock = (guard.nonblock_mask & bit) != 0;
+    let is_nonblock = crate::fs::vfs::FileDescriptorTable::mask_test(&guard.nonblock_mask, fd as usize);
 
     // If reading from the TTY (fd == stdin or any TTY fd), wire up the
     // echo sink before acquiring the mutable descriptor reference so we
@@ -742,6 +806,33 @@ unsafe fn sys_open(name_ptr: *const u8, name_length: usize, flags: i32, mode: u3
         name_abs_owned.as_str()
     };
 
+    // Binary Permission Model — access permission check.
+    //
+    // Check before any inode lookup to prevent path enumeration: a denied
+    // path returns EACCES regardless of whether the inode exists.
+    //
+    // Impossible namespaces are always denied.
+    // If granted_permissions is non-empty, the path must match at least one
+    // pattern.  An empty set means Tier-4 transitional mode (bypass).
+    //
+    // Only canonical `//scheme:` paths are checked here — POSIX `/dev/`, `/proc/`
+    // paths go through a separate device dispatch before reaching the VFS.
+    //
+    // Reference: docs/features/Binary Permission Model.md §vfs_open check.
+    if name.starts_with("//") {
+        if crate::permission::is_impossible_namespace(name) {
+            return EPERM;
+        }
+        let access_denied = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process()
+                .map(|p| !crate::permission::permission_allows(&p.granted_permissions, name))
+                .unwrap_or(false)
+        });
+        if access_denied {
+            return EACCES;
+        }
+    }
+
     // Dispatch by path scheme.
     // NOTE: FAT32 is now mounted at /mnt via the VFS mount table — no special
     // case needed.  Paths starting with /mnt/ are resolved by vfs_resolve()
@@ -783,7 +874,7 @@ unsafe fn sys_open(name_ptr: *const u8, name_length: usize, flags: i32, mode: u3
             match crate::fs::vfs_resolve(name, cwd.as_ref()) {
                 Ok(inode) => {
                     if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
-                        return -17; // EEXIST
+                        return EEXIST;
                     }
                     if flags & O_TRUNC != 0 {
                         let _ = inode.truncate(0);
@@ -824,7 +915,7 @@ unsafe fn sys_open(name_ptr: *const u8, name_length: usize, flags: i32, mode: u3
             match crate::fs::vfs_resolve(name, cwd.as_ref()) {
                 Ok(inode) => {
                     if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
-                        return -17; // EEXIST
+                        return EEXIST;
                     }
                     if flags & O_TRUNC != 0 {
                         let _ = inode.truncate(0);
@@ -866,12 +957,11 @@ unsafe fn sys_open(name_ptr: *const u8, name_length: usize, flags: i32, mode: u3
     if fd < 0 {
         return EMFILE as i64;
     }
-    let bit: u64 = 1u64 << (fd as u64 & 63);
     if flags & O_CLOEXEC != 0 {
-        guard.cloexec_mask |= bit;
+        crate::fs::vfs::FileDescriptorTable::mask_set(&mut guard.cloexec_mask, fd as usize);
     }
     if flags & O_NONBLOCK != 0 {
-        guard.nonblock_mask |= bit;
+        crate::fs::vfs::FileDescriptorTable::mask_set(&mut guard.nonblock_mask, fd as usize);
     }
     fd as i64
 }
@@ -894,9 +984,8 @@ unsafe fn sys_close(fd: i32) -> i64 {
     };
     let mut guard = fd_table_arc.lock();
     if guard.close(fd as usize) {
-        let bit: u64 = 1u64 << (fd as u64 & 63);
-        guard.cloexec_mask &= !bit;
-        guard.nonblock_mask &= !bit;
+        crate::fs::vfs::FileDescriptorTable::mask_clear(&mut guard.cloexec_mask, fd as usize);
+        crate::fs::vfs::FileDescriptorTable::mask_clear(&mut guard.nonblock_mask, fd as usize);
         0
     } else {
         EBADF
@@ -946,8 +1035,13 @@ unsafe fn sys_spawn(name_ptr: *const u8, name_length: usize, capability_mask: u6
 
     // Try VFS first (FAT32 disk), fall back to legacy ramfs for built-ins.
     // This mirrors the pattern used by sys_exec.
-    let cwd = crate::scheduler::with_scheduler(|scheduler| {
-        scheduler.current_process().and_then(|p| p.cwd.clone())
+    // Also collect cwd_path so the child inherits the working directory.
+    let (cwd, parent_cwd_path) = crate::scheduler::with_scheduler(|scheduler| {
+        let cwd      = scheduler.current_process().and_then(|p| p.cwd.clone());
+        let cwd_path = scheduler.current_process()
+            .map(|p| p.cwd_path.clone())
+            .unwrap_or_else(|| alloc::string::String::from("/"));
+        (cwd, cwd_path)
     });
     let vfs_inode = crate::fs::vfs_resolve(name, cwd.as_ref()).ok();
     let owned_elf: alloc::vec::Vec<u8>;
@@ -1033,12 +1127,23 @@ unsafe fn sys_spawn(name_ptr: *const u8, name_length: usize, capability_mask: u6
 
         // Install the new page table.
         child.page_table = Some(loaded_page_table);
+        // Register the demand-paged stack region.
+        child.mmap_regions.push(crate::process::MmapRegion {
+            base:   loaded.stack_demand_base,
+            length: loaded.stack_demand_top - loaded.stack_demand_base,
+            demand: true,
+            backing: crate::process::MmapBacking::Anonymous,
+        });
         // Grant requested capabilities (already validated above).
         child.capabilities = capability_mask;
         // Inherit the parent's environment.
         child.environ = parent_environ.iter()
             .filter_map(|v| core::str::from_utf8(v).ok().map(|s| alloc::string::String::from(s)))
             .collect();
+
+        // Inherit the parent's working directory.
+        child.cwd      = cwd.clone();
+        child.cwd_path = parent_cwd_path.clone();
 
         // Replace the fresh fd table with the parent's clone (inheriting pipes).
         if let Some(fd_clone) = parent_fd_table_clone {
@@ -1053,6 +1158,13 @@ unsafe fn sys_spawn(name_ptr: *const u8, name_length: usize, capability_mask: u6
         (*frame_ptr).elr = loaded.entry_point;
         (*frame_ptr).spsr = 0; // EL0 state
         (*frame_ptr).sp = loaded.initial_stack_pointer;
+        crate::uart::puts("[spawn] sp=");
+        crate::uart::put_hex(loaded.initial_stack_pointer);
+        crate::uart::puts(" demand=[");
+        crate::uart::put_hex(loaded.stack_demand_base);
+        crate::uart::puts(", ");
+        crate::uart::put_hex(loaded.stack_demand_top);
+        crate::uart::puts(")\r\n");
         // AArch64 SYSV ABI: x0 = argc, x1 = argv[] VA, x2 = envp[] VA.
         (*frame_ptr).x[0] = loaded.argc as u64;
         (*frame_ptr).x[1] = loaded.argv_va;
@@ -1112,6 +1224,16 @@ unsafe fn sys_wait(pid_arg: i32, status_ptr: *mut i32) -> i64 {
         Some(crate::process::Pid::new(pid_arg as u16, 1))
     };
 
+    // POSIX.1-2017 wait(2): if the calling process has no existing unwaited-for
+    // child processes, return ECHILD immediately rather than blocking forever.
+    let has_any_children = crate::scheduler::with_scheduler(|scheduler| {
+        let current_pid = scheduler.current_pid();
+        scheduler.has_children(current_pid)
+    });
+    if !has_any_children {
+        return ECHILD;
+    }
+
     loop {
         let result = crate::scheduler::with_scheduler(|scheduler| {
             let current_pid = scheduler.current_pid();
@@ -1120,7 +1242,12 @@ unsafe fn sys_wait(pid_arg: i32, status_ptr: *mut i32) -> i64 {
 
         if let Some((reaped_pid, exit_code)) = result {
             if !status_ptr.is_null() && (status_ptr as u64) < crate::process::USER_ADDR_LIMIT {
-                *status_ptr = exit_code;
+                // POSIX.1-2017 waitpid(2): encode exit status so that the
+                // standard WIFEXITED(status) and WEXITSTATUS(status) macros
+                // work correctly.  Normal termination encodes exit_code in
+                // bits [15:8] with bits [7:0] == 0.
+                // Reference: POSIX.1-2017 §2.13, sys/wait.h macros.
+                *status_ptr = (exit_code & 0xFF) << 8;
             }
             return reaped_pid.index as i64;
         }
@@ -1143,8 +1270,11 @@ unsafe fn sys_pipe(fd_pair_ptr: *mut i32) -> i64 {
     if fd_pair_ptr.is_null() {
         return EINVAL;
     }
-    if fd_pair_ptr as u64 >= crate::process::USER_ADDR_LIMIT {
-        return EINVAL;
+    // Validate that both words of the int[2] are within user address space.
+    // A single bounds check on `fd_pair_ptr` alone is insufficient — a pointer
+    // near USER_ADDR_LIMIT could cause the second write to go out of bounds.
+    if !validate_user_pointer(fd_pair_ptr as u64, 2 * core::mem::size_of::<i32>()) {
+        return EFAULT;
     }
 
     let (read_handle, write_handle) = crate::fs::pipe::pipe_create();
@@ -1217,7 +1347,23 @@ unsafe fn sys_dup2(source_fd: i32, destination_fd: i32) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// sys_mmap — anonymous memory allocation
+// sys_mmap — memory mapping (anonymous and file-backed)
+//
+// ABI: mmap(addr, length, prot, flags, fd, offset)
+//   addr:   hint (ignored; we use a bump pointer).
+//   length: bytes to map (rounded up to a page boundary).
+//   prot:   PROT_READ / PROT_WRITE / PROT_EXEC (stored but not enforced yet).
+//   flags:  MAP_ANONYMOUS, MAP_PRIVATE, MAP_SHARED, MAP_FIXED (MAP_FIXED ignored).
+//   fd:     file descriptor for file-backed mappings; -1 for anonymous.
+//   offset: byte offset into the file (must be page-aligned for file-backed).
+//
+// Supported combinations:
+//   MAP_ANONYMOUS | MAP_PRIVATE  — zero-filled anonymous (demand).
+//   MAP_ANONYMOUS | MAP_SHARED   — anonymous shared (registered in SharedRegionTable).
+//   fd >= 0 | MAP_PRIVATE        — file-backed CoW (demand, reads from inode on fault).
+//   fd >= 0 | MAP_SHARED         — stubbed: treated as MAP_PRIVATE for now (post-v1.0).
+//
+// Reference: POSIX.1-2017 mmap(2).
 // ---------------------------------------------------------------------------
 
 unsafe fn sys_mmap(
@@ -1225,6 +1371,8 @@ unsafe fn sys_mmap(
     length: u64,
     _prot: i32,
     flags: i32,
+    fd: i32,
+    offset: u64,
 ) -> i64 {
     if length == 0 {
         return EINVAL;
@@ -1233,34 +1381,83 @@ unsafe fn sys_mmap(
     let page_size = crate::memory::physical::read_page_size();
     let pages = ((length + page_size - 1) / page_size) as usize;
 
-    // MAP_SHARED | MAP_ANONYMOUS: allocate anonymous pages and register the
-    // region in the SharedRegionTable so fork() maps them directly (not CoW).
-    let is_shared_anonymous =
-        (flags & MAP_SHARED != 0) && (flags & MAP_ANONYMOUS != 0);
+    let is_anonymous = (flags & MAP_ANONYMOUS != 0) || fd < 0;
+    let is_shared_anonymous = (flags & MAP_SHARED != 0) && is_anonymous;
 
-    // The mmap_anonymous_for_current method on Scheduler takes both the
-    // scheduler state and the physical allocator, avoiding the double-borrow
-    // problem of two closures each borrowing a global.
-    let base_va = crate::memory::with_physical_allocator(|phys| {
-        crate::scheduler::with_scheduler(|scheduler| {
-            match scheduler.mmap_anonymous_for_current(pages, page_size, phys) {
-                Some(va) => va as i64,
-                None => ENOMEM,
+    // --- File-backed MAP_PRIVATE ---
+    // Resolve the inode now (outside the scheduler lock) so we can store an
+    // Arc<dyn Inode> in the MmapRegion backing.
+    let file_backing: Option<alloc::sync::Arc<dyn crate::fs::Inode>> = if !is_anonymous {
+        // Validate fd and offset alignment.
+        if offset % page_size != 0 {
+            return EINVAL;
+        }
+        let inode = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process().and_then(|p| {
+                let table = p.file_descriptor_table.lock();
+                table.get(fd as usize).and_then(|desc| {
+                    match desc {
+                        crate::fs::vfs::FileDescriptor::InoFile { inode, .. } => {
+                            Some(alloc::sync::Arc::clone(inode))
+                        }
+                        _ => None,
+                    }
+                })
+            })
+        });
+        match inode {
+            Some(inode) => Some(inode),
+            None => return EBADF,
+        }
+    } else {
+        None
+    };
+
+    // Allocate VA space via bump pointer; all regions are demand-paged.
+    let base_va_opt = crate::scheduler::with_scheduler(|scheduler| {
+        let process = scheduler.current_process_mut()?;
+        if process.mmap_regions.len() >= crate::process::MMAP_MAX_REGIONS {
+            return None;
+        }
+        let base = process.mmap_next_va;
+        let region_length = pages as u64 * page_size;
+        process.mmap_next_va = base + region_length;
+
+        let backing = if let Some(ref inode) = file_backing {
+            crate::process::MmapBacking::File {
+                inode: alloc::sync::Arc::clone(inode),
+                file_offset: offset,
             }
-        })
+        } else {
+            crate::process::MmapBacking::Anonymous
+        };
+
+        process.mmap_regions.push(crate::process::MmapRegion {
+            base,
+            length: region_length,
+            demand: true,
+            backing,
+        });
+
+        Some(base)
     });
 
-    if base_va > 0 && is_shared_anonymous {
+    let base_va = match base_va_opt {
+        Some(va) => va,
+        None => return ENOMEM,
+    };
+
+    if is_shared_anonymous {
         // Register the region so fork() will map it shared rather than CoW.
-        let table = unsafe { &mut *SHARED_REGION_TABLE.0.get() };
-        table.insert(base_va as u64, SharedRegion {
-            phys_base: 0, // physical address tracked by the page table; placeholder
+        let table = &mut *SHARED_REGION_TABLE.0.get();
+        table.insert(base_va, SharedRegion {
+            phys_base: 0, // tracked by page table; placeholder
             page_count: pages,
             reference_count: 1,
         });
     }
 
-    base_va
+    base_va as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,6 +1470,13 @@ unsafe fn sys_munmap(addr: u64, length: u64) -> i64 {
     }
 
     let page_size = crate::memory::physical::read_page_size();
+
+    // POSIX.1-2017 munmap(2): "The addr argument shall be a multiple of the
+    // page size as returned by sysconf(_SC_PAGESIZE)."
+    // Linux returns EINVAL for a non-page-aligned addr.
+    if addr % page_size != 0 {
+        return EINVAL;
+    }
     let pages = ((length + page_size - 1) / page_size) as usize;
 
     crate::memory::with_physical_allocator(|phys| {
@@ -1294,9 +1498,12 @@ unsafe fn sys_fork(frame: *mut ExceptionFrame) -> i64 {
     crate::scheduler::with_scheduler(|scheduler| {
         match scheduler.fork(frame) {
             Ok(child_pid) => child_pid.index as i64,
-            Err(crate::scheduler::ForkError::OutOfPids) => ENOMEM,
+            // POSIX.1-2017 fork(2): EAGAIN if process/resource limit reached,
+            // ENOMEM if insufficient memory.  InternalError is an OOM-class
+            // failure, not a "process not found" situation, so ESRCH is wrong.
+            Err(crate::scheduler::ForkError::OutOfPids) => EAGAIN,
             Err(crate::scheduler::ForkError::OutOfMemory) => ENOMEM,
-            Err(crate::scheduler::ForkError::InternalError) => ESRCH,
+            Err(crate::scheduler::ForkError::InternalError) => ENOMEM,
         }
     })
 }
@@ -1376,6 +1583,16 @@ unsafe fn sys_exec(
     let vfs_inode = crate::fs::vfs_resolve(name, None).ok();
     let ramfs_data = if vfs_inode.is_none() { crate::fs::ramfs_find(name) } else { None };
 
+    // INODE_KERNEL_EXEC_ONLY check: reject userspace exec of kernel-only binaries.
+    //
+    // vfs_mark_kernel_exec_only() is called during boot for /system/bin/bzinit.
+    // Any subsequent userspace exec() of that path returns EPERM.
+    //
+    // Reference: docs/features/Binary Permission Model.md §INODE_KERNEL_EXEC_ONLY.
+    if crate::fs::vfs_is_kernel_exec_only(name) {
+        return EPERM;
+    }
+
     // We need owned data for the VFS path because the inode may be backed by a
     // Vec<u8> whose lifetime is tied to the inode Arc — we copy it to avoid
     // borrowing through the scheduler lock.
@@ -1394,6 +1611,30 @@ unsafe fn sys_exec(
         return ENOENT;
     };
 
+    // Binary Permission Model — tier dispatch at exec time.
+    //
+    // Tier 1: system binary → full trust (wildcard permissions).
+    // Tier 4: no .bazzulto_permissions section → inherit from parent + warn.
+    // Tier 2/3: section present → permissiond handles it (post-v1.0); we do
+    //           not touch the sets and leave them as-is.
+    //
+    // Reference: docs/features/Binary Permission Model.md §Tier Dispatch.
+    let exec_permission_tier_result = {
+        let has_perm_section = crate::permission::elf_has_bazzulto_permissions_section(elf_data);
+        let (parent_perms, parent_actions) = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process()
+                .map(|p| (p.granted_permissions.clone(), p.granted_actions.clone()))
+                .unwrap_or_default()
+        });
+        crate::permission::resolve_exec_permissions(
+            name,
+            has_perm_section,
+            &parent_perms,
+            &parent_actions,
+            name,
+        )
+    };
+
     // Parse argv (cap at 64 entries to bound stack usage).
     let mut argv_slices: [&[u8]; 64] = [&[]; 64];
     let argv_count = parse_flat_strings(argv_ptr, argv_len, &mut argv_slices);
@@ -1410,6 +1651,15 @@ unsafe fn sys_exec(
 
     let loaded = match loaded {
         Ok(image) => image,
+        Err(crate::loader::LoaderError::NotAnElf)
+        | Err(crate::loader::LoaderError::UnsupportedFormat)
+        | Err(crate::loader::LoaderError::NotExecutable)
+        | Err(crate::loader::LoaderError::UnalignedSegment)
+        | Err(crate::loader::LoaderError::Truncated) => {
+            // POSIX.1-2017 exec(2) §ERRORS: ENOEXEC if the file has the
+            // appropriate access permission but an unrecognised format.
+            return ENOEXEC;
+        }
         Err(_) => return ENOMEM,
     };
     // Box the page table outside with_physical_allocator to avoid re-entrant
@@ -1424,15 +1674,18 @@ unsafe fn sys_exec(
     });
     if let Some(arc) = fd_table_arc {
         let mut guard = arc.lock();
-        let cloexec_mask = guard.cloexec_mask;
-        let mut mask = cloexec_mask;
-        while mask != 0 {
-            let bit_index = mask.trailing_zeros() as usize;
-            guard.close(bit_index);
-            mask &= mask - 1;
+        // Iterate all 16 words of the cloexec bitmask and close every marked fd.
+        for word_index in 0..16usize {
+            let mut word = guard.cloexec_mask[word_index];
+            while word != 0 {
+                let bit_pos = word.trailing_zeros() as usize;
+                let fd_number = word_index * 64 + bit_pos;
+                guard.close(fd_number);
+                word &= word - 1;
+            }
         }
-        guard.cloexec_mask = 0;
-        guard.nonblock_mask = 0;
+        guard.cloexec_mask = [0u64; 16];
+        guard.nonblock_mask = [0u64; 16];
     }
 
     crate::scheduler::with_scheduler(|scheduler| {
@@ -1442,11 +1695,33 @@ unsafe fn sys_exec(
             process.page_table = Some(loaded_page_table);
             process.mmap_next_va = crate::process::MMAP_USER_BASE;
             process.mmap_regions.clear();
+            // Register the demand-paged stack region for the new image.
+            process.mmap_regions.push(crate::process::MmapRegion {
+                base:   loaded.stack_demand_base,
+                length: loaded.stack_demand_top - loaded.stack_demand_base,
+                demand: true,
+                backing: crate::process::MmapBacking::Anonymous,
+            });
+
+            // Apply Binary Permission Model tier result.
+            // Tier 1/4: replace both sets.
+            // Tier 2/3 (None): leave sets untouched — permissiond will set them.
+            if let Some((new_perms, new_actions)) = exec_permission_tier_result.clone() {
+                process.granted_permissions = new_perms;
+                process.granted_actions = new_actions;
+            }
 
             // Patch the exception frame in-place to redirect to the new entry.
             (*frame).elr = loaded.entry_point;
             (*frame).spsr = 0; // EL0 state
             (*frame).sp = loaded.initial_stack_pointer;
+            crate::uart::puts("[exec] sp=");
+            crate::uart::put_hex(loaded.initial_stack_pointer);
+            crate::uart::puts(" demand=[");
+            crate::uart::put_hex(loaded.stack_demand_base);
+            crate::uart::puts(", ");
+            crate::uart::put_hex(loaded.stack_demand_top);
+            crate::uart::puts(")\r\n");
             // Clear GP registers x0–x30, then set AArch64 SysV ABI entry args:
             //   x0 = argc, x1 = argv VA, x2 = envp VA.
             // x0 is written by dispatch() using this function's return value.
@@ -1545,7 +1820,13 @@ unsafe fn sys_clock_gettime(clock_id: i32, timespec_ptr: *mut u64) -> i64 {
 // sys_nanosleep — put the calling process to sleep for the requested duration
 // ---------------------------------------------------------------------------
 
-unsafe fn sys_nanosleep(timespec_ptr: *const u64) -> i64 {
+/// `sys_nanosleep(req, rem)` — sleep for the duration specified by `*req`.
+///
+/// If a signal interrupts the sleep, writes the remaining time into `*rem`
+/// (if `rem` is a valid user pointer) and returns `EINTR`.
+///
+/// Reference: POSIX.1-2017 nanosleep(2).
+unsafe fn sys_nanosleep(timespec_ptr: *const u64, rmtp: *mut u64) -> i64 {
     if timespec_ptr.is_null() || (timespec_ptr as u64) >= crate::process::USER_ADDR_LIMIT {
         return EINVAL;
     }
@@ -1586,6 +1867,33 @@ unsafe fn sys_nanosleep(timespec_ptr: *const u64) -> i64 {
         scheduler.schedule();
     });
 
+    // After waking, check whether a signal caused the early wake-up.
+    // `pending_signals != 0` means at least one signal is queued; deliver_pending_signals
+    // (called by dispatch() after this function returns) will handle it.
+    // POSIX.1-2017 nanosleep(2): if interrupted by a signal, write remaining
+    // time to *rmtp and return EINTR.
+    let has_pending_signal = crate::scheduler::with_scheduler(|scheduler| {
+        scheduler.current_process()
+            .map(|p| p.pending_signals.load(core::sync::atomic::Ordering::Acquire) != 0)
+            .unwrap_or(false)
+    });
+
+    if has_pending_signal {
+        let woke_at = crate::platform::qemu_virt::timer::current_tick();
+        // Write remaining time into *rmtp if the pointer is valid.
+        if !rmtp.is_null() && (rmtp as u64) < crate::process::USER_ADDR_LIMIT
+            && (rmtp as u64).saturating_add(16) <= crate::process::USER_ADDR_LIMIT
+        {
+            let remaining_ticks = wake_at_tick.saturating_sub(woke_at);
+            let remaining_ns = remaining_ticks.saturating_mul(tick_interval_ns);
+            let remaining_secs = remaining_ns / 1_000_000_000;
+            let remaining_nsec = remaining_ns % 1_000_000_000;
+            *rmtp = remaining_secs;
+            *rmtp.add(1) = remaining_nsec;
+        }
+        return EINTR;
+    }
+
     0
 }
 
@@ -1595,7 +1903,12 @@ unsafe fn sys_nanosleep(timespec_ptr: *const u64) -> i64 {
 
 unsafe fn sys_kill(target_pid: i32, signal_number: i32) -> i64 {
     if target_pid <= 0 {
-        return ESRCH; // We do not support process groups yet.
+        // POSIX.1-2017 kill(2): pid == 0 sends to the process group (not
+        // supported yet); pid < 0 sends to a group (not supported yet).
+        // ESRCH would mean "process not found" — incorrect here.
+        // EPERM is the closest appropriate error for "not permitted / not
+        // implemented" at this scope level.
+        return EPERM;
     }
     if signal_number < 0 || signal_number as usize >= crate::process::SIGNAL_COUNT {
         return EINVAL;
@@ -2449,22 +2762,28 @@ unsafe fn sys_getrusage(who: i32, usage_ptr: *mut u64) -> i64 {
         return EINVAL;
     }
 
-    let user_ticks = crate::scheduler::with_scheduler(|scheduler| {
+    let (user_ticks, sys_ticks) = crate::scheduler::with_scheduler(|scheduler| {
         scheduler.current_process()
-            .map(|p| p.user_ticks)
-            .unwrap_or(0)
+            .map(|p| (p.user_ticks, p.sys_time_ticks))
+            .unwrap_or((0, 0))
     });
 
     // Convert ticks to (seconds, microseconds).
+    // TICK_INTERVAL_MS is the timer period in ms; ticks_per_second = 1000 / interval.
     let ticks_per_second = 1000 / crate::platform::qemu_virt::timer::TICK_INTERVAL_MS;
-    let user_seconds = user_ticks / ticks_per_second;
+    let user_seconds  = user_ticks / ticks_per_second;
     let user_useconds = (user_ticks % ticks_per_second)
+        * (1_000_000 / ticks_per_second);
+    // sys_time_ticks counts one tick per syscall entry.  Reuse the same
+    // ticks_per_second denominator so both times are on the same scale.
+    let sys_seconds   = sys_ticks / ticks_per_second;
+    let sys_useconds  = (sys_ticks % ticks_per_second)
         * (1_000_000 / ticks_per_second);
 
     *usage_ptr          = user_seconds;  // ru_utime.tv_sec
     *usage_ptr.add(1)   = user_useconds; // ru_utime.tv_usec
-    *usage_ptr.add(2)   = 0;             // ru_stime.tv_sec  (stub)
-    *usage_ptr.add(3)   = 0;             // ru_stime.tv_usec (stub)
+    *usage_ptr.add(2)   = sys_seconds;   // ru_stime.tv_sec
+    *usage_ptr.add(3)   = sys_useconds;  // ru_stime.tv_usec
 
     0
 }
@@ -2965,6 +3284,41 @@ unsafe fn sys_truncate_fd(fd: i32, new_size: u64) -> i64 {
 
     match inode {
         Some(inode) => match inode.truncate(new_size) {
+            Ok(()) => 0,
+            Err(err) => err.to_errno(),
+        },
+        None => EBADF,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sys_fsync — flush file data to storage
+// ---------------------------------------------------------------------------
+
+unsafe fn sys_fsync(fd: i32) -> i64 {
+    if fd < 0 {
+        return EBADF;
+    }
+
+    let inode = {
+        let fd_table_arc = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process()
+                .map(|p| alloc::sync::Arc::clone(&p.file_descriptor_table))
+        });
+        fd_table_arc.and_then(|arc| {
+            let guard = arc.lock();
+            if let Some(crate::fs::vfs::FileDescriptor::InoFile { inode, .. }) =
+                guard.get(fd as usize)
+            {
+                Some(inode.clone())
+            } else {
+                None
+            }
+        })
+    };
+
+    match inode {
+        Some(inode) => match inode.fsync() {
             Ok(()) => 0,
             Err(err) => err.to_errno(),
         },
@@ -3836,7 +4190,9 @@ struct TimeVal {
 /// Checks up to `nfds` file descriptors for readiness.
 ///   readfds:    fds to check for EPOLLIN  (data available to read).
 ///   writefds:   fds to check for EPOLLOUT (space available to write).
-///   exceptfds:  fds to check for exceptional condition (always treated as empty).
+///   exceptfds:  fds to check for exceptional conditions (out-of-band data).
+///               AF_UNIX sockets never carry OOB data, so this set is always
+///               empty on return.  The pointer is validated if non-NULL.
 ///   timeout_ptr: *const TimeVal — NULL means block indefinitely; {0,0} means
 ///                poll once without blocking.
 ///
@@ -3881,7 +4237,9 @@ unsafe fn sys_select(
         );
     }
 
-    // exceptfds: we accept a valid pointer but treat the set as always empty.
+    // exceptfds: validate pointer.  No fd type supported by this kernel generates
+    // OOB/exceptional data (AF_UNIX has no OOB), so the returned set will always
+    // be empty.  We still validate the pointer to comply with POSIX error semantics.
     if exceptfds_ptr != 0 {
         if !validate_user_pointer(exceptfds_ptr, core::mem::size_of::<FdSet>()) {
             return EINVAL;
@@ -4079,4 +4437,420 @@ unsafe fn sys_machine_poweroff() -> i64 {
         "hvc #0",
         options(nostack, noreturn)
     );
+}
+
+// ---------------------------------------------------------------------------
+// sys_getuid / sys_getgid / sys_geteuid / sys_getegid — POSIX UID/GID queries
+//
+// UIDs and GIDs are a POSIX compatibility shim.  The actual security mechanism
+// in Bazzulto is the Binary Permission Model (see docs/features/Binary Permission Model.md).
+// UIDs are needed so that standard tools (bash, coreutils, etc.) do not break.
+//
+// Default for user processes: uid=gid=euid=egid=1000.
+// bzinit and kernel tasks run with uid=0.
+//
+// Reference: POSIX.1-2017 getuid(2), getgid(2), geteuid(2), getegid(2).
+// ---------------------------------------------------------------------------
+
+unsafe fn sys_getuid() -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        scheduler.current_process()
+            .map(|p| p.uid as i64)
+            .unwrap_or(0)
+    })
+}
+
+unsafe fn sys_getgid() -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        scheduler.current_process()
+            .map(|p| p.gid as i64)
+            .unwrap_or(0)
+    })
+}
+
+unsafe fn sys_geteuid() -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        scheduler.current_process()
+            .map(|p| p.euid as i64)
+            .unwrap_or(0)
+    })
+}
+
+unsafe fn sys_getegid() -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        scheduler.current_process()
+            .map(|p| p.egid as i64)
+            .unwrap_or(0)
+    })
+}
+
+/// POSIX setuid(2): set real and effective UID.
+///
+/// If euid == 0: may set uid/euid to any value.
+/// Otherwise: may only set euid to uid (drop privileges).
+///
+/// Reference: POSIX.1-2017 setuid(2).
+unsafe fn sys_setuid(new_uid: u32) -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        if let Some(process) = scheduler.current_process_mut() {
+            if process.euid == 0 {
+                // Root: set both real and effective UID.
+                process.uid  = new_uid;
+                process.euid = new_uid;
+                0
+            } else if new_uid == process.uid {
+                // Non-root: can set euid to real uid (no-op / drop saved set-uid).
+                process.euid = new_uid;
+                0
+            } else {
+                EPERM
+            }
+        } else {
+            EPERM
+        }
+    })
+}
+
+/// POSIX setgid(2): set real and effective GID.
+unsafe fn sys_setgid(new_gid: u32) -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        if let Some(process) = scheduler.current_process_mut() {
+            if process.euid == 0 {
+                process.gid  = new_gid;
+                process.egid = new_gid;
+                0
+            } else if new_gid == process.gid {
+                process.egid = new_gid;
+                0
+            } else {
+                EPERM
+            }
+        } else {
+            EPERM
+        }
+    })
+}
+
+/// POSIX seteuid(2): set effective UID only.
+unsafe fn sys_seteuid(new_euid: u32) -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        if let Some(process) = scheduler.current_process_mut() {
+            if process.euid == 0 || new_euid == process.uid {
+                process.euid = new_euid;
+                0
+            } else {
+                EPERM
+            }
+        } else {
+            EPERM
+        }
+    })
+}
+
+/// POSIX setegid(2): set effective GID only.
+unsafe fn sys_setegid(new_egid: u32) -> i64 {
+    crate::scheduler::with_scheduler(|scheduler| {
+        if let Some(process) = scheduler.current_process_mut() {
+            if process.euid == 0 || new_egid == process.gid {
+                process.egid = new_egid;
+                0
+            } else {
+                EPERM
+            }
+        } else {
+            EPERM
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// sys_chmod / sys_fchmod / sys_chown / sys_fchown — POSIX file permission stubs
+//
+// Full permission enforcement requires the VFS inode to carry owner_uid/gid
+// and mode bits (planned for a later pass).  For v1.0 these syscalls succeed
+// silently so that coreutils and other tools do not error out.
+// ---------------------------------------------------------------------------
+
+unsafe fn sys_chmod(_path_ptr: u64, _path_len: usize, _mode: u32) -> i64 {
+    // TODO: update inode mode bits when InodeStat carries owner info.
+    0
+}
+
+unsafe fn sys_fchmod(_fd: i32, _mode: u32) -> i64 {
+    // TODO: update inode mode bits.
+    0
+}
+
+unsafe fn sys_chown(_path_ptr: u64, _path_len: usize, _new_uid: u32, _new_gid: u32) -> i64 {
+    // TODO: update inode owner when InodeStat carries owner info.
+    0
+}
+
+unsafe fn sys_fchown(_fd: i32, _new_uid: u32, _new_gid: u32) -> i64 {
+    // TODO: update inode owner.
+    0
+}
+
+// ---------------------------------------------------------------------------
+// sys_mount — mount a filesystem at a VFS path
+//
+// Syscall number: 113.
+//
+// Arguments (x0–x5):
+//   x0: source_ptr  — pointer to source path string (Bazzulto Path Model)
+//   x1: source_len  — byte length of source path
+//   x2: target_ptr  — pointer to target mountpoint path string
+//   x3: target_len  — byte length of target path
+//   x4: fstype_ptr  — pointer to filesystem type string ("fat32", "bafs", "tmpfs")
+//   x5: fstype_len  — byte length of fstype
+//
+// Source path format (Bazzulto Path Model):
+//   "//dev:diska:1/"  → disk index 0 (letter a=0), partition 1 (1-based → part_index 0)
+//   "//dev:diskb:2/"  → disk index 1, partition 2 (part_index 1)
+//   "//dev:diska/"    → disk index 0, bare disk (no partition table; part_index 0)
+//
+// Target path: native Bazzulto path ("//home:user/" or POSIX "/home/user").
+// The target directory is created if it does not exist.
+//
+// Returns 0 on success, negative errno on failure.
+//
+// Required permission: ActionPermission::MountFilesystem.
+// ---------------------------------------------------------------------------
+
+unsafe fn sys_mount(
+    source_ptr: u64,
+    source_len: usize,
+    target_ptr: u64,
+    target_len: usize,
+    fstype_ptr: u64,
+    fstype_len: usize,
+) -> i64 {
+    const EPERM:   i64 = -1;
+    const ENODEV:  i64 = -19;
+    const EINVAL:  i64 = -22;
+    const ENOENT:  i64 = -2;
+    const ENOMEM:  i64 = -12;
+
+    // --- Permission check ---------------------------------------------------
+    let has_permission = crate::scheduler::with_scheduler(|s| {
+        s.current_process().map(|p| {
+            crate::permission::check_action_permission(
+                &p.granted_actions,
+                crate::permission::ActionPermission::MountFilesystem,
+            ).is_ok()
+        }).unwrap_or(false)
+    });
+    if !has_permission {
+        return EPERM;
+    }
+
+    // --- Read user strings --------------------------------------------------
+    if source_len == 0 || source_len > 256 { return EINVAL; }
+    if target_len == 0 || target_len > 256 { return EINVAL; }
+    if fstype_len == 0 || fstype_len > 16  { return EINVAL; }
+
+    let source_bytes = core::slice::from_raw_parts(source_ptr as *const u8, source_len);
+    let target_bytes = core::slice::from_raw_parts(target_ptr as *const u8, target_len);
+    let fstype_bytes = core::slice::from_raw_parts(fstype_ptr as *const u8, fstype_len);
+
+    let source = match core::str::from_utf8(source_bytes) { Ok(s) => s, Err(_) => return EINVAL };
+    let target = match core::str::from_utf8(target_bytes) { Ok(s) => s, Err(_) => return EINVAL };
+    let fstype = match core::str::from_utf8(fstype_bytes) { Ok(s) => s, Err(_) => return EINVAL };
+
+    // --- Parse source: "//dev:disk{x}:{y}/" --------------------------------
+    // Strip "//dev:disk" prefix.
+    let rest = match source.strip_prefix("//dev:disk") {
+        Some(r) => r,
+        None    => return EINVAL,
+    };
+    // First character is the disk letter ('a'=0, 'b'=1, ...).
+    let letter = match rest.as_bytes().first().copied() {
+        Some(ch) if ch.is_ascii_lowercase() => ch,
+        _ => return EINVAL,
+    };
+    let disk_index = (letter - b'a') as usize;
+    let after_letter = &rest[1..]; // ":1/" or "/"
+
+    // Partition number: optional ":{N}" suffix.  Absent means bare disk (part 1).
+    let part_number_1based: usize = if let Some(colon_rest) = after_letter.strip_prefix(':') {
+        // Parse the digits before the trailing '/'.
+        let digits = colon_rest.trim_end_matches('/');
+        match digits.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => return EINVAL,
+        }
+    } else {
+        1 // bare disk shorthand → partition 1
+    };
+    let target_part_index = part_number_1based - 1; // convert to 0-based
+
+    // --- Find and mount the partition ---------------------------------------
+    let disk = match crate::hal::disk::get_disk(disk_index) {
+        Some(d) => d,
+        None    => return ENODEV,
+    };
+
+    let partitions = crate::fs::partition::enumerate_partitions(disk, disk_index);
+    let partition = match partitions.into_iter().find(|p| p.part_index == target_part_index) {
+        Some(p) => p,
+        None    => return ENODEV,
+    };
+
+    // Normalize the target path for the VFS mount table.
+    // "//home:user/" → "/home/user" (simple prefix strip + colon → slash replacement).
+    // If already a POSIX path ("/home/user"), use as-is.
+    let mut posix_target_buf = [0u8; 256];
+    let posix_target: &str = if target.starts_with("//") {
+        // Bazzulto path model: strip leading '/' → "/home:user/" → replace ':' with '/'
+        // then strip trailing '/'.
+        let inner = &target[1..]; // "/home:user/"
+        let mut out_len = 0usize;
+        for b in inner.as_bytes() {
+            let ch = if *b == b':' { b'/' } else { *b };
+            if out_len >= posix_target_buf.len() { return EINVAL; }
+            posix_target_buf[out_len] = ch;
+            out_len += 1;
+        }
+        // Strip trailing slash unless it's just "/".
+        while out_len > 1 && posix_target_buf[out_len - 1] == b'/' {
+            out_len -= 1;
+        }
+        match core::str::from_utf8(&posix_target_buf[..out_len]) {
+            Ok(s) => s,
+            Err(_) => return EINVAL,
+        }
+    } else {
+        target
+    };
+
+    // Ensure the mountpoint directory exists (create if needed).
+    if let Ok((parent, name)) = crate::fs::vfs_resolve_parent(posix_target) {
+        let _ = parent.mkdir(&name);
+    }
+
+    // Probe and mount according to the requested filesystem type.
+    if fstype.eq_ignore_ascii_case("fat32") {
+        if !partition.is_fat32_candidate() {
+            return EINVAL;
+        }
+        let volume = match crate::fs::fat32::fat32_init_partition(partition.disk, partition.start_lba) {
+            Some(v) => v,
+            None    => return ENODEV,
+        };
+        let root_inode = match crate::fs::fat32::fat32_root_inode(volume) {
+            Some(i) => i,
+            None    => return ENOMEM,
+        };
+        crate::fs::vfs_mount(posix_target, root_inode, source, "fat32");
+        0
+    } else if fstype.eq_ignore_ascii_case("bafs") {
+        if !crate::fs::bafs_driver::bafs_probe(&partition.disk, partition.start_lba) {
+            return ENODEV;
+        }
+        let root_inode = match crate::fs::bafs_driver::bafs_mount_partition(partition.disk, partition.start_lba) {
+            Some(i) => i,
+            None    => return ENODEV,
+        };
+        crate::fs::vfs_mount(posix_target, root_inode, source, "bafs");
+        0
+    } else {
+        EINVAL
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sys_getmounts — enumerate mounted filesystems
+// ---------------------------------------------------------------------------
+//
+// Syscall number: 114.
+//
+// Serialises all VFS mount entries into a flat byte buffer for userspace.
+//
+// Buffer format (packed, variable length):
+//   For each mount entry:
+//     [0]     u8  — mountpoint length  (bytes)
+//     [1..n]  u8* — mountpoint path    (not NUL-terminated)
+//     [n]     u8  — source length      (bytes, 0 for virtual filesystems)
+//     [n+1..] u8* — source path        (not NUL-terminated)
+//     [...]   u8  — fstype length      (bytes)
+//     [...]   u8* — fstype string      (not NUL-terminated)
+//     [...]   u64 — total 512-blocks   (little-endian)
+//     [...]   u64 — free 512-blocks    (little-endian)
+//
+// Returns the total number of bytes written on success, or -EINVAL / -ENOMEM.
+// Pass buf_ptr=0 and buf_len=0 to query the required buffer size.
+//
+// The caller should allocate a buffer of the returned size and call again.
+//
+// Reference: Linux /proc/mounts format; POSIX statvfs(3).
+unsafe fn sys_getmounts(buf_ptr: *mut u8, buf_len: usize) -> i64 {
+    use alloc::vec::Vec;
+
+    // Accumulate serialised entries into a heap buffer, then copy to user.
+    let mut serialised: Vec<u8> = Vec::new();
+
+    crate::fs::vfs_for_each_mount(|mountpoint, source, fstype, root_inode| {
+        // Compute 512-block statistics.
+        // For FAT32 we can obtain real stats via the fat32_volume_stats helper.
+        // For other filesystem types report 0 (unknown) — userspace shows "-".
+        let (total_blocks, free_blocks): (u64, u64) =
+            if fstype == "fat32" {
+                // Downcast root_inode to Fat32DirInode to reach the volume Arc.
+                // We expose a helper on the inode trait for this purpose.
+                if let Some(stats) = root_inode.fs_stats() {
+                    stats
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
+
+        // Serialise the entry.
+        let mp_bytes = mountpoint.as_bytes();
+        let src_bytes = source.as_bytes();
+        let fs_bytes  = fstype.as_bytes();
+
+        // Lengths are capped at 255 bytes (single u8 field).
+        let mp_len  = mp_bytes.len().min(255) as u8;
+        let src_len = src_bytes.len().min(255) as u8;
+        let fs_len  = fs_bytes.len().min(255)  as u8;
+
+        serialised.push(mp_len);
+        serialised.extend_from_slice(&mp_bytes[..mp_len as usize]);
+        serialised.push(src_len);
+        serialised.extend_from_slice(&src_bytes[..src_len as usize]);
+        serialised.push(fs_len);
+        serialised.extend_from_slice(&fs_bytes[..fs_len as usize]);
+        serialised.extend_from_slice(&total_blocks.to_le_bytes());
+        serialised.extend_from_slice(&free_blocks.to_le_bytes());
+    });
+
+    let total_len = serialised.len();
+
+    // Query mode: return required size without writing.
+    if buf_ptr.is_null() || buf_len == 0 {
+        return total_len as i64;
+    }
+
+    if !validate_user_pointer(buf_ptr as u64, buf_len) {
+        return EINVAL;
+    }
+
+    if buf_len < total_len {
+        // Buffer too small — return required size as positive so caller can retry.
+        return total_len as i64;
+    }
+
+    // Pre-fault all demand pages in the user buffer before writing from EL1.
+    // EL1 data aborts do not go through the demand-paging handler; writing to
+    // an unmapped demand page from kernel context would halt the kernel.
+    if !crate::memory::fault_in_user_write_pages(buf_ptr as u64, total_len) {
+        return EINVAL;
+    }
+
+    // Copy serialised data to userspace buffer.
+    core::ptr::copy_nonoverlapping(serialised.as_ptr(), buf_ptr, total_len);
+
+    total_len as i64
 }

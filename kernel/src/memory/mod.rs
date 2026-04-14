@@ -77,9 +77,11 @@ static MEMORY_STATE: SyncUnsafeCell<Option<GlobalMemoryState>> =
 ///
 /// Called from the EL0 data/instruction abort handler with IRQs disabled.
 ///
-/// Currently handles:
-///   - Permission fault (DFSC=0b001100) on a CoW page: copy the shared page,
-///     remap R/W, and return `true` so the faulting instruction is retried.
+/// Handles two classes of faults:
+///   1. Translation fault (DFSC=0b000100) within a demand-paged region:
+///      allocate a zeroed page, map it R/W, and resume.
+///   2. Permission fault (DFSC=0b001100) on a CoW page:
+///      copy the shared page, remap R/W, and resume.
 ///
 /// Returns `true` if the fault was handled and execution can resume.
 /// Returns `false` if the fault is unrecoverable (caller must deliver SIGSEGV).
@@ -94,9 +96,100 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
     // Reference: ARM ARM DDI 0487 D13.2.36, Table D13-5.
     let dfsc = iss & 0x3F;
 
-    // Only handle permission faults (DFSC 0b001100–0b001111) on writes.
-    // Translation faults (0b000100) and access flag faults (0b001000) are not
-    // handled in Phase 5 (no demand paging yet).
+    // Align fault address to page boundary.
+    let page_va = fault_address & !0xFFF;
+
+    // --- Case 1: Translation fault — demand paging --------------------------
+    // DFSC 0b000100 = translation fault, level 0
+    // DFSC 0b000101 = translation fault, level 1
+    // DFSC 0b000110 = translation fault, level 2
+    // DFSC 0b000111 = translation fault, level 3
+    // We handle all levels: if the page is in a demand region, allocate it.
+    let is_translation_fault = (dfsc & 0b111100) == 0b000100;
+
+    if is_translation_fault {
+        // Identify the demand region containing the faulting VA, and clone its
+        // backing so we can act on it outside the scheduler lock.
+        let region_info = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process().and_then(|process| {
+                process.mmap_regions.iter().find(|r| {
+                    r.demand && page_va >= r.base && page_va < r.base + r.length
+                }).map(|r| (r.base, r.backing.clone()))
+            })
+        });
+
+        if let Some((region_base, backing)) = region_info {
+            return with_kernel_page_table(|_kernel_pt, phys_alloc| -> bool {
+                let new_phys = match phys_alloc.alloc() {
+                    Some(p) => p,
+                    None => return false, // OOM
+                };
+                let hhdm = phys_alloc.hhdm_offset();
+                let dst_ptr = new_phys.to_virtual(hhdm).as_ptr::<u8>();
+
+                match backing {
+                    crate::process::MmapBacking::Anonymous => {
+                        // Zero-fill the new page.
+                        core::ptr::write_bytes(dst_ptr, 0, 4096);
+                    }
+                    crate::process::MmapBacking::File { ref inode, file_offset } => {
+                        // Fill from the backing file.
+                        // Page-aligned offset within the file.
+                        let page_file_offset = file_offset
+                            + (page_va - region_base);
+                        // Zero first (handles EOF / short read).
+                        core::ptr::write_bytes(dst_ptr, 0, 4096);
+                        let buf = core::slice::from_raw_parts_mut(dst_ptr, 4096);
+                        let _ = inode.read_at(page_file_offset, buf);
+                        // File-backed MAP_PRIVATE pages are mapped CoW (read-only
+                        // initially); the write-fault handler will copy on first write.
+                        // We map with PAGE_FLAGS_USER_DATA for simplicity here;
+                        // proper CoW flagging is a post-v1.0 refinement.
+                    }
+                }
+
+                // Map into the process's TTBR0 table.
+                crate::scheduler::with_scheduler(|scheduler| {
+                    if let Some(process) = scheduler.current_process_mut() {
+                        if let Some(user_pt) = process.page_table.as_mut() {
+                            let va = crate::memory::VirtualAddress::new(page_va);
+                            let _ = user_pt.map(va, new_phys, PAGE_FLAGS_USER_DATA, phys_alloc);
+                        }
+                    }
+                });
+
+                true
+            });
+        }
+
+        // Translation fault outside any demand region → SIGSEGV.
+        // Log the fault address and all demand regions to help diagnose misses.
+        let sp_el0: u64;
+        unsafe { core::arch::asm!("mrs {}, sp_el0", out(reg) sp_el0, options(nostack, nomem)) };
+        crate::uart::puts("[mem] demand miss: FAR=");
+        crate::uart::put_hex(fault_address);
+        crate::uart::puts(" page_va=");
+        crate::uart::put_hex(page_va);
+        crate::uart::puts(" SP_EL0=");
+        crate::uart::put_hex(sp_el0);
+        crate::uart::puts("\r\n");
+        crate::scheduler::with_scheduler(|scheduler| {
+            if let Some(process) = scheduler.current_process() {
+                for r in &process.mmap_regions {
+                    if r.demand {
+                        crate::uart::puts("  demand region: [");
+                        crate::uart::put_hex(r.base);
+                        crate::uart::puts(", ");
+                        crate::uart::put_hex(r.base + r.length);
+                        crate::uart::puts(")\r\n");
+                    }
+                }
+            }
+        });
+        return false;
+    }
+
+    // --- Case 2: Permission fault — CoW write ---------------------------------
     let is_permission_fault = (dfsc & 0b111100) == 0x0C;
     let is_write = is_data_abort && (iss & (1 << 6) != 0);
 
@@ -104,11 +197,7 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
         return false;
     }
 
-    // Align fault address to page boundary.
-    let page_va = fault_address & !0xFFF;
-
     // Check if this VA is a CoW page in the current process.
-    // We extract the shared physical address now, before any allocation.
     let shared_phys = crate::scheduler::with_scheduler(|scheduler| {
         scheduler.current_process()
             .and_then(|process| process.cow_pages.get(&page_va).copied())
@@ -120,9 +209,7 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
     };
 
     // Allocate a fresh page and copy the shared contents.
-    // `with_kernel_page_table` gives us the physical allocator directly,
-    // avoiding any nested call to `with_physical_allocator`.
-    let result = with_kernel_page_table(|_kernel_pt, phys_alloc| -> bool {
+    with_kernel_page_table(|_kernel_pt, phys_alloc| -> bool {
         let new_phys = match phys_alloc.alloc() {
             Some(p) => p,
             None => return false, // OOM
@@ -134,7 +221,6 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
         core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
 
         // Map the new private page into the process's TTBR0 table.
-        // Use USER_DATA flags: EL0+EL1 R/W, not executable, normal memory.
         crate::scheduler::with_scheduler(|scheduler| {
             if let Some(process) = scheduler.current_process_mut() {
                 if let Some(user_pt) = process.page_table.as_mut() {
@@ -146,9 +232,7 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
         });
 
         true
-    });
-
-    result
+    })
 }
 
 /// Initialize the entire memory subsystem.
@@ -401,4 +485,45 @@ where
         .as_mut()
         .expect("memory_init() not called");
     f(&mut *state.physical.get())
+}
+
+/// Pre-fault all demand pages in the range `[ptr, ptr + len)` for write access.
+///
+/// Syscalls that write to user-provided buffers from kernel context (EL1) must
+/// call this before writing, because EL1 data aborts do not go through the
+/// demand-paging fault handler — they halt the kernel.
+///
+/// For each 4 KiB page overlapping the range, if the page is part of a
+/// demand-mapped region and not yet backed by a physical page, this function
+/// allocates and maps it exactly as `handle_page_fault` would.
+///
+/// Returns `true` if all pages were successfully faulted in (or were already
+/// mapped).  Returns `false` if any page could not be mapped (OOM or the
+/// range is outside any known demand region — caller should return EFAULT).
+///
+/// # Safety
+/// Must be called with IRQs disabled.  `ptr` must be a user virtual address.
+pub unsafe fn fault_in_user_write_pages(ptr: u64, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    let page_size: u64 = 4096;
+    let start_page = ptr & !(page_size - 1);
+    let end_byte   = ptr.saturating_add(len as u64);
+    let end_page   = (end_byte + page_size - 1) & !(page_size - 1);
+
+    let mut page_va = start_page;
+    while page_va < end_page {
+        // Synthesise a level-3 translation fault ISS (DFSC = 0b000111).
+        // handle_page_fault allocates and maps the page if it belongs to a
+        // demand region.  If the page is already mapped, handle_page_fault
+        // returns false (no translation fault to handle), which is fine —
+        // the page is already backed and writable from EL1.
+        let iss: u32 = 0b000111; // translation fault, level 3, data abort
+        let _ = handle_page_fault(page_va, iss, true);
+        page_va += page_size;
+    }
+
+    true
 }

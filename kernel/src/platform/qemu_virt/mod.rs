@@ -218,11 +218,19 @@ pub fn irq_dispatch() {
         }
         other => {
             // Check if this is a virtio-blk or virtio-keyboard IRQ.
-            let disk_irq = crate::platform::qemu_virt::virtio_blk::disk_get_irq_id();
+            // Up to MAX_BLKS=4 disk instances may be registered; check each one.
             let keyboard_irq = crate::platform::qemu_virt::keyboard_virtio::keyboard_get_irq_id();
-
-            if other == disk_irq && disk_irq != 0 {
-                unsafe { crate::platform::qemu_virt::virtio_blk::disk_irq_handler() };
+            let mut handled_as_disk = false;
+            for disk_index in 0..4usize {
+                let disk_irq = crate::platform::qemu_virt::virtio_blk::disk_get_irq_id(disk_index);
+                if disk_irq != 0 && other == disk_irq {
+                    unsafe { crate::platform::qemu_virt::virtio_blk::disk_irq_handler(disk_index) };
+                    handled_as_disk = true;
+                    break;
+                }
+            }
+            if handled_as_disk {
+                // already handled
             } else if other == keyboard_irq && keyboard_irq != 0 {
                 unsafe { crate::platform::qemu_virt::keyboard_virtio::keyboard_irq_handler() };
             } else {

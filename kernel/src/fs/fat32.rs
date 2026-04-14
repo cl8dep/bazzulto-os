@@ -10,6 +10,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use alloc::vec;
 use alloc::sync::Arc;
+use crate::sync::SpinLock;
+use crate::hal::disk::BlockDevice;
 
 // ---------------------------------------------------------------------------
 // FAT32 on-disk structures (little-endian, packed)
@@ -128,38 +130,52 @@ fn is_lfn(entry: &Fat32DirEntry) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Global filesystem state
+// Per-volume filesystem state
 // ---------------------------------------------------------------------------
 
-struct Fat32State {
+/// All mutable state for a single FAT32 volume.
+///
+/// Multiple volumes can exist simultaneously — one per partition.
+/// Each `Fat32DirInode` and `Fat32FileInode` holds an `Arc<SpinLock<Fat32Volume>>`
+/// so operations on one volume never touch another.
+pub struct Fat32Volume {
+    /// Block device backing this volume (used for all sector I/O).
+    disk: Arc<dyn BlockDevice>,
     /// LBA offset of the partition start on the physical disk.
     ///
     /// All FAT32 LBA values stored in BPB fields are relative to the partition
-    /// start.  Every `read_sectors_into` / `write_sectors_from` call adds this
-    /// offset before issuing the I/O request to the block device.
+    /// start.  Every sector read/write adds this offset before calling into
+    /// the block device.
     partition_start_lba: u64,
-    bytes_per_sector:   u32,
+    bytes_per_sector:    u32,
     sectors_per_cluster: u32,
-    bytes_per_cluster:  u32,
-    fat_start_lba:      u64,
-    fat_sectors:        u32,
-    num_fats:           u32,
-    data_start_lba:     u64,
-    root_cluster:       u32,
-    total_clusters:     u32,
-    fsinfo_sector:      u64,
-    free_clusters:      u32,
-    fat_bitmap:         Vec<u8>,   // 1 bit per cluster (bit = used)
-    cluster_buf:        Vec<u8>,   // reusable scratch buffer
+    bytes_per_cluster:   u32,
+    fat_start_lba:       u64,
+    fat_sectors:         u32,
+    num_fats:            u32,
+    data_start_lba:      u64,
+    root_cluster:        u32,
+    total_clusters:      u32,
+    fsinfo_sector:       u64,
+    free_clusters:       u32,
+    fat_bitmap:          Vec<u8>,      // 1 bit per cluster (bit = used)
+    cluster_buf:         Vec<u8>,      // reusable scratch buffer (one full cluster)
+    /// Single-sector FAT cache: last sector read into fat_cache_buf.
+    fat_cache_sector:    u64,
+    fat_cache_buf:       [u8; 512],
     /// Volume label from BPB bytes 43–53 (11 bytes, space-padded, no NUL).
-    volume_label:       [u8; 11],
-    ready:              bool,
+    volume_label:        [u8; 11],
+    /// Volume Serial Number (BPB bytes 39–42, `vol_id`).
+    /// Displayed as XXXX-XXXX (upper 16 bits, lower 16 bits in hex).
+    volume_id:           u32,
+    ready:               bool,
 }
 
-impl Fat32State {
-    fn new() -> Self {
+impl Fat32Volume {
+    fn new(disk: Arc<dyn BlockDevice>, start_lba: u64) -> Self {
         Self {
-            partition_start_lba: 0,
+            disk,
+            partition_start_lba: start_lba,
             bytes_per_sector: 0,
             sectors_per_cluster: 0,
             bytes_per_cluster: 0,
@@ -173,26 +189,22 @@ impl Fat32State {
             free_clusters: 0,
             fat_bitmap: Vec::new(),
             cluster_buf: Vec::new(),
+            fat_cache_sector: u64::MAX,
+            fat_cache_buf: [0u8; 512],
             volume_label: [b' '; 11],
+            volume_id: 0,
             ready: false,
         }
     }
-}
 
-struct SyncCell<T>(core::cell::UnsafeCell<T>);
-unsafe impl<T> Sync for SyncCell<T> {}
+    // --- low-level sector I/O -----------------------------------------------
 
-static STATE: SyncCell<Option<Fat32State>> = SyncCell(core::cell::UnsafeCell::new(None));
+    fn read_sectors_into(&self, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+        self.disk.read_sectors(self.partition_start_lba + lba, count, buf)
+    }
 
-fn with_state<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut Fat32State) -> R,
-    R: Default,
-{
-    let state_opt = unsafe { &mut *STATE.0.get() };
-    match state_opt.as_mut() {
-        Some(state) => f(state),
-        None => R::default(), // FAT32 not initialized — return a safe default
+    fn write_sectors_from(&self, lba: u64, count: u32, buf: &[u8]) -> bool {
+        self.disk.write_sectors(self.partition_start_lba + lba, count, buf)
     }
 }
 
@@ -200,117 +212,98 @@ where
 // Open file descriptor state
 // ---------------------------------------------------------------------------
 
-pub struct Fat32File {
-    pub dir_cluster:     u32,
-    pub dir_entry_index: u32,   // entry index within dir cluster
-    pub first_cluster:   u32,
-    pub file_size:       u32,
-    pub position:        u64,
+// Internal helper: tracks file position and cluster chain head for I/O operations.
+// Used by update_dir_entry_size to patch the directory entry after writes and truncates.
+struct Fat32File {
+    dir_cluster:     u32,
+    dir_entry_index: u32,
+    first_cluster:   u32,
+    file_size:       u32,
+    position:        u64,
 }
 
 // ---------------------------------------------------------------------------
-// Sector I/O helpers
+// Sector I/O helpers — now methods / free functions taking &mut Fat32Volume
 // ---------------------------------------------------------------------------
 
-/// Read sectors relative to the mounted partition start.
-///
-/// `lba` is the partition-relative LBA (as stored in FAT32 BPB fields).
-/// The absolute disk LBA = `state.partition_start_lba + lba`.
-fn read_sectors_into(lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    let offset = unsafe {
-        (*STATE.0.get()).as_ref().map(|s| s.partition_start_lba).unwrap_or(0)
-    };
-    crate::hal::disk::read_sectors(offset + lba, count, buf)
+fn cluster_lba(vol: &Fat32Volume, cluster: u32) -> u64 {
+    vol.data_start_lba + (cluster - FIRST_DATA_CLUSTER) as u64 * vol.sectors_per_cluster as u64
 }
 
-/// Write sectors relative to the mounted partition start.
-fn write_sectors_from(lba: u64, count: u32, buf: &[u8]) -> bool {
-    let offset = unsafe {
-        (*STATE.0.get()).as_ref().map(|s| s.partition_start_lba).unwrap_or(0)
-    };
-    crate::hal::disk::write_sectors(offset + lba, count, buf)
-}
-
-fn cluster_lba(state: &Fat32State, cluster: u32) -> u64 {
-    state.data_start_lba + (cluster - FIRST_DATA_CLUSTER) as u64 * state.sectors_per_cluster as u64
-}
-
-fn read_cluster(state: &mut Fat32State, cluster: u32) -> bool {
+fn read_cluster(vol: &mut Fat32Volume, cluster: u32) -> bool {
     if cluster < FIRST_DATA_CLUSTER {
         return false;
     }
-    let lba = cluster_lba(state, cluster);
-    let sectors = state.sectors_per_cluster;
-    let buf = &mut state.cluster_buf;
-    read_sectors_into(lba, sectors, buf)
+    let lba     = cluster_lba(vol, cluster);
+    let sectors = vol.sectors_per_cluster;
+    let buf     = &mut vol.cluster_buf;
+    vol.disk.read_sectors(vol.partition_start_lba + lba, sectors, buf)
 }
 
-fn write_cluster(state: &mut Fat32State, cluster: u32) -> bool {
+fn write_cluster(vol: &mut Fat32Volume, cluster: u32) -> bool {
     if cluster < FIRST_DATA_CLUSTER {
         return false;
     }
-    let lba = cluster_lba(state, cluster);
-    let sectors = state.sectors_per_cluster;
-    let buf = state.cluster_buf.clone(); // avoid borrow issue
-    write_sectors_from(lba, sectors, &buf)
+    let lba     = cluster_lba(vol, cluster);
+    let sectors = vol.sectors_per_cluster;
+    let buf     = vol.cluster_buf.clone(); // avoid simultaneous borrow
+    vol.disk.write_sectors(vol.partition_start_lba + lba, sectors, &buf)
 }
 
 // ---------------------------------------------------------------------------
-// FAT table I/O (cached single-sector)
+// FAT table I/O (per-volume single-sector cache)
 // ---------------------------------------------------------------------------
 
-// Thread-local FAT sector cache (non-reentrant; single-core kernel).
-static FAT_CACHE_SECTOR: SyncCell<u64> = SyncCell(core::cell::UnsafeCell::new(u64::MAX));
-static FAT_CACHE_BUF: SyncCell<[u8; 512]> = SyncCell(core::cell::UnsafeCell::new([0u8; 512]));
-
-fn read_fat_entry(state: &Fat32State, cluster: u32) -> Option<u32> {
-    let fat_offset = cluster as u64 * 4;
-    let fat_sector = fat_offset / 512;
+fn read_fat_entry(vol: &mut Fat32Volume, cluster: u32) -> Option<u32> {
+    let fat_offset   = cluster as u64 * 4;
+    let fat_sector   = fat_offset / 512;
     let entry_offset = (fat_offset % 512) as usize;
+    let abs_sector   = vol.fat_start_lba + fat_sector;
 
-    let cache_sector = unsafe { *FAT_CACHE_SECTOR.0.get() };
-    if cache_sector != state.fat_start_lba + fat_sector {
-        let buf = unsafe { &mut *FAT_CACHE_BUF.0.get() };
-        if !read_sectors_into(state.fat_start_lba + fat_sector, 1, buf) {
+    if vol.fat_cache_sector != abs_sector {
+        if !vol.disk.read_sectors(vol.partition_start_lba + abs_sector, 1, &mut vol.fat_cache_buf) {
             return None;
         }
-        unsafe { *FAT_CACHE_SECTOR.0.get() = state.fat_start_lba + fat_sector; }
+        vol.fat_cache_sector = abs_sector;
     }
 
-    let buf = unsafe { &*FAT_CACHE_BUF.0.get() };
     let raw = u32::from_le_bytes([
-        buf[entry_offset],
-        buf[entry_offset + 1],
-        buf[entry_offset + 2],
-        buf[entry_offset + 3],
+        vol.fat_cache_buf[entry_offset],
+        vol.fat_cache_buf[entry_offset + 1],
+        vol.fat_cache_buf[entry_offset + 2],
+        vol.fat_cache_buf[entry_offset + 3],
     ]);
     Some(raw & 0x0FFFFFFF)
 }
 
-fn write_fat_entry(state: &Fat32State, cluster: u32, value: u32) -> bool {
-    let fat_offset = cluster as u64 * 4;
-    let fat_sector = fat_offset / 512;
+fn write_fat_entry(vol: &mut Fat32Volume, cluster: u32, value: u32) -> bool {
+    let fat_offset   = cluster as u64 * 4;
+    let fat_sector   = fat_offset / 512;
     let entry_offset = (fat_offset % 512) as usize;
 
-    for fat in 0..state.num_fats {
-        let sector = state.fat_start_lba + fat_sector + fat as u64 * state.fat_sectors as u64;
+    for fat in 0..vol.num_fats {
+        let abs_sector = vol.partition_start_lba
+            + vol.fat_start_lba
+            + fat_sector
+            + fat as u64 * vol.fat_sectors as u64;
         let mut buf = [0u8; 512];
-        if !read_sectors_into(sector, 1, &mut buf) {
+        if !vol.disk.read_sectors(abs_sector, 1, &mut buf) {
             return false;
         }
-        let existing = u32::from_le_bytes([buf[entry_offset], buf[entry_offset+1], buf[entry_offset+2], buf[entry_offset+3]]);
+        let existing = u32::from_le_bytes([
+            buf[entry_offset], buf[entry_offset+1],
+            buf[entry_offset+2], buf[entry_offset+3],
+        ]);
         let new_value = (value & 0x0FFFFFFF) | (existing & 0xF0000000);
-        let bytes = new_value.to_le_bytes();
-        buf[entry_offset..entry_offset+4].copy_from_slice(&bytes);
-        if !write_sectors_from(sector, 1, &buf) {
+        buf[entry_offset..entry_offset+4].copy_from_slice(&new_value.to_le_bytes());
+        if !vol.disk.write_sectors(abs_sector, 1, &buf) {
             return false;
         }
     }
 
-    // Invalidate cache if we touched the cached sector.
-    let cache_sector = unsafe { *FAT_CACHE_SECTOR.0.get() };
-    if cache_sector == state.fat_start_lba + fat_sector {
-        unsafe { *FAT_CACHE_SECTOR.0.get() = u64::MAX; }
+    // Invalidate per-volume FAT cache if we touched the cached sector.
+    if vol.fat_cache_sector == vol.partition_start_lba + vol.fat_start_lba + fat_sector {
+        vol.fat_cache_sector = u64::MAX;
     }
 
     true
@@ -320,7 +313,7 @@ fn write_fat_entry(state: &Fat32State, cluster: u32, value: u32) -> bool {
 // FAT bitmap helpers
 // ---------------------------------------------------------------------------
 
-fn bitmap_set(state: &mut Fat32State, cluster: u32) {
+fn bitmap_set(state: &mut Fat32Volume, cluster: u32) {
     if cluster < FIRST_DATA_CLUSTER || cluster >= state.total_clusters + 2 {
         return;
     }
@@ -330,7 +323,7 @@ fn bitmap_set(state: &mut Fat32State, cluster: u32) {
     }
 }
 
-fn bitmap_clear(state: &mut Fat32State, cluster: u32) {
+fn bitmap_clear(state: &mut Fat32Volume, cluster: u32) {
     if cluster < FIRST_DATA_CLUSTER || cluster >= state.total_clusters + 2 {
         return;
     }
@@ -340,7 +333,7 @@ fn bitmap_clear(state: &mut Fat32State, cluster: u32) {
     }
 }
 
-fn bitmap_find_free(state: &Fat32State) -> Option<u32> {
+fn bitmap_find_free(state: &mut Fat32Volume) -> Option<u32> {
     for i in 0..state.total_clusters as usize {
         if state.fat_bitmap[i / 8] & (1 << (i % 8)) == 0 {
             return Some(FIRST_DATA_CLUSTER + i as u32);
@@ -349,7 +342,7 @@ fn bitmap_find_free(state: &Fat32State) -> Option<u32> {
     None
 }
 
-fn build_fat_bitmap(state: &mut Fat32State) -> bool {
+fn build_fat_bitmap(state: &mut Fat32Volume) -> bool {
     for i in 0..(state.total_clusters + 2) {
         let entry = match read_fat_entry(state, i) {
             Some(e) => e,
@@ -366,7 +359,7 @@ fn build_fat_bitmap(state: &mut Fat32State) -> bool {
 // Cluster chain helpers
 // ---------------------------------------------------------------------------
 
-fn cluster_at_index(state: &Fat32State, first_cluster: u32, index: u32) -> Option<u32> {
+fn cluster_at_index(state: &mut Fat32Volume, first_cluster: u32, index: u32) -> Option<u32> {
     let mut cluster = first_cluster;
     for _ in 0..index {
         if is_eof(cluster) || is_bad(cluster) {
@@ -377,7 +370,7 @@ fn cluster_at_index(state: &Fat32State, first_cluster: u32, index: u32) -> Optio
     Some(cluster)
 }
 
-fn get_last_cluster(state: &Fat32State, first_cluster: u32) -> Option<u32> {
+fn get_last_cluster(state: &mut Fat32Volume, first_cluster: u32) -> Option<u32> {
     if first_cluster < FIRST_DATA_CLUSTER {
         return None;
     }
@@ -391,7 +384,7 @@ fn get_last_cluster(state: &Fat32State, first_cluster: u32) -> Option<u32> {
     }
 }
 
-fn alloc_cluster(state: &mut Fat32State, first_cluster: u32) -> Option<(u32, u32)> {
+fn alloc_cluster(state: &mut Fat32Volume, first_cluster: u32) -> Option<(u32, u32)> {
     let new_cluster = bitmap_find_free(state)?;
 
     bitmap_set(state, new_cluster);
@@ -418,7 +411,7 @@ fn alloc_cluster(state: &mut Fat32State, first_cluster: u32) -> Option<(u32, u32
     Some((new_cluster, new_first))
 }
 
-fn free_chain(state: &mut Fat32State, mut cluster: u32) {
+fn free_chain(state: &mut Fat32Volume, mut cluster: u32) {
     while cluster >= FIRST_DATA_CLUSTER && !is_eof(cluster) && !is_bad(cluster) {
         let next = match read_fat_entry(state, cluster) {
             Some(n) => n,
@@ -528,9 +521,20 @@ fn names_match_case_insensitive(a: &str, b: &str) -> bool {
     })
 }
 
-fn lfn_char_to_ascii(ch: u16) -> char {
-    // Preserve original case — LFN stores the exact name as entered.
-    if ch < 0x80 { ch as u8 as char } else { '?' }
+/// Convert a UTF-16 code unit from a FAT32 LFN entry to a Rust char.
+///
+/// FAT32 LFN entries store names as UTF-16LE (BMP only — no surrogate pairs
+/// in practice for filesystem names).  We use `char::from_u32()` to produce
+/// the correct Unicode scalar, falling back to U+FFFD REPLACEMENT CHARACTER
+/// for values that are not valid Unicode scalars.
+///
+/// Reference: Microsoft FAT32 File System Specification §7 "Long Name Directory Entry".
+fn lfn_char_to_utf8(ch: u16) -> char {
+    // ASCII fast path — the common case.
+    if ch < 0x80 { return ch as u8 as char; }
+    // Map to Unicode scalar.  FAT32 LFN uses UTF-16LE; surrogates (D800–DFFF)
+    // are illegal in filenames per the spec — replace them rather than panic.
+    char::from_u32(ch as u32).unwrap_or('\u{FFFD}')
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +553,7 @@ struct DirEntry {
 }
 
 fn lookup_in_dir(
-    state: &mut Fat32State,
+    state: &mut Fat32Volume,
     dir_cluster: u32,
     component: &str,
 ) -> Option<DirEntry> {
@@ -613,7 +617,7 @@ fn lookup_in_dir(
                     let mut segment = alloc::string::String::new();
                     for ch in chars.iter() {
                         if *ch == 0x0000 || *ch == 0xFFFF { break; }
-                        segment.push(lfn_char_to_ascii(*ch));
+                        segment.push(lfn_char_to_utf8(*ch));
                     }
                     // LFN entries arrive in reverse order — prepend.
                     let combined = segment + &lfn_buf;
@@ -658,7 +662,7 @@ fn lookup_in_dir(
 
 // Resolve a path like "/hello.txt" or "/dir/file.txt" from the root cluster.
 // Returns (dir_entry, parent_cluster) or None.
-fn resolve_path(state: &mut Fat32State, path: &str) -> Option<(Fat32DirEntry, u32, u32)> {
+fn resolve_path(state: &mut Fat32Volume, path: &str) -> Option<(Fat32DirEntry, u32, u32)> {
     // Split path on '/'.
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if parts.is_empty() {
@@ -707,265 +711,114 @@ fn strip_disk_prefix(path: &str) -> &str {
 ///
 /// `start_lba` is the first LBA of the partition as reported by the partition
 /// table parser.  All subsequent sector reads and writes will be offset by
+/// Initialise a FAT32 volume from a specific partition on a `BlockDevice`.
+///
+/// `start_lba` is the first LBA of the partition as reported by the partition
+/// table parser.  All subsequent sector reads and writes will be offset by
 /// `start_lba` relative to the block device.
 ///
-/// Returns `true` on success.  Replaces any previously initialised state.
+/// Returns `Some(Arc<SpinLock<Fat32Volume>>)` on success, `None` if the
+/// partition is not a valid FAT32 volume or the disk cannot be read.
 ///
-/// # Panics / Safety
-/// Caller must ensure IRQs are disabled (single-core invariant).
-pub fn fat32_init_partition(disk: &dyn crate::hal::disk::BlockDevice, start_lba: u64) -> bool {
-    // Prime the STATE with the partition offset so that read_sectors_into
-    // applies the correct LBA translation when fat32_init() reads the BPB.
-    {
-        let state_opt = unsafe { &mut *STATE.0.get() };
-        let state = state_opt.get_or_insert_with(Fat32State::new);
-        state.partition_start_lba = start_lba;
-        state.ready = false;
+/// Multiple partitions on the same or different disks can each produce an
+/// independent `Arc<SpinLock<Fat32Volume>>` — there is no global state.
+pub fn fat32_init_partition(
+    disk:      Arc<dyn BlockDevice>,
+    start_lba: u64,
+) -> Option<Arc<SpinLock<Fat32Volume>>> {
+    let mut vol = Fat32Volume::new(disk, start_lba);
+    if fat32_init_inner(&mut vol) {
+        Some(Arc::new(SpinLock::new(vol)))
+    } else {
+        None
     }
-    // Delegate to the existing BPB-parsing logic.
-    // fat32_init() reads sector 0 (which becomes start_lba + 0 on disk).
-    //
-    // Note: fat32_init() also checks `hal::disk::capacity()` which reads the
-    // global virtio device — this is fine for the current single-disk setup.
-    // For multi-disk support, Fat32State would store the Arc<dyn BlockDevice>
-    // and read_sectors_into would dispatch through it.
-    let _ = disk; // reserved for future multi-disk dispatch
-    fat32_init_inner()
 }
 
-/// `fat32_init` without partition offset — whole-disk mount (legacy / fallback).
-pub fn fat32_init() -> bool {
-    {
-        let state_opt = unsafe { &mut *STATE.0.get() };
-        let state = state_opt.get_or_insert_with(Fat32State::new);
-        state.partition_start_lba = 0;
-    }
-    fat32_init_inner()
-}
-
-fn fat32_init_inner() -> bool {
-    let state_opt = unsafe { &mut *STATE.0.get() };
-    if state_opt.is_none() {
-        *state_opt = Some(Fat32State::new());
-    }
-    let state = state_opt.as_mut().unwrap();
-
-    let capacity = crate::hal::disk::capacity();
-    if capacity == 0 {
-        crate::drivers::uart::puts("[fat32] disk capacity is 0 — no disk\r\n");
-        *state_opt = None;
-        return false;
-    }
-
-    // Allocate sector buffer.
-    state.cluster_buf = vec![0u8; 512];
-
-    // Read boot sector (LBA 0 relative to partition start).
-    if !read_sectors_into(0, 1, &mut state.cluster_buf) {
+fn fat32_init_inner(vol: &mut Fat32Volume) -> bool {
+    // Read boot sector (LBA 0 relative to partition start) into a temporary buffer.
+    // We cannot pass vol.cluster_buf directly because read_sectors_into(&self, ...)
+    // borrows the whole struct, which conflicts with the &mut cluster_buf borrow.
+    let mut boot_sector = vec![0u8; 512];
+    if !vol.read_sectors_into(0, 1, &mut boot_sector) {
         crate::drivers::uart::puts("[fat32] failed to read boot sector\r\n");
-        *state_opt = None;
         return false;
     }
+    vol.cluster_buf = boot_sector;
 
-    if state.cluster_buf[510] != 0x55 || state.cluster_buf[511] != 0xAA {
+    if vol.cluster_buf[510] != 0x55 || vol.cluster_buf[511] != 0xAA {
         crate::drivers::uart::puts("[fat32] bad boot signature (not 0x55AA)\r\n");
-        *state_opt = None;
         return false;
     }
 
-    // Check FAT32 signature.
-    if &state.cluster_buf[82..87] != b"FAT32" {
+    // Check FAT32 signature at offset 82.
+    if &vol.cluster_buf[82..87] != b"FAT32" {
         crate::drivers::uart::puts("[fat32] not a FAT32 volume (signature mismatch at offset 82)\r\n");
-        *state_opt = None;
         return false;
     }
 
-    let bpb: Fat32Bpb = unsafe { core::ptr::read_unaligned(state.cluster_buf.as_ptr() as *const Fat32Bpb) };
+    let bpb: Fat32Bpb = unsafe {
+        core::ptr::read_unaligned(vol.cluster_buf.as_ptr() as *const Fat32Bpb)
+    };
 
-    state.bytes_per_sector   = u16::from_le(bpb.bytes_per_sec) as u32;
-    state.sectors_per_cluster = bpb.sec_per_clus as u32;
-    state.bytes_per_cluster  = state.bytes_per_sector * state.sectors_per_cluster;
-    state.fat_start_lba      = u16::from_le(bpb.rsvd_sec_cnt) as u64;
-    state.fat_sectors        = u32::from_le(bpb.fat_sz32);
-    state.num_fats           = bpb.num_fats as u32;
-    state.data_start_lba     = state.fat_start_lba + state.num_fats as u64 * state.fat_sectors as u64;
-    state.root_cluster       = u32::from_le(bpb.root_clus);
-    state.fsinfo_sector      = u16::from_le(bpb.fs_info) as u64;
-    state.volume_label       = bpb.vol_lab;
+    vol.bytes_per_sector    = u16::from_le(bpb.bytes_per_sec) as u32;
+    vol.sectors_per_cluster = bpb.sec_per_clus as u32;
+    vol.bytes_per_cluster   = vol.bytes_per_sector * vol.sectors_per_cluster;
+    vol.fat_start_lba       = u16::from_le(bpb.rsvd_sec_cnt) as u64;
+    vol.fat_sectors         = u32::from_le(bpb.fat_sz32);
+    vol.num_fats            = bpb.num_fats as u32;
+    vol.data_start_lba      = vol.fat_start_lba + vol.num_fats as u64 * vol.fat_sectors as u64;
+    vol.root_cluster        = u32::from_le(bpb.root_clus);
+    vol.fsinfo_sector       = u16::from_le(bpb.fs_info) as u64;
+    vol.volume_label        = bpb.vol_lab;
+    vol.volume_id           = u32::from_le(bpb.vol_id);
 
     let total_sectors = if bpb.tot_sec16 != 0 {
         u16::from_le(bpb.tot_sec16) as u64
     } else {
         u32::from_le(bpb.tot_sec32) as u64
     };
-    let data_sectors = total_sectors.saturating_sub(state.data_start_lba);
-    state.total_clusters = (data_sectors / state.sectors_per_cluster as u64) as u32;
+    let data_sectors = total_sectors.saturating_sub(vol.data_start_lba);
+    vol.total_clusters = (data_sectors / vol.sectors_per_cluster as u64) as u32;
 
     // Resize cluster_buf to full cluster size.
-    state.cluster_buf = vec![0u8; state.bytes_per_cluster as usize];
+    vol.cluster_buf = vec![0u8; vol.bytes_per_cluster as usize];
 
     // Allocate and build FAT bitmap.
-    let bitmap_size = ((state.total_clusters + 7) / 8) as usize;
-    state.fat_bitmap = vec![0u8; bitmap_size];
+    let bitmap_size = ((vol.total_clusters + 7) / 8) as usize;
+    vol.fat_bitmap = vec![0u8; bitmap_size];
 
-    if !build_fat_bitmap(state) {
+    if !build_fat_bitmap(vol) {
         crate::drivers::uart::puts("[fat32] failed to build FAT bitmap\r\n");
-        *state_opt = None;
         return false;
     }
 
     // Read FSInfo for free cluster count.
     let mut fsinfo_buf = [0u8; 512];
-    if read_sectors_into(state.fsinfo_sector, 1, &mut fsinfo_buf) {
+    if vol.read_sectors_into(vol.fsinfo_sector, 1, &mut fsinfo_buf) {
         let sig1 = u32::from_le_bytes([fsinfo_buf[0], fsinfo_buf[1], fsinfo_buf[2], fsinfo_buf[3]]);
         let sig2 = u32::from_le_bytes([fsinfo_buf[484], fsinfo_buf[485], fsinfo_buf[486], fsinfo_buf[487]]);
         if sig1 == 0x41615252 && sig2 == 0x61417272 {
-            state.free_clusters = u32::from_le_bytes([fsinfo_buf[488], fsinfo_buf[489], fsinfo_buf[490], fsinfo_buf[491]]);
+            vol.free_clusters = u32::from_le_bytes([
+                fsinfo_buf[488], fsinfo_buf[489], fsinfo_buf[490], fsinfo_buf[491],
+            ]);
         } else {
-            state.free_clusters = state.total_clusters;
+            vol.free_clusters = vol.total_clusters;
         }
     } else {
-        state.free_clusters = state.total_clusters;
+        vol.free_clusters = vol.total_clusters;
     }
 
-    state.ready = true;
-    crate::drivers::uart::puts("[fat32] initialized — ");
-    crate::drivers::uart::put_hex(state.total_clusters as u64);
+    vol.ready = true;
+    crate::drivers::uart::puts("[fat32] volume initialized — ");
+    crate::drivers::uart::put_hex(vol.total_clusters as u64);
     crate::drivers::uart::puts(" clusters, root @ cluster ");
-    crate::drivers::uart::put_hex(state.root_cluster as u64);
+    crate::drivers::uart::put_hex(vol.root_cluster as u64);
     crate::drivers::uart::puts("\r\n");
     true
 }
 
-/// Open a file for reading. Returns None if not found.
-pub fn fat32_open(path: &str) -> Option<Fat32File> {
-    let path = strip_disk_prefix(path);
-    with_state(|state| {
-        if !state.ready { return None; }
-        let (entry, parent_cluster, entry_index) = resolve_path(state, path)?;
-        if entry.attr & ATTR_DIRECTORY != 0 { return None; }
-        Some(Fat32File {
-            dir_cluster:     parent_cluster,
-            dir_entry_index: entry_index,
-            first_cluster:   entry_cluster(&entry),
-            file_size:       u32::from_le(entry.file_size),
-            position:        0,
-        })
-    })
-}
 
-/// Read up to `buf.len()` bytes from `file` at its current position.
-/// Returns bytes read, or -1 on error.
-pub fn fat32_read(file: &mut Fat32File, buf: &mut [u8]) -> i64 {
-    with_state(|state| {
-        if !state.ready { return -1; }
-
-        let file_size = file.file_size as u64;
-        if file.position >= file_size {
-            return 0;
-        }
-
-        let available = file_size - file.position;
-        let to_read = (buf.len() as u64).min(available) as usize;
-        let mut total_read = 0usize;
-        let mut pos = file.position;
-
-        while total_read < to_read {
-            let cluster_index = (pos / state.bytes_per_cluster as u64) as u32;
-            let cluster = match cluster_at_index(state, file.first_cluster, cluster_index) {
-                Some(c) if c >= FIRST_DATA_CLUSTER => c,
-                _ => break,
-            };
-
-            if !read_cluster(state, cluster) {
-                break;
-            }
-
-            let offset_in_cluster = (pos % state.bytes_per_cluster as u64) as usize;
-            let available_in_cluster = state.bytes_per_cluster as usize - offset_in_cluster;
-            let chunk = (to_read - total_read).min(available_in_cluster);
-
-            let cluster_data = state.cluster_buf.clone();
-            buf[total_read..total_read + chunk]
-                .copy_from_slice(&cluster_data[offset_in_cluster..offset_in_cluster + chunk]);
-
-            total_read += chunk;
-            pos += chunk as u64;
-        }
-
-        file.position = pos;
-        total_read as i64
-    })
-}
-
-/// Write `buf` to `file` at its current position (extending if necessary).
-/// Returns bytes written, or -1 on error.
-pub fn fat32_write(file: &mut Fat32File, buf: &[u8]) -> i64 {
-    if buf.is_empty() { return 0; }
-
-    let state_opt = unsafe { &mut *STATE.0.get() };
-    let state = match state_opt.as_mut() {
-        Some(s) if s.ready => s,
-        _ => return -1,
-    };
-
-    let bytes_per_cluster = state.bytes_per_cluster as u64;
-    let mut total_written = 0usize;
-    let mut pos = file.position;
-    let to_write = buf.len();
-
-    while total_written < to_write {
-        let cluster_index = (pos / bytes_per_cluster) as u32;
-
-        // Get or allocate cluster.
-        let cluster = if file.first_cluster < FIRST_DATA_CLUSTER {
-            match alloc_cluster(state, 0) {
-                Some((new_cluster, new_first)) => { file.first_cluster = new_first; new_cluster }
-                None => break,
-            }
-        } else {
-            match cluster_at_index(state, file.first_cluster, cluster_index) {
-                Some(c) if c >= FIRST_DATA_CLUSTER => c,
-                _ => {
-                    match alloc_cluster(state, file.first_cluster) {
-                        Some((new_cluster, new_first)) => { file.first_cluster = new_first; new_cluster }
-                        None => break,
-                    }
-                }
-            }
-        };
-
-        // Read existing cluster data (for partial writes).
-        let offset_in_cluster = (pos % bytes_per_cluster) as usize;
-        read_cluster(state, cluster); // ignore error — partial init OK
-
-        let available_in_cluster = state.bytes_per_cluster as usize - offset_in_cluster;
-        let chunk = (to_write - total_written).min(available_in_cluster);
-
-        // Write chunk into cluster buffer.
-        state.cluster_buf[offset_in_cluster..offset_in_cluster + chunk]
-            .copy_from_slice(&buf[total_written..total_written + chunk]);
-
-        if !write_cluster(state, cluster) {
-            break;
-        }
-
-        total_written += chunk;
-        pos += chunk as u64;
-    }
-
-    file.position = pos;
-    if pos > file.file_size as u64 {
-        file.file_size = pos as u32;
-    }
-
-    // Update directory entry size.
-    update_dir_entry_size(state, file);
-
-    total_written as i64
-}
-
-fn update_dir_entry_size(state: &mut Fat32State, file: &Fat32File) {
+fn update_dir_entry_size(state: &mut Fat32Volume, file: &Fat32File) {
     // Read the directory cluster containing the file's entry.
     if !read_cluster(state, file.dir_cluster) {
         return;
@@ -992,97 +845,8 @@ fn update_dir_entry_size(state: &mut Fat32State, file: &Fat32File) {
     write_cluster(state, file.dir_cluster);
 }
 
-/// Create a new empty file. Returns None on failure.
-/// Create or open a file for writing.
-///
-/// `truncate = true`  → O_WRONLY|O_CREAT|O_TRUNC semantics (used by `>`).
-/// `truncate = false` → O_WRONLY|O_CREAT semantics, no truncation (used by `>>`).
-pub fn fat32_creat(path: &str, truncate: bool) -> Option<Fat32File> {
-    let path = strip_disk_prefix(path);
-    with_state(|state| {
-        if !state.ready { return None; }
 
-        // Split to get parent dir and filename.
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.is_empty() { return None; }
-
-        let filename = parts.last().copied()?;
-        let dir_cluster = if parts.len() == 1 {
-            state.root_cluster
-        } else {
-            // Navigate to parent directory.
-            let mut current = state.root_cluster;
-            for part in &parts[..parts.len()-1] {
-                let found = lookup_in_dir(state, current, part)?;
-                if found.entry.attr & ATTR_DIRECTORY == 0 { return None; }
-                current = entry_cluster(&found.entry);
-            }
-            current
-        };
-
-        // File already exists.
-        if let Some(dir_entry) = lookup_in_dir(state, dir_cluster, filename) {
-            if truncate {
-                // O_TRUNC: free old cluster chain, reset size to 0.
-                let first_cluster = entry_cluster(&dir_entry.entry);
-                if first_cluster >= FIRST_DATA_CLUSTER {
-                    free_chain(state, first_cluster);
-                }
-                let mut truncated = Fat32File {
-                    dir_cluster,
-                    dir_entry_index: dir_entry.entry_index,
-                    first_cluster: 0,
-                    file_size: 0,
-                    position: 0,
-                };
-                update_dir_entry_size(state, &truncated);
-                return Some(truncated);
-            } else {
-                // No truncation: open the existing file as-is (append mode).
-                return Some(Fat32File {
-                    dir_cluster,
-                    dir_entry_index: dir_entry.entry_index,
-                    first_cluster: entry_cluster(&dir_entry.entry),
-                    file_size: u32::from_le(dir_entry.entry.file_size),
-                    position: 0,
-                });
-            }
-        }
-
-        // Write directory entry — with LFN if the name requires it.
-        let (entry_cluster_num, entry_index) = if needs_lfn(filename) {
-            let short_name = generate_short_alias(state, dir_cluster, filename)?;
-            let n_slots    = lfn_entry_count(filename) + 1;
-            let (sc, si)   = find_n_free_dir_slots(state, dir_cluster, n_slots)?;
-            write_lfn_and_83(state, sc, si, filename, &short_name, 0x20, 0, 0)?
-        } else {
-            let mut short_name = [b' '; 11];
-            let nt_res = name_to_short(filename, &mut short_name);
-            let (sc, si) = find_free_dir_slot(state, dir_cluster)?;
-            let mut new_entry = Fat32DirEntry::default();
-            new_entry.name   = short_name;
-            new_entry.nt_res = nt_res;
-            new_entry.attr   = 0x20; // ARCHIVE
-            if !read_cluster(state, sc) { return None; }
-            let entry_bytes = unsafe {
-                core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
-            };
-            state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
-            if !write_cluster(state, sc) { return None; }
-            (sc, si)
-        };
-
-        Some(Fat32File {
-            dir_cluster:     entry_cluster_num,
-            dir_entry_index: entry_index,
-            first_cluster:   0,
-            file_size:       0,
-            position:        0,
-        })
-    })
-}
-
-fn find_free_dir_slot(state: &mut Fat32State, dir_cluster: u32) -> Option<(u32, u32)> {
+fn find_free_dir_slot(state: &mut Fat32Volume, dir_cluster: u32) -> Option<(u32, u32)> {
     let entries_per_cluster = (state.bytes_per_cluster / 32) as usize;
     let mut cluster = dir_cluster;
 
@@ -1147,7 +911,7 @@ fn lfn_entry_count(name: &str) -> usize {
 /// Returns `None` if no alias can be found (directory has >9999 similarly
 /// named entries — effectively impossible in practice).
 fn generate_short_alias(
-    state:       &mut Fat32State,
+    state:       &mut Fat32Volume,
     dir_cluster: u32,
     name:        &str,
 ) -> Option<[u8; 11]> {
@@ -1202,7 +966,7 @@ fn generate_short_alias(
 ///
 /// Returns `(cluster, first_index)` of the run start, or `None` on failure.
 fn find_n_free_dir_slots(
-    state:       &mut Fat32State,
+    state:       &mut Fat32Volume,
     dir_cluster: u32,
     count:       usize,
 ) -> Option<(u32, u32)> {
@@ -1266,7 +1030,7 @@ fn find_n_free_dir_slots(
 ///
 /// Returns `(cluster, index)` of the written 8.3 entry, or `None` on error.
 fn write_lfn_and_83(
-    state:         &mut Fat32State,
+    state:         &mut Fat32Volume,
     start_cluster: u32,
     start_index:   u32,
     name:          &str,
@@ -1378,7 +1142,7 @@ fn write_lfn_and_83(
 /// at `(start_cluster, start_index)`.  Follows the FAT chain across cluster
 /// boundaries.  Used to remove the LFN entries that precede a deleted 8.3 entry.
 fn mark_entries_deleted(
-    state:         &mut Fat32State,
+    state:         &mut Fat32Volume,
     start_cluster: u32,
     start_index:   u32,
     count:         u32,
@@ -1408,23 +1172,12 @@ fn mark_entries_deleted(
     }
 }
 
-/// Return (file_size, file_type) for a path. Returns None if not found.
-pub fn fat32_fstat(path: &str) -> Option<(u64, i32)> {
-    let path = strip_disk_prefix(path);
-    with_state(|state| {
-        if !state.ready { return None; }
-        let (entry, _, _) = resolve_path(state, path)?;
-        let size = u32::from_le(entry.file_size) as u64;
-        let file_type = if entry.attr & ATTR_DIRECTORY != 0 { 2 } else { 1 };
-        Some((size, file_type))
-    })
-}
 
 /// List all entries in a FAT32 directory cluster chain.
 ///
 /// Returns a Vec of `(name, is_directory, file_size, first_cluster)` tuples.
 /// Used by `Fat32DirInode::readdir` and `Fat32DirInode::lookup`.
-fn list_dir(state: &mut Fat32State, dir_cluster: u32) -> Vec<(alloc::string::String, bool, u32, u32)> {
+fn list_dir(state: &mut Fat32Volume, dir_cluster: u32) -> Vec<(alloc::string::String, bool, u32, u32)> {
     let entries_per_cluster = (state.bytes_per_cluster / 32) as usize;
     let mut cluster = dir_cluster;
     let mut results: Vec<(alloc::string::String, bool, u32, u32)> = Vec::new();
@@ -1479,7 +1232,7 @@ fn list_dir(state: &mut Fat32State, dir_cluster: u32) -> Vec<(alloc::string::Str
                     let mut segment = alloc::string::String::new();
                     for ch in chars.iter() {
                         if *ch == 0x0000 || *ch == 0xFFFF { break; }
-                        segment.push(lfn_char_to_ascii(*ch));
+                        segment.push(lfn_char_to_utf8(*ch));
                     }
                     let combined = segment + &lfn_buf;
                     lfn_buf = combined;
@@ -1514,72 +1267,19 @@ fn list_dir(state: &mut Fat32State, dir_cluster: u32) -> Vec<(alloc::string::Str
     results
 }
 
-/// Delete a file. Returns true on success.
-pub fn fat32_unlink(path: &str) -> bool {
-    let path = strip_disk_prefix(path);
-    let state_opt = unsafe { &mut *STATE.0.get() };
-    let state = match state_opt.as_mut() {
-        Some(s) if s.ready => s,
-        _ => return false,
-    };
-
-    // Resolve path to parent dir cluster + filename.
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() { return false; }
-    let filename = match parts.last() { Some(s) => *s, None => return false };
-    let mut parent_cluster = state.root_cluster;
-    for part in &parts[..parts.len()-1] {
-        match lookup_in_dir(state, parent_cluster, part) {
-            Some(d) if d.entry.attr & ATTR_DIRECTORY != 0 => {
-                parent_cluster = entry_cluster(&d.entry);
-            }
-            _ => return false,
-        }
-    }
-
-    let found = match lookup_in_dir(state, parent_cluster, filename) {
-        Some(d) => d,
-        None => return false,
-    };
-
-    if found.entry.attr & ATTR_DIRECTORY != 0 { return false; }
-
-    // Free cluster chain.
-    let first_cluster = entry_cluster(&found.entry);
-    if first_cluster >= FIRST_DATA_CLUSTER {
-        free_chain(state, first_cluster);
-    }
-
-    // Delete LFN entries.
-    if found.lfn_count > 0 {
-        mark_entries_deleted(state, found.lfn_start_cluster, found.lfn_start_index,
-                             found.lfn_count);
-    }
-
-    // Mark 8.3 entry as deleted.
-    if !read_cluster(state, found.cluster) { return false; }
-    let offset = found.entry_index as usize * 32;
-    if offset < state.cluster_buf.len() {
-        state.cluster_buf[offset] = DIR_ENTRY_DELETED;
-    }
-    write_cluster(state, found.cluster);
-    true
-}
 
 // ---------------------------------------------------------------------------
 // VFS Inode wrappers — expose FAT32 through the kernel Inode trait so the
-// VFS mount table can route /mnt/* paths to the FAT32 driver transparently.
+// VFS mount table can route paths to the FAT32 driver transparently.
 //
 // Design:
 //   Fat32DirInode  — represents a FAT32 directory (holds its first cluster).
 //   Fat32FileInode — represents a FAT32 regular file (holds metadata).
 //
-// Both types use the global FAT32_STATE via `with_state()`.  They assert
-// Send+Sync because the kernel runs single-core with IRQs disabled.
+// Both types hold an Arc<SpinLock<Fat32Volume>> for per-volume isolation.
+// Multiple FAT32 partitions can be mounted simultaneously without sharing state.
 // ---------------------------------------------------------------------------
 
-use alloc::sync::Arc;
-use core::cell::UnsafeCell;
 use super::inode::{
     Inode, InodeType, InodeStat, DirEntry as VfsDirEntry, FsError,
     alloc_inode_number,
@@ -1594,16 +1294,19 @@ pub struct Fat32DirInode {
     inode_number: u64,
     /// First cluster of this directory (root_cluster for "/").
     dir_cluster: u32,
+    /// Reference to the volume that owns this directory.
+    volume: Arc<SpinLock<Fat32Volume>>,
 }
 
 unsafe impl Send for Fat32DirInode {}
 unsafe impl Sync for Fat32DirInode {}
 
 impl Fat32DirInode {
-    fn new(dir_cluster: u32) -> Arc<dyn Inode> {
+    fn new(dir_cluster: u32, volume: Arc<SpinLock<Fat32Volume>>) -> Arc<dyn Inode> {
         Arc::new(Self {
             inode_number: alloc_inode_number(),
             dir_cluster,
+            volume,
         })
     }
 }
@@ -1631,204 +1334,313 @@ impl Inode for Fat32DirInode {
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn Inode>> {
         let dir_cluster = self.dir_cluster;
-        with_state(|state| {
-            if !state.ready { return None; }
-            let found = lookup_in_dir(state, dir_cluster, name)?;
-            if found.entry.attr & ATTR_DIRECTORY != 0 {
-                Some(Fat32DirInode::new(entry_cluster(&found.entry)))
-            } else {
-                Some(Fat32FileInode::new(
-                    entry_cluster(&found.entry),
-                    u32::from_le(found.entry.file_size),
-                    dir_cluster,
-                    found.entry_index,
-                ))
-            }
-        })
+        let volume = Arc::clone(&self.volume);
+        let mut state = self.volume.lock();
+        if !state.ready { return None; }
+        let found = lookup_in_dir(&mut *state, dir_cluster, name)?;
+        if found.entry.attr & ATTR_DIRECTORY != 0 {
+            Some(Fat32DirInode::new(entry_cluster(&found.entry), volume))
+        } else {
+            Some(Fat32FileInode::new(
+                entry_cluster(&found.entry),
+                u32::from_le(found.entry.file_size),
+                dir_cluster,
+                found.entry_index,
+                volume,
+            ))
+        }
     }
 
     fn readdir(&self, index: usize) -> Option<VfsDirEntry> {
         let dir_cluster = self.dir_cluster;
-        with_state(|state| {
-            if !state.ready { return None; }
-            let entries = list_dir(state, dir_cluster);
-            let (name, is_dir, _size, _cluster) = entries.into_iter().nth(index)?;
-            Some(VfsDirEntry {
-                name,
-                inode_type: if is_dir { InodeType::Directory } else { InodeType::RegularFile },
-                inode_number: alloc_inode_number(),
-            })
+        let mut state = self.volume.lock();
+        if !state.ready { return None; }
+        let entries = list_dir(&mut *state, dir_cluster);
+        let (name, is_dir, _size, _cluster) = entries.into_iter().nth(index)?;
+        Some(VfsDirEntry {
+            name,
+            inode_type: if is_dir { InodeType::Directory } else { InodeType::RegularFile },
+            inode_number: alloc_inode_number(),
         })
     }
 
     fn create(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         let dir_cluster = self.dir_cluster;
         let name_owned = alloc::string::String::from(name);
-        let state_opt = unsafe { &mut *STATE.0.get() };
-        let state = match state_opt.as_mut() {
-            Some(s) if s.ready => s,
-            _ => return Err(FsError::IoError),
-        };
-        {
+        let volume = Arc::clone(&self.volume);
+        let mut state = self.volume.lock();
+        if !state.ready { return Err(FsError::IoError); }
 
-            // If the file already exists, return it.
-            if let Some(existing) = lookup_in_dir(state, dir_cluster, &name_owned) {
-                if existing.entry.attr & ATTR_DIRECTORY != 0 {
-                    return Err(FsError::NotSupported);
-                }
-                return Ok(Fat32FileInode::new(
-                    entry_cluster(&existing.entry),
-                    u32::from_le(existing.entry.file_size),
-                    existing.cluster,
-                    existing.entry_index,
-                ));
+        // If the file already exists, return it.
+        if let Some(existing) = lookup_in_dir(&mut *state, dir_cluster, &name_owned) {
+            if existing.entry.attr & ATTR_DIRECTORY != 0 {
+                return Err(FsError::NotSupported);
             }
-
-            // Write directory entry — with LFN if the name requires it.
-            let (entry_cluster_num, entry_index) = if needs_lfn(&name_owned) {
-                let short_name = generate_short_alias(state, dir_cluster, &name_owned)
-                    .ok_or(FsError::OutOfMemory)?;
-                let n_slots  = lfn_entry_count(&name_owned) + 1;
-                let (sc, si) = find_n_free_dir_slots(state, dir_cluster, n_slots)
-                    .ok_or(FsError::OutOfMemory)?;
-                write_lfn_and_83(state, sc, si, &name_owned, &short_name, 0x20, 0, 0)
-                    .ok_or(FsError::IoError)?
-            } else {
-                let mut short_name = [b' '; 11];
-                let nt_res = name_to_short(&name_owned, &mut short_name);
-                let (sc, si) = find_free_dir_slot(state, dir_cluster)
-                    .ok_or(FsError::OutOfMemory)?;
-                let mut new_entry = Fat32DirEntry::default();
-                new_entry.name   = short_name;
-                new_entry.nt_res = nt_res;
-                new_entry.attr   = 0x20;
-                if !read_cluster(state, sc) { return Err(FsError::IoError); }
-                let entry_bytes = unsafe {
-                    core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
-                };
-                state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
-                if !write_cluster(state, sc) { return Err(FsError::IoError); }
-                (sc, si)
-            };
-
-            Ok(Fat32FileInode::new(0, 0, entry_cluster_num, entry_index))
+            return Ok(Fat32FileInode::new(
+                entry_cluster(&existing.entry),
+                u32::from_le(existing.entry.file_size),
+                existing.cluster,
+                existing.entry_index,
+                volume,
+            ));
         }
+
+        // Write directory entry — with LFN if the name requires it.
+        let (entry_cluster_num, entry_index) = if needs_lfn(&name_owned) {
+            let short_name = generate_short_alias(&mut *state, dir_cluster, &name_owned)
+                .ok_or(FsError::OutOfMemory)?;
+            let n_slots  = lfn_entry_count(&name_owned) + 1;
+            let (sc, si) = find_n_free_dir_slots(&mut *state, dir_cluster, n_slots)
+                .ok_or(FsError::OutOfMemory)?;
+            write_lfn_and_83(&mut *state, sc, si, &name_owned, &short_name, 0x20, 0, 0)
+                .ok_or(FsError::IoError)?
+        } else {
+            let mut short_name = [b' '; 11];
+            let nt_res = name_to_short(&name_owned, &mut short_name);
+            let (sc, si) = find_free_dir_slot(&mut *state, dir_cluster)
+                .ok_or(FsError::OutOfMemory)?;
+            let mut new_entry = Fat32DirEntry::default();
+            new_entry.name   = short_name;
+            new_entry.nt_res = nt_res;
+            new_entry.attr   = 0x20;
+            if !read_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+            let entry_bytes = unsafe {
+                core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
+            };
+            state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
+            if !write_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+            (sc, si)
+        };
+
+        Ok(Fat32FileInode::new(0, 0, entry_cluster_num, entry_index, volume))
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> {
         let dir_cluster = self.dir_cluster;
         let name_owned = alloc::string::String::from(name);
-        let state_opt = unsafe { &mut *STATE.0.get() };
-        let state = match state_opt.as_mut() {
-            Some(s) if s.ready => s,
-            _ => return Err(FsError::IoError),
-        };
-        {
+        let volume = Arc::clone(&self.volume);
+        let mut state = self.volume.lock();
+        if !state.ready { return Err(FsError::IoError); }
 
-            // Reject if a name already exists.
-            if lookup_in_dir(state, dir_cluster, &name_owned).is_some() {
-                return Err(FsError::AlreadyExists);
-            }
-
-            // Allocate a cluster for the new directory.
-            let (new_cluster, _) = alloc_cluster(state, 0).ok_or(FsError::OutOfMemory)?;
-
-            // Zero the new cluster.
-            state.cluster_buf.fill(0);
-
-            // Write '.' entry (points to itself).
-            let mut dot_entry = Fat32DirEntry::default();
-            dot_entry.name = *b".          ";
-            dot_entry.attr = ATTR_DIRECTORY;
-            dot_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
-            dot_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
-            let dot_bytes = unsafe {
-                core::slice::from_raw_parts(&dot_entry as *const Fat32DirEntry as *const u8, 32)
-            };
-            state.cluster_buf[0..32].copy_from_slice(dot_bytes);
-
-            // Write '..' entry (points to parent).
-            let mut dotdot_entry = Fat32DirEntry::default();
-            dotdot_entry.name = *b"..         ";
-            dotdot_entry.attr = ATTR_DIRECTORY;
-            dotdot_entry.fst_clus_lo = (dir_cluster & 0xFFFF) as u16;
-            dotdot_entry.fst_clus_hi = ((dir_cluster >> 16) & 0xFFFF) as u16;
-            let dotdot_bytes = unsafe {
-                core::slice::from_raw_parts(&dotdot_entry as *const Fat32DirEntry as *const u8, 32)
-            };
-            state.cluster_buf[32..64].copy_from_slice(dotdot_bytes);
-
-            if !write_cluster(state, new_cluster) { return Err(FsError::IoError); }
-
-            // Add directory entry in the parent — with LFN if the name requires it.
-            if needs_lfn(&name_owned) {
-                let short_name = generate_short_alias(state, dir_cluster, &name_owned)
-                    .ok_or(FsError::OutOfMemory)?;
-                let n_slots  = lfn_entry_count(&name_owned) + 1;
-                let (sc, si) = find_n_free_dir_slots(state, dir_cluster, n_slots)
-                    .ok_or(FsError::OutOfMemory)?;
-                write_lfn_and_83(state, sc, si, &name_owned, &short_name,
-                                  ATTR_DIRECTORY, new_cluster, 0)
-                    .ok_or(FsError::IoError)?;
-            } else {
-                let mut short_name = [b' '; 11];
-                let nt_res = name_to_short(&name_owned, &mut short_name);
-                let (sc, si) = find_free_dir_slot(state, dir_cluster)
-                    .ok_or(FsError::OutOfMemory)?;
-                let mut new_entry = Fat32DirEntry::default();
-                new_entry.name        = short_name;
-                new_entry.nt_res      = nt_res;
-                new_entry.attr        = ATTR_DIRECTORY;
-                new_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
-                new_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
-                if !read_cluster(state, sc) { return Err(FsError::IoError); }
-                let entry_bytes = unsafe {
-                    core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
-                };
-                state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
-                if !write_cluster(state, sc) { return Err(FsError::IoError); }
-            }
-
-            Ok(Fat32DirInode::new(new_cluster))
+        // Reject if a name already exists.
+        if lookup_in_dir(&mut *state, dir_cluster, &name_owned).is_some() {
+            return Err(FsError::AlreadyExists);
         }
+
+        // Allocate a cluster for the new directory.
+        let (new_cluster, _) = alloc_cluster(&mut *state, 0).ok_or(FsError::OutOfMemory)?;
+
+        // Zero the new cluster.
+        state.cluster_buf.fill(0);
+
+        // Write '.' entry (points to itself).
+        let mut dot_entry = Fat32DirEntry::default();
+        dot_entry.name = *b".          ";
+        dot_entry.attr = ATTR_DIRECTORY;
+        dot_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
+        dot_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+        let dot_bytes = unsafe {
+            core::slice::from_raw_parts(&dot_entry as *const Fat32DirEntry as *const u8, 32)
+        };
+        state.cluster_buf[0..32].copy_from_slice(dot_bytes);
+
+        // Write '..' entry (points to parent).
+        let mut dotdot_entry = Fat32DirEntry::default();
+        dotdot_entry.name = *b"..         ";
+        dotdot_entry.attr = ATTR_DIRECTORY;
+        dotdot_entry.fst_clus_lo = (dir_cluster & 0xFFFF) as u16;
+        dotdot_entry.fst_clus_hi = ((dir_cluster >> 16) & 0xFFFF) as u16;
+        let dotdot_bytes = unsafe {
+            core::slice::from_raw_parts(&dotdot_entry as *const Fat32DirEntry as *const u8, 32)
+        };
+        state.cluster_buf[32..64].copy_from_slice(dotdot_bytes);
+
+        if !write_cluster(&mut *state, new_cluster) { return Err(FsError::IoError); }
+
+        // Add directory entry in the parent — with LFN if the name requires it.
+        if needs_lfn(&name_owned) {
+            let short_name = generate_short_alias(&mut *state, dir_cluster, &name_owned)
+                .ok_or(FsError::OutOfMemory)?;
+            let n_slots  = lfn_entry_count(&name_owned) + 1;
+            let (sc, si) = find_n_free_dir_slots(&mut *state, dir_cluster, n_slots)
+                .ok_or(FsError::OutOfMemory)?;
+            write_lfn_and_83(&mut *state, sc, si, &name_owned, &short_name,
+                              ATTR_DIRECTORY, new_cluster, 0)
+                .ok_or(FsError::IoError)?;
+        } else {
+            let mut short_name = [b' '; 11];
+            let nt_res = name_to_short(&name_owned, &mut short_name);
+            let (sc, si) = find_free_dir_slot(&mut *state, dir_cluster)
+                .ok_or(FsError::OutOfMemory)?;
+            let mut new_entry = Fat32DirEntry::default();
+            new_entry.name        = short_name;
+            new_entry.nt_res      = nt_res;
+            new_entry.attr        = ATTR_DIRECTORY;
+            new_entry.fst_clus_lo = (new_cluster & 0xFFFF) as u16;
+            new_entry.fst_clus_hi = ((new_cluster >> 16) & 0xFFFF) as u16;
+            if !read_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+            let entry_bytes = unsafe {
+                core::slice::from_raw_parts(&new_entry as *const Fat32DirEntry as *const u8, 32)
+            };
+            state.cluster_buf[si as usize * 32..si as usize * 32 + 32].copy_from_slice(entry_bytes);
+            if !write_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+        }
+
+        Ok(Fat32DirInode::new(new_cluster, volume))
     }
 
     fn unlink(&self, name: &str) -> Result<(), FsError> {
         let dir_cluster = self.dir_cluster;
         let name_owned = alloc::string::String::from(name);
-        let state_opt = unsafe { &mut *STATE.0.get() };
-        let state = match state_opt.as_mut() {
-            Some(s) if s.ready => s,
-            _ => return Err(FsError::IoError),
-        };
-        {
+        let mut state = self.volume.lock();
+        if !state.ready { return Err(FsError::IoError); }
 
-            let found = lookup_in_dir(state, dir_cluster, &name_owned)
-                .ok_or(FsError::NotFound)?;
+        let found = lookup_in_dir(&mut *state, dir_cluster, &name_owned)
+            .ok_or(FsError::NotFound)?;
 
-            // Free the cluster chain for files (directories must be empty first,
-            // but for v1.0 we allow removal regardless).
-            let first_cluster = entry_cluster(&found.entry);
-            if first_cluster >= FIRST_DATA_CLUSTER {
-                free_chain(state, first_cluster);
-            }
-
-            // Delete any LFN entries that precede this 8.3 entry.
-            if found.lfn_count > 0 {
-                mark_entries_deleted(state, found.lfn_start_cluster, found.lfn_start_index,
-                                     found.lfn_count);
-            }
-
-            // Mark the 8.3 directory entry as deleted.
-            if !read_cluster(state, found.cluster) { return Err(FsError::IoError); }
-            let offset = found.entry_index as usize * 32;
-            if offset < state.cluster_buf.len() {
-                state.cluster_buf[offset] = DIR_ENTRY_DELETED;
-            }
-            if !write_cluster(state, found.cluster) { return Err(FsError::IoError); }
-
-            Ok(())
+        // Free the cluster chain for files (directories must be empty first,
+        // but for v1.0 we allow removal regardless).
+        let first_cluster = entry_cluster(&found.entry);
+        if first_cluster >= FIRST_DATA_CLUSTER {
+            free_chain(&mut *state, first_cluster);
         }
+
+        // Delete any LFN entries that precede this 8.3 entry.
+        if found.lfn_count > 0 {
+            mark_entries_deleted(&mut *state, found.lfn_start_cluster, found.lfn_start_index,
+                                 found.lfn_count);
+        }
+
+        // Mark the 8.3 directory entry as deleted.
+        if !read_cluster(&mut *state, found.cluster) { return Err(FsError::IoError); }
+        let offset = found.entry_index as usize * 32;
+        if offset < state.cluster_buf.len() {
+            state.cluster_buf[offset] = DIR_ENTRY_DELETED;
+        }
+        if !write_cluster(&mut *state, found.cluster) { return Err(FsError::IoError); }
+
+        Ok(())
+    }
+
+    /// Write the FSInfo sector back to disk with the current free-cluster count.
+    ///
+    /// FSInfo is a hint structure — it is not required for correctness, only for
+    /// performance (fast free-space queries).  We write it on fsync() so that a
+    /// clean unmount leaves an accurate sector.
+    ///
+    /// Reference: Microsoft FAT32 File System Specification §3.4 "FSInfo Sector".
+    fn fsync(&self) -> Result<(), FsError> {
+        let mut state = self.volume.lock();
+        if !state.ready { return Ok(()); }
+        if state.fsinfo_sector == 0 { return Ok(()); }
+
+        // Build a 512-byte FSInfo sector.
+        let mut buf = [0u8; 512];
+        // Lead signature at offset 0.
+        buf[0..4].copy_from_slice(&0x41615252u32.to_le_bytes());
+        // Structure signature at offset 484.
+        buf[484..488].copy_from_slice(&0x61417272u32.to_le_bytes());
+        // Free cluster count at offset 488.
+        buf[488..492].copy_from_slice(&state.free_clusters.to_le_bytes());
+        // Next free cluster hint — 0xFFFFFFFF means "unknown".
+        buf[492..496].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // Trail signature at offset 508.
+        buf[508..512].copy_from_slice(&0xAA550000u32.to_le_bytes());
+
+        if !state.write_sectors_from(state.fsinfo_sector, 1, &buf) {
+            return Err(FsError::IoError);
+        }
+        Ok(())
+    }
+
+    /// Return the first cluster of this directory (for `link_child` on FAT32).
+    fn fat32_first_cluster(&self) -> Option<u32> {
+        Some(self.dir_cluster)
+    }
+
+    /// Insert an existing FAT32 inode under `name` in this directory.
+    ///
+    /// Used by `sys_rename()` to atomically add the source entry in the new
+    /// parent before unlinking it from the old parent.
+    ///
+    /// The child must be a FAT32 inode (implements `fat32_first_cluster()`).
+    /// Non-FAT32 inodes return `FsError::NotSupported` — cross-filesystem
+    /// renames are not supported.
+    ///
+    /// Reference: Microsoft FAT32 File System Specification §6.
+    fn link_child(&self, name: &str, child: Arc<dyn Inode>) -> Result<(), FsError> {
+        let first_cluster = child.fat32_first_cluster().ok_or(FsError::NotSupported)?;
+        let child_stat    = child.stat();
+        let child_size    = child_stat.size as u32;
+        let is_dir        = child.inode_type() == InodeType::Directory;
+        let attr: u8      = if is_dir { ATTR_DIRECTORY } else { 0x20 };
+
+        let dir_cluster = self.dir_cluster;
+        let name_owned  = alloc::string::String::from(name);
+        let mut state   = self.volume.lock();
+        if !state.ready { return Err(FsError::IoError); }
+
+        // Reject duplicate names.
+        if lookup_in_dir(&mut *state, dir_cluster, &name_owned).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        // Write directory entry — with LFN if the name requires it.
+        if needs_lfn(&name_owned) {
+            let short_name = generate_short_alias(&mut *state, dir_cluster, &name_owned)
+                .ok_or(FsError::OutOfMemory)?;
+            let n_slots = lfn_entry_count(&name_owned) + 1;
+            let (sc, si) = find_n_free_dir_slots(&mut *state, dir_cluster, n_slots)
+                .ok_or(FsError::OutOfMemory)?;
+            write_lfn_and_83(&mut *state, sc, si, &name_owned, &short_name,
+                              attr, first_cluster, child_size)
+                .ok_or(FsError::IoError)?;
+        } else {
+            let mut short_name = [b' '; 11];
+            let nt_res = name_to_short(&name_owned, &mut short_name);
+            let (sc, si) = find_free_dir_slot(&mut *state, dir_cluster)
+                .ok_or(FsError::OutOfMemory)?;
+            let mut new_entry = Fat32DirEntry::default();
+            new_entry.name        = short_name;
+            new_entry.nt_res      = nt_res;
+            new_entry.attr        = attr;
+            new_entry.fst_clus_lo = (first_cluster & 0xFFFF) as u16;
+            new_entry.fst_clus_hi = ((first_cluster >> 16) & 0xFFFF) as u16;
+            new_entry.file_size   = u32::to_le(child_size);
+            if !read_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+            let entry_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &new_entry as *const Fat32DirEntry as *const u8, 32)
+            };
+            state.cluster_buf[si as usize * 32..si as usize * 32 + 32]
+                .copy_from_slice(entry_bytes);
+            if !write_cluster(&mut *state, sc) { return Err(FsError::IoError); }
+        }
+
+        Ok(())
+    }
+
+    fn fs_stats(&self) -> Option<(u64, u64)> {
+        let state = self.volume.lock();
+        if !state.ready { return None; }
+        let sectors_per_cluster = state.bytes_per_cluster / 512;
+        let total_clusters = state.total_clusters as u64;
+        let total_blocks   = total_clusters * sectors_per_cluster as u64;
+        // Count free clusters from the FAT bitmap, which is always accurate
+        // (built by scanning the full FAT at mount time, updated on alloc/free).
+        // This avoids relying on the FSInfo free_count field, which may be
+        // 0xFFFFFFFF ("unknown") if the volume was not cleanly unmounted.
+        let used_clusters: u64 = if !state.fat_bitmap.is_empty() {
+            // Count set bits (used clusters) in the bitmap.
+            state.fat_bitmap.iter().map(|b| b.count_ones() as u64).sum()
+        } else {
+            // Bitmap not built yet — fall back to FSInfo with sentinel check.
+            let free = state.free_clusters.min(state.total_clusters);
+            return Some((total_blocks, free as u64 * sectors_per_cluster as u64));
+        };
+        let free_clusters = total_clusters.saturating_sub(used_clusters);
+        let free_blocks   = free_clusters * sectors_per_cluster as u64;
+        Some((total_blocks, free_blocks))
     }
 }
 
@@ -1841,20 +1653,28 @@ impl Inode for Fat32DirInode {
 /// File position is per-FileDescriptor, not per-inode — the VFS layer
 /// manages position in `FileDescriptor::InoFile { position }`.
 ///
-/// `first_cluster` and `file_size` are mutable via `UnsafeCell` so that
-/// `write_at` can update them in-place after each write.  This is safe
-/// because the kernel runs single-core with IRQs disabled during syscalls —
-/// no concurrent access to a single inode is possible.
+/// `first_cluster` and `file_size` are stored inside the volume-level
+/// `SpinLock<Fat32Volume>`, but we cache the values here for fast `stat()`
+/// calls.  The cached values are updated after every write through the
+/// `write_at` path.  Because `write_at` takes `&self` (required by the
+/// `Inode` trait), we use interior mutability via a `SpinLock<FileInodeState>`
+/// for the two mutable fields.
 pub struct Fat32FileInode {
-    inode_number: u64,
-    /// First cluster of the file's data chain.  Starts at 0 for a newly
-    /// created file and is updated to the real cluster after the first write.
-    first_cluster: UnsafeCell<u32>,
-    /// Current logical file size in bytes.  Updated after every write.
-    file_size: UnsafeCell<u32>,
+    inode_number:   u64,
     /// Directory cluster + entry index — needed for write (update dir entry size).
     dir_cluster:     u32,
     dir_entry_index: u32,
+    /// Per-inode mutable state: first_cluster and file_size.
+    mutable: SpinLock<Fat32FileMutable>,
+    /// Reference to the volume that owns this file.
+    volume: Arc<SpinLock<Fat32Volume>>,
+}
+
+struct Fat32FileMutable {
+    /// First cluster of the file's data chain.
+    first_cluster: u32,
+    /// Current logical file size in bytes.
+    file_size: u32,
 }
 
 unsafe impl Send for Fat32FileInode {}
@@ -1866,13 +1686,14 @@ impl Fat32FileInode {
         file_size: u32,
         dir_cluster: u32,
         dir_entry_index: u32,
+        volume: Arc<SpinLock<Fat32Volume>>,
     ) -> Arc<dyn Inode> {
         Arc::new(Self {
             inode_number: alloc_inode_number(),
-            first_cluster: UnsafeCell::new(first_cluster),
-            file_size: UnsafeCell::new(file_size),
             dir_cluster,
             dir_entry_index,
+            mutable: SpinLock::new(Fat32FileMutable { first_cluster, file_size }),
+            volume,
         })
     }
 }
@@ -1883,45 +1704,179 @@ impl Inode for Fat32FileInode {
     }
 
     fn stat(&self) -> InodeStat {
-        let file_size = unsafe { *self.file_size.get() };
-        InodeStat::regular(self.inode_number, file_size as u64)
+        let mutable = self.mutable.lock();
+        InodeStat::regular(self.inode_number, mutable.file_size as u64)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
-        let mut fat_file = Fat32File {
-            dir_cluster:     self.dir_cluster,
-            dir_entry_index: self.dir_entry_index,
-            first_cluster:   unsafe { *self.first_cluster.get() },
-            file_size:       unsafe { *self.file_size.get() },
-            position:        offset,
-        };
-        let n = fat32_read(&mut fat_file, buf);
-        if n < 0 { Err(FsError::IoError) } else { Ok(n as usize) }
+        let mutable = self.mutable.lock();
+        let first_cluster = mutable.first_cluster;
+        let file_size = mutable.file_size;
+        drop(mutable);
+
+        let mut vol = self.volume.lock();
+        if !vol.ready { return Err(FsError::IoError); }
+
+        let file_size_u64 = file_size as u64;
+        if offset >= file_size_u64 { return Ok(0); }
+
+        let available  = file_size_u64 - offset;
+        let to_read    = (buf.len() as u64).min(available) as usize;
+        let mut total  = 0usize;
+        let mut pos    = offset;
+        let bytes_per_cluster = vol.bytes_per_cluster as u64;
+
+        while total < to_read {
+            let cluster_index = (pos / bytes_per_cluster) as u32;
+            let cluster = match cluster_at_index(&mut *vol,first_cluster, cluster_index) {
+                Some(c) if c >= FIRST_DATA_CLUSTER => c,
+                _ => break,
+            };
+            if !read_cluster(&mut *vol, cluster) { break; }
+
+            let offset_in_cluster  = (pos % bytes_per_cluster) as usize;
+            let available_in_chunk = vol.bytes_per_cluster as usize - offset_in_cluster;
+            let chunk              = (to_read - total).min(available_in_chunk);
+
+            let cluster_data = vol.cluster_buf.clone();
+            buf[total..total + chunk]
+                .copy_from_slice(&cluster_data[offset_in_cluster..offset_in_cluster + chunk]);
+
+            total += chunk;
+            pos   += chunk as u64;
+        }
+        Ok(total)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
-        let mut fat_file = Fat32File {
+        if buf.is_empty() { return Ok(0); }
+
+        let mutable_snapshot = {
+            let m = self.mutable.lock();
+            (m.first_cluster, m.file_size)
+        };
+        let (mut first_cluster, mut file_size) = mutable_snapshot;
+
+        let mut vol = self.volume.lock();
+        if !vol.ready { return Err(FsError::IoError); }
+
+        let bytes_per_cluster = vol.bytes_per_cluster as u64;
+        let mut total = 0usize;
+        let mut pos   = offset;
+        let to_write  = buf.len();
+
+        while total < to_write {
+            let cluster_index = (pos / bytes_per_cluster) as u32;
+
+            let cluster = if first_cluster < FIRST_DATA_CLUSTER {
+                match alloc_cluster(&mut *vol, 0) {
+                    Some((new_cluster, new_first)) => { first_cluster = new_first; new_cluster }
+                    None => break,
+                }
+            } else {
+                match cluster_at_index(&mut *vol,first_cluster, cluster_index) {
+                    Some(c) if c >= FIRST_DATA_CLUSTER => c,
+                    _ => match alloc_cluster(&mut *vol, first_cluster) {
+                        Some((new_cluster, new_first)) => { first_cluster = new_first; new_cluster }
+                        None => break,
+                    },
+                }
+            };
+
+            let offset_in_cluster  = (pos % bytes_per_cluster) as usize;
+            read_cluster(&mut *vol, cluster); // partial write read-modify-write
+            let available_in_chunk = vol.bytes_per_cluster as usize - offset_in_cluster;
+            let chunk              = (to_write - total).min(available_in_chunk);
+
+            vol.cluster_buf[offset_in_cluster..offset_in_cluster + chunk]
+                .copy_from_slice(&buf[total..total + chunk]);
+
+            if !write_cluster(&mut *vol, cluster) { break; }
+
+            total += chunk;
+            pos   += chunk as u64;
+        }
+
+        if pos > file_size as u64 {
+            file_size = pos as u32;
+        }
+
+        // Update the directory entry on disk.
+        let dir_file = Fat32File {
             dir_cluster:     self.dir_cluster,
             dir_entry_index: self.dir_entry_index,
-            first_cluster:   unsafe { *self.first_cluster.get() },
-            file_size:       unsafe { *self.file_size.get() },
-            position:        offset,
+            first_cluster,
+            file_size,
+            position: pos,
         };
-        let n = fat32_write(&mut fat_file, buf);
-        if n >= 0 {
-            // Persist updated cluster chain head and file size back into
-            // the inode so that subsequent writes through this same fd
-            // extend the chain correctly instead of starting a new one.
-            unsafe {
-                *self.first_cluster.get() = fat_file.first_cluster;
-                *self.file_size.get()     = fat_file.file_size;
-            }
-        }
-        if n < 0 { Err(FsError::IoError) } else { Ok(n as usize) }
+        update_dir_entry_size(&mut *vol, &dir_file);
+        drop(vol);
+
+        // Persist updated values back into the inode.
+        let mut mutable = self.mutable.lock();
+        mutable.first_cluster = first_cluster;
+        mutable.file_size     = file_size;
+
+        Ok(total)
     }
 
-    fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
-        Err(FsError::NotSupported)
+    fn truncate(&self, new_size: u64) -> Result<(), FsError> {
+        let mutable_snapshot = {
+            let m = self.mutable.lock();
+            (m.first_cluster, m.file_size)
+        };
+        let (first_cluster, current_size) = mutable_snapshot;
+
+        if new_size > current_size as u64 {
+            // Growing a file via truncate is not supported.
+            return Err(FsError::NotSupported);
+        }
+        if new_size == current_size as u64 {
+            return Ok(());
+        }
+
+        // new_size < current_size: free clusters beyond new_size.
+        let mut vol = self.volume.lock();
+        if !vol.ready { return Err(FsError::IoError); }
+
+        if new_size == 0 {
+            // Free the entire chain.
+            if first_cluster >= FIRST_DATA_CLUSTER {
+                free_chain(&mut *vol, first_cluster);
+            }
+        } else {
+            let bytes_per_cluster = vol.bytes_per_cluster as u64;
+            // Find the last cluster that should remain.
+            let last_kept_cluster_index = ((new_size - 1) / bytes_per_cluster) as u32;
+            if let Some(last_cluster) = cluster_at_index(&mut *vol,first_cluster, last_kept_cluster_index) {
+                // Get the cluster after the last kept one and free from there.
+                if let Some(next) = read_fat_entry(&mut *vol, last_cluster) {
+                    if next >= FIRST_DATA_CLUSTER && !is_eof(next) {
+                        free_chain(&mut *vol, next);
+                    }
+                    // Mark last_cluster as EOF.
+                    write_fat_entry(&mut *vol, last_cluster, 0x0FFFFFFF);
+                }
+            }
+        }
+
+        // Update directory entry.
+        let dir_file = Fat32File {
+            dir_cluster:     self.dir_cluster,
+            dir_entry_index: self.dir_entry_index,
+            first_cluster:   if new_size == 0 { 0 } else { first_cluster },
+            file_size:       new_size as u32,
+            position:        new_size,
+        };
+        update_dir_entry_size(&mut *vol, &dir_file);
+        drop(vol);
+
+        // Persist.
+        let mut mutable = self.mutable.lock();
+        mutable.file_size     = new_size as u32;
+        mutable.first_cluster = if new_size == 0 { 0 } else { first_cluster };
+
+        Ok(())
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn Inode>> {
@@ -1943,28 +1898,63 @@ impl Inode for Fat32FileInode {
     fn unlink(&self, _name: &str) -> Result<(), FsError> {
         Err(FsError::NotDirectory)
     }
+
+    /// Return the first cluster of this file (for `link_child` / rename).
+    fn fat32_first_cluster(&self) -> Option<u32> {
+        Some(self.mutable.lock().first_cluster)
+    }
+
+    /// Flush the FSInfo sector for this file's volume.
+    ///
+    /// The FAT cluster chain was already written during `write_at` / `truncate`.
+    /// FSInfo writeback ensures the free-cluster count is accurate on disk.
+    fn fsync(&self) -> Result<(), FsError> {
+        let state = self.volume.lock();
+        if !state.ready { return Ok(()); }
+        if state.fsinfo_sector == 0 { return Ok(()); }
+
+        let mut buf = [0u8; 512];
+        buf[0..4].copy_from_slice(&0x41615252u32.to_le_bytes());
+        buf[484..488].copy_from_slice(&0x61417272u32.to_le_bytes());
+        buf[488..492].copy_from_slice(&state.free_clusters.to_le_bytes());
+        buf[492..496].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        buf[508..512].copy_from_slice(&0xAA550000u32.to_le_bytes());
+
+        if !state.write_sectors_from(state.fsinfo_sector, 1, &buf) {
+            return Err(FsError::IoError);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Public factory — called from kernel_main after fat32_init()
 // ---------------------------------------------------------------------------
 
-/// Return the volume label of the currently mounted FAT32 partition.
+/// Return the volume label for a mounted FAT32 volume.
 ///
 /// The label is the 11-byte space-padded value from BPB bytes 43–53.
-/// Trailing spaces are stripped before returning.
-/// Returns an empty string if FAT32 is not initialised.
-pub fn fat32_volume_label() -> [u8; 11] {
-    with_state(|state| state.volume_label)
+pub fn fat32_volume_label(volume: &SpinLock<Fat32Volume>) -> [u8; 11] {
+    volume.lock().volume_label
 }
 
-/// Return the VFS root inode for the FAT32 filesystem.
+/// Return the Volume Serial Number (BPB `vol_id`) for a mounted FAT32 volume.
 ///
-/// Returns `None` if FAT32 is not initialised (no disk or bad format).
-/// Mount the returned inode at `/mnt` via `vfs_mount("/mnt", root)`.
-pub fn fat32_root_inode() -> Option<Arc<dyn Inode>> {
-    let root_cluster = with_state(|state| {
+/// Displayed as `XXXX-XXXX` (upper 16 bits, lower 16 bits in hex).
+/// Used by `sys_mount` and `main.rs` to identify the root partition via
+/// `root=UUID=XXXX-XXXX` in the Limine kernel cmdline.
+pub fn fat32_volume_uuid(volume: &SpinLock<Fat32Volume>) -> u32 {
+    volume.lock().volume_id
+}
+
+/// Return the VFS root inode for a FAT32 volume.
+///
+/// Returns `None` if the volume was not successfully initialised.
+/// Mount the returned inode at the desired path via `vfs_mount`.
+pub fn fat32_root_inode(volume: Arc<SpinLock<Fat32Volume>>) -> Option<Arc<dyn Inode>> {
+    let root_cluster = {
+        let state = volume.lock();
         if state.ready { Some(state.root_cluster) } else { None }
-    });
-    root_cluster.map(Fat32DirInode::new)
+    };
+    root_cluster.map(|cluster| Fat32DirInode::new(cluster, volume))
 }

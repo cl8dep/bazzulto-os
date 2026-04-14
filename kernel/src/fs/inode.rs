@@ -192,6 +192,21 @@ pub trait Inode: Send + Sync {
     /// Return metadata for this inode.
     fn stat(&self) -> InodeStat;
 
+    /// Return `true` if this inode is exec-restricted to the kernel only.
+    ///
+    /// When `true`, `sys_exec()` returns `EPERM` for any process that attempts
+    /// to `exec` this file.  The kernel itself may still read and exec the file
+    /// during boot (e.g. spawning bzinit as PID 1).
+    ///
+    /// Used to protect `bzinit` from being exec'd by arbitrary userspace processes.
+    ///
+    /// Default implementation returns `false`.
+    ///
+    /// Reference: docs/features/Binary Permission Model.md §INODE_KERNEL_EXEC_ONLY.
+    fn is_kernel_exec_only(&self) -> bool {
+        false
+    }
+
     // --- Regular file operations ---
 
     /// Read bytes starting at `offset`.
@@ -211,6 +226,16 @@ pub trait Inode: Send + Sync {
     ///
     /// Returns `FsError::NotSupported` for non-regular-file inodes.
     fn truncate(&self, new_size: u64) -> Result<(), FsError>;
+
+    /// Flush all dirty data for this file to the underlying storage.
+    ///
+    /// Default implementation returns `Ok(())` — filesystems that maintain
+    /// write-back caches (e.g. FAT32 cluster cache) should override this.
+    ///
+    /// Reference: POSIX.1-2017 fsync(2).
+    fn fsync(&self) -> Result<(), FsError> {
+        Ok(())
+    }
 
     // --- Directory operations ---
 
@@ -259,6 +284,30 @@ pub trait Inode: Send + Sync {
     fn link_child(&self, name: &str, child: Arc<dyn Inode>) -> Result<(), FsError> {
         let _ = (name, child);
         Err(FsError::NotSupported)
+    }
+
+    /// Return the FAT32 first-cluster number for this inode, if applicable.
+    ///
+    /// Only meaningful for `Fat32FileInode` and `Fat32DirInode`.  Used by
+    /// `Fat32DirInode::link_child()` to write the cluster pointer into the new
+    /// directory entry when performing a rename.
+    ///
+    /// Default returns `None` (not a FAT32 inode).
+    fn fat32_first_cluster(&self) -> Option<u32> {
+        None
+    }
+
+    /// Return filesystem block statistics for the volume this inode belongs to.
+    ///
+    /// Returns `Some((total_512_blocks, free_512_blocks))` when the filesystem
+    /// supports block accounting (e.g. FAT32).  Returns `None` for virtual
+    /// filesystems (tmpfs, devfs, procfs) that do not track block usage.
+    ///
+    /// Used by `sys_getmounts` to populate `df`-style output.
+    ///
+    /// Default implementation returns `None`.
+    fn fs_stats(&self) -> Option<(u64, u64)> {
+        None
     }
 }
 
@@ -333,4 +382,57 @@ impl Inode for SymlinkInode {
     fn truncate(&self, _new_size: u64) -> Result<(), FsError> {
         Err(FsError::NotSupported)
     }
+}
+
+// ---------------------------------------------------------------------------
+// KernelExecOnlyInode — wraps any inode and marks it exec-restricted
+// ---------------------------------------------------------------------------
+
+/// Wraps an `Arc<dyn Inode>` and overrides `is_kernel_exec_only()` to return
+/// `true`, blocking any userspace `exec()` attempt on this file.
+///
+/// All other `Inode` methods delegate directly to the inner inode.
+///
+/// Usage: wrap the bzinit inode in `vfs_init()` before mounting it so that
+/// no userspace process can accidentally re-exec bzinit.
+///
+/// Reference: docs/features/Binary Permission Model.md §INODE_KERNEL_EXEC_ONLY.
+pub struct KernelExecOnlyInode {
+    inner: Arc<dyn Inode>,
+}
+
+unsafe impl Send for KernelExecOnlyInode {}
+unsafe impl Sync for KernelExecOnlyInode {}
+
+impl KernelExecOnlyInode {
+    /// Wrap `inner` so that `is_kernel_exec_only()` returns `true`.
+    pub fn wrap(inner: Arc<dyn Inode>) -> Arc<dyn Inode> {
+        Arc::new(KernelExecOnlyInode { inner })
+    }
+}
+
+impl Inode for KernelExecOnlyInode {
+    fn inode_type(&self) -> InodeType { self.inner.inode_type() }
+    fn stat(&self) -> InodeStat { self.inner.stat() }
+    fn is_kernel_exec_only(&self) -> bool { true }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.inner.read_at(offset, buf)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
+        self.inner.write_at(offset, buf)
+    }
+    fn truncate(&self, new_size: u64) -> Result<(), FsError> {
+        self.inner.truncate(new_size)
+    }
+    fn fsync(&self) -> Result<(), FsError> { self.inner.fsync() }
+    fn lookup(&self, name: &str) -> Option<Arc<dyn Inode>> { self.inner.lookup(name) }
+    fn readdir(&self, index: usize) -> Option<DirEntry> { self.inner.readdir(index) }
+    fn create(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> { self.inner.create(name) }
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn Inode>, FsError> { self.inner.mkdir(name) }
+    fn unlink(&self, name: &str) -> Result<(), FsError> { self.inner.unlink(name) }
+    fn set_mode(&self, mode: u64) -> Result<(), FsError> { self.inner.set_mode(mode) }
+    fn link_child(&self, name: &str, child: Arc<dyn Inode>) -> Result<(), FsError> {
+        self.inner.link_child(name, child)
+    }
+    fn fat32_first_cluster(&self) -> Option<u32> { self.inner.fat32_first_cluster() }
 }

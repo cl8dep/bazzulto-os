@@ -340,11 +340,14 @@ pub extern "C" fn exception_handler_sync_el0(frame: *mut ExceptionFrame) {
 
             // Non-recoverable fault — send SIGSEGV (signal 11) to the current process.
             let elr_at_fault = unsafe { (*frame).elr };
+            let sp_at_fault  = unsafe { (*frame).sp };
             uart::puts("\r\n[fault] SIGSEGV: user-space memory fault\r\n");
             uart::puts("  ELR  = ");
             uart::put_hex(elr_at_fault);
             uart::puts("\r\n  FAR  = ");
             uart::put_hex(far);
+            uart::puts("\r\n  SP   = ");
+            uart::put_hex(sp_at_fault);
             uart::puts("\r\n  ESR  = ");
             uart::put_hex(esr);
             uart::puts("\r\n");

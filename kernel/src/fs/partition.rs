@@ -72,6 +72,21 @@ impl Partition {
         let disk_letter = (b'a' + (self.disk_index as u8).min(25)) as char;
         alloc::format!("/mnt/disk{}{}", disk_letter, self.part_index + 1)
     }
+
+    /// Return the Bazzulto Path Model device path for this partition.
+    ///
+    /// Format: `//dev:disk{letter}:{partition_number}/`
+    ///   - letter:           disk index as lowercase ASCII (0 → 'a', 1 → 'b', …)
+    ///   - partition_number: partition index + 1 (0-based → 1-based)
+    ///
+    /// Examples:
+    ///   disk 0, partition 0 → `//dev:diska:1/`
+    ///   disk 1, partition 0 → `//dev:diskb:1/`
+    ///   disk 1, partition 1 → `//dev:diskb:2/`
+    pub fn device_path(&self) -> alloc::string::String {
+        let disk_letter = (b'a' + (self.disk_index as u8).min(25)) as char;
+        alloc::format!("//dev:disk{}:{}/", disk_letter, self.part_index + 1)
+    }
 }
 
 // ---------------------------------------------------------------------------
