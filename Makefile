@@ -113,6 +113,29 @@ kernel-release:
 	cd $(KERNEL_DIR) && $(CARGO) build --release
 
 # ---------------------------------------------------------------------------
+# musl patches — overlay Bazzulto-specific files onto the musl submodule.
+#
+# musl is a read-only submodule (upstream git.musl-libc.org).  Files that
+# must differ from upstream live in userspace/libraries/libc/patches/ and
+# mirror the musl source tree layout.  Run `make musl-patch` once after
+# cloning, and again whenever patches/ is updated.
+# ---------------------------------------------------------------------------
+
+MUSL_DIR    := userspace/libraries/libc/musl
+PATCHES_DIR := userspace/libraries/libc/patches/musl
+
+.PHONY: musl-patch
+musl-patch:
+	@echo "Applying Bazzulto patches to musl submodule..."
+	@find $(PATCHES_DIR) -type f | while read src; do \
+	    dst=$(MUSL_DIR)/$${src#$(PATCHES_DIR)/}; \
+	    mkdir -p $$(dirname $$dst); \
+	    cp $$src $$dst; \
+	    echo "  patched: $$dst"; \
+	done
+	@echo "Done."
+
+# ---------------------------------------------------------------------------
 # Timezone database — compiled from the IANA source (third_party/tz).
 #
 # Requires `zic` (available on macOS via Xcode; on Linux via tzdata or libc-bin).

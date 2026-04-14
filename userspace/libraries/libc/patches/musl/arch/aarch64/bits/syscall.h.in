@@ -1,0 +1,557 @@
+/* Bazzulto OS — AArch64 syscall numbers
+ *
+ * These replace the Linux aarch64 numbers that musl ships with.
+ * ABI is identical: x8 = syscall number, x0–x5 = arguments, x0 = return value.
+ *
+ * Source of truth: kernel/src/systemcalls/mod.rs (pub mod numbers)
+ *
+ * Sections:
+ *   1. Core syscalls (0–114)        — original Bazzulto-numbered syscalls
+ *   2. musl bootstrap (115–119)     — set_tid_address, set_robust_list, etc.
+ *   3. POSIX *at + new (120–161)    — musl ABI alignment additions
+ *   4. Redirects for unimplemented  — map Linux-numbered calls that musl may
+ *                                     invoke to the nearest working equivalent
+ *                                     or to an unused slot (→ ENOSYS/-EINVAL)
+ */
+
+/* -----------------------------------------------------------------------
+ * Section 1 — Core syscalls (0–114)
+ * ----------------------------------------------------------------------- */
+
+#define __NR_exit               0
+#define __NR_write              1
+#define __NR_read               2
+#define __NR_sched_yield        3
+#define __NR_open               4
+#define __NR_close              5
+#define __NR_lseek              6
+/* 7  = spawn   (Bazzulto-specific) */
+/* 8  = list    (Bazzulto-specific) */
+#define __NR_wait4              9
+#define __NR_pipe               10
+#define __NR_dup                11
+#define __NR_dup2               12
+#define __NR_mmap               13
+#define __NR_munmap             14
+#define __NR_fork               15
+/* vfork → fork; no copy-on-write yet */
+#define __NR_vfork              15
+#define __NR_execve             16
+#define __NR_getpid             17
+#define __NR_getppid            18
+#define __NR_clock_gettime      19
+#define __NR_nanosleep          20
+#define __NR_rt_sigaction       21
+#define __NR_kill               22
+#define __NR_rt_sigreturn       23
+#define __NR_creat              24
+#define __NR_unlink             25
+#define __NR_fstat              26
+/* 27 = setfgpid     (Bazzulto-specific) */
+/* 28 = disk_info    (Bazzulto-specific) */
+#define __NR_getrandom          29
+#define __NR_nice               30
+#define __NR_getpriority        31
+#define __NR_setpriority        32
+#define __NR_getrlimit          33
+#define __NR_setrlimit          34
+/* prlimit64: musl calls this; map to setrlimit (soft limit used, hard ignored) */
+#define __NR_prlimit64          34
+#define __NR_getpgrp            35
+#define __NR_setpgid            36
+#define __NR_getsid             37
+#define __NR_setsid             38
+#define __NR_tcgetpgrp          39
+#define __NR_tcsetpgrp          40
+#define __NR_uname              41
+#define __NR_sysinfo            42
+#define __NR_rt_sigprocmask     43
+#define __NR_rt_sigpending      44
+#define __NR_rt_sigsuspend      45
+#define __NR_getrusage          46
+#define __NR_prctl              47
+#define __NR_gettimeofday       48
+/* poll: Bazzulto 49, struct layout matches Linux {i32 fd; u16 events; u16 revents} */
+#define __NR_ppoll              49
+#define __NR_getuid             50
+#define __NR_getgid             51
+#define __NR_chdir              52
+#define __NR_getcwd             53
+#define __NR_mkdir              54
+#define __NR_rmdir              55
+#define __NR_rename             56
+#define __NR_getdents64         57
+/* truncate(58): path-based; ftruncate(124): fd-based */
+#define __NR_truncate           58
+#define __NR_fsync              59
+#define __NR_fdatasync          125
+#define __NR_ioctl              60
+#define __NR_tcgetattr          61
+#define __NR_tcsetattr          62
+#define __NR_futex              63
+#define __NR_epoll_create1      64
+#define __NR_epoll_ctl          65
+#define __NR_epoll_wait         66
+#define __NR_epoll_pwait        66
+#define __NR_epoll_pwait2       66
+#define __NR_clone              67
+#define __NR_gettid             69
+/* 70 = framebuffer_map  (Bazzulto-specific) */
+#define __NR_mkfifo             71
+/* 72-78 = POSIX semaphores (Bazzulto-specific) — not called by musl */
+#define __NR_socket             79
+#define __NR_bind               80
+#define __NR_listen             81
+#define __NR_accept             82
+#define __NR_accept4            82
+#define __NR_connect            83
+#define __NR_sendto             84
+#define __NR_send               84
+#define __NR_recvfrom           85
+#define __NR_recv               85
+#define __NR_shutdown           86
+#define __NR_getsockname        87
+#define __NR_getpeername        88
+#define __NR_socketpair         89
+/* sendmsg/recvmsg: no scatter-gather socket implementation; ENOSYS via mismatch */
+#define __NR_sendmsg            84
+#define __NR_recvmsg            85
+/* getsockopt/setsockopt: not yet implemented */
+#define __NR_getsockopt         60
+#define __NR_setsockopt         60
+#define __NR_mq_open            90
+#define __NR_mq_close           91
+#define __NR_mq_send            92
+#define __NR_mq_receive         93
+#define __NR_mq_unlink          94
+#define __NR_mq_getattr         95
+#define __NR_mq_timedsend       92
+#define __NR_mq_timedreceive    93
+#define __NR_mq_notify          95
+#define __NR_select             96
+#define __NR_pselect6           96
+#define __NR_umask              97
+#define __NR_sigaltstack        98
+#define __NR_alarm              99
+/* 100 = machine_reboot, 101 = machine_poweroff (Bazzulto-specific) */
+#define __NR_reboot             100
+#define __NR_geteuid            102
+#define __NR_getegid            103
+#define __NR_setuid             104
+#define __NR_setgid             105
+#define __NR_seteuid            106
+#define __NR_setegid            107
+#define __NR_chmod              108
+#define __NR_fchmod             109
+#define __NR_chown              110
+#define __NR_fchown             111
+#define __NR_lchown             112
+#define __NR_mount              113
+/* 114 = getmounts (Bazzulto-specific) */
+
+/* -----------------------------------------------------------------------
+ * Section 2 — musl bootstrap syscalls (115–119)
+ * ----------------------------------------------------------------------- */
+
+#define __NR_set_tid_address    115
+#define __NR_set_robust_list    116
+#define __NR_get_robust_list    117
+#define __NR_exit_group         118
+#define __NR_brk                119
+
+/* -----------------------------------------------------------------------
+ * Section 3 — POSIX *at and additional syscalls (120–161)
+ * ----------------------------------------------------------------------- */
+
+#define __NR_openat             120
+#define __NR_newfstatat         121
+/* fstatat is the same entry point as newfstatat on aarch64 */
+#define __NR_fstatat64          121
+#define __NR_unlinkat           122
+#define __NR_mkdirat            123
+#define __NR_ftruncate          124
+/* fdatasync: also mapped at 125 in section 1 above */
+#define __NR_pipe2              126
+#define __NR_dup3               127
+#define __NR_fcntl              128
+#define __NR_mprotect           129
+#define __NR_access             130
+#define __NR_readlink           131
+#define __NR_clock_nanosleep    132
+#define __NR_clock_getres       133
+#define __NR_waitid             134
+#define __NR_tkill              135
+#define __NR_tgkill             136
+#define __NR_mremap             137
+#define __NR_madvise            138
+#define __NR_msync              139
+#define __NR_symlink            140
+#define __NR_link               141
+#define __NR_readlinkat         142
+#define __NR_fchownat           143
+#define __NR_fchmodat           144
+#define __NR_fchmodat2          144
+#define __NR_fchdir             145
+#define __NR_statx              146
+#define __NR_readv              147
+#define __NR_writev             148
+#define __NR_pread64            149
+#define __NR_pwrite64           150
+#define __NR_renameat           151
+#define __NR_renameat2          151
+#define __NR_times              152
+#define __NR_getgroups          153
+#define __NR_getpgid            154
+#define __NR_clock_settime      155
+#define __NR_timer_create       156
+#define __NR_timer_settime      157
+#define __NR_timer_gettime      158
+#define __NR_timer_delete       159
+#define __NR_timer_getoverrun   156
+#define __NR_setitimer          160
+#define __NR_getitimer          161
+
+/* -----------------------------------------------------------------------
+ * Section 4 — Redirects for unimplemented Linux-numbered syscalls
+ *
+ * These map Linux aarch64 syscall numbers to valid Bazzulto entries when
+ * the semantics are close enough, or to an unused slot (→ ENOSYS/EINVAL)
+ * when there is no reasonable fallback.
+ * ----------------------------------------------------------------------- */
+
+/* stat / lstat: no separate path-based stat; use fstatat (AT_FDCWD + path) */
+#define __NR_stat               121
+#define __NR_lstat              121
+
+/* symlinkat: Bazzulto has no dirfd form yet; fallback to symlink */
+#define __NR_symlinkat          140
+/* linkat: same situation */
+#define __NR_linkat             141
+
+/* faccessat: AT_FDCWD + path behaves like access */
+#define __NR_faccessat          130
+#define __NR_faccessat2         130
+
+/* mkfifoat: no dirfd form; falls back to mkfifo */
+#define __NR_mkfifoat           71
+
+/* sync / syncfs → fsync */
+#define __NR_sync               59
+#define __NR_syncfs             59
+#define __NR_sync_file_range    59
+
+/* preadv / pwritev → pread64 / pwrite64 (single-iov fast path) */
+#define __NR_preadv             149
+#define __NR_pwritev            150
+#define __NR_preadv2            149
+#define __NR_pwritev2           150
+
+/* rt_sigtimedwait / rt_sigqueueinfo: no implementation; map to unused slot */
+#define __NR_rt_sigtimedwait    162
+#define __NR_rt_sigqueueinfo    162
+#define __NR_rt_tgsigqueueinfo  162
+
+/* waitpid: musl uses wait4; map there */
+#define __NR_waitpid            9
+
+/* timerfd: not implemented */
+#define __NR_timerfd_create     162
+#define __NR_timerfd_settime    162
+#define __NR_timerfd_gettime    162
+
+/* signalfd4: not implemented */
+#define __NR_signalfd4          162
+
+/* eventfd2: not implemented */
+#define __NR_eventfd2           162
+
+/* inotify: not implemented */
+#define __NR_inotify_init1      162
+#define __NR_inotify_add_watch  162
+#define __NR_inotify_rm_watch   162
+
+/* splice / tee / sendfile: not implemented */
+#define __NR_splice             162
+#define __NR_tee                162
+#define __NR_sendfile           162
+
+/* copy_file_range: not implemented */
+#define __NR_copy_file_range    162
+
+/* utimensat: not implemented */
+#define __NR_utimensat          162
+
+/* statfs / fstatfs: not implemented */
+#define __NR_statfs             162
+#define __NR_fstatfs            162
+
+/* fallocate: not implemented */
+#define __NR_fallocate          162
+
+/* fadvise64: not implemented */
+#define __NR_fadvise64          162
+
+/* readahead: not implemented */
+#define __NR_readahead          162
+
+/* mincore, mlock*: not implemented */
+#define __NR_mincore            162
+#define __NR_mlock              162
+#define __NR_munlock            162
+#define __NR_mlockall           162
+#define __NR_munlockall         162
+#define __NR_mlock2             162
+
+/* sched_*: not implemented */
+#define __NR_sched_setscheduler 162
+#define __NR_sched_getscheduler 162
+#define __NR_sched_setparam     162
+#define __NR_sched_getparam     162
+#define __NR_sched_setaffinity  162
+#define __NR_sched_getaffinity  162
+#define __NR_sched_get_priority_max 162
+#define __NR_sched_get_priority_min 162
+#define __NR_sched_rr_get_interval  162
+#define __NR_sched_setattr      162
+#define __NR_sched_getattr      162
+
+/* ptrace: not implemented */
+#define __NR_ptrace             162
+
+/* xattr: not implemented */
+#define __NR_setxattr           162
+#define __NR_getxattr           162
+#define __NR_listxattr          162
+#define __NR_removexattr        162
+#define __NR_fsetxattr          162
+#define __NR_fgetxattr          162
+#define __NR_flistxattr         162
+#define __NR_fremovexattr       162
+#define __NR_setxattrat         162
+#define __NR_getxattrat         162
+#define __NR_listxattrat        162
+#define __NR_removexattrat      162
+
+/* pivot_root, chroot: not implemented */
+#define __NR_pivot_root         162
+#define __NR_chroot             162
+
+/* vhangup: not implemented */
+#define __NR_vhangup            162
+
+/* swap: not applicable */
+#define __NR_swapon             162
+#define __NR_swapoff            162
+
+/* umount2: not implemented */
+#define __NR_umount2            162
+
+/* settimeofday: not implemented */
+#define __NR_settimeofday       162
+
+/* sethostname / setdomainname: not implemented */
+#define __NR_sethostname        162
+#define __NR_setdomainname      162
+
+/* ioprio: not implemented */
+#define __NR_ioprio_set         162
+#define __NR_ioprio_get         162
+
+/* flock: not implemented */
+#define __NR_flock              162
+
+/* capget / capset: not implemented */
+#define __NR_capget             162
+#define __NR_capset             162
+
+/* unshare: not implemented */
+#define __NR_unshare            162
+
+/* setns: not implemented */
+#define __NR_setns              162
+
+/* keyctl: not implemented */
+#define __NR_add_key            162
+#define __NR_request_key        162
+#define __NR_keyctl             162
+
+/* perf_event_open: not implemented */
+#define __NR_perf_event_open    162
+
+/* BPF: not implemented */
+#define __NR_bpf                162
+
+/* io_uring: not implemented */
+#define __NR_io_uring_setup     162
+#define __NR_io_uring_enter     162
+#define __NR_io_uring_register  162
+
+/* rseq: not implemented */
+#define __NR_rseq               162
+
+/* landlock: not implemented */
+#define __NR_landlock_create_ruleset 162
+#define __NR_landlock_add_rule       162
+#define __NR_landlock_restrict_self  162
+
+/* close_range: not implemented */
+#define __NR_close_range        162
+
+/* pidfd_*: not implemented */
+#define __NR_pidfd_open         162
+#define __NR_pidfd_send_signal  162
+#define __NR_pidfd_getfd        162
+
+/* openat2: not implemented */
+#define __NR_openat2            162
+
+/* memfd_create: not implemented */
+#define __NR_memfd_create       162
+
+/* memfd_secret: not implemented */
+#define __NR_memfd_secret       162
+
+/* clone3: not implemented */
+#define __NR_clone3             162
+
+/* execveat: not implemented */
+#define __NR_execveat           162
+
+/* fanotify: not implemented */
+#define __NR_fanotify_init      162
+#define __NR_fanotify_mark      162
+
+/* name_to_handle_at / open_by_handle_at: not implemented */
+#define __NR_name_to_handle_at  162
+#define __NR_open_by_handle_at  162
+
+/* futex variants: redirect to core futex (63) */
+#define __NR_futex_waitv        63
+#define __NR_futex_wake         63
+#define __NR_futex_wait         63
+#define __NR_futex_requeue      63
+
+/* statmount / listmount / listns: not implemented */
+#define __NR_statmount          162
+#define __NR_listmount          162
+#define __NR_listns             162
+
+/* lsm_*: not implemented */
+#define __NR_lsm_get_self_attr  162
+#define __NR_lsm_set_self_attr  162
+#define __NR_lsm_list_modules   162
+
+/* file_getattr / file_setattr / open_tree_attr: not implemented */
+#define __NR_file_getattr       162
+#define __NR_file_setattr       162
+#define __NR_open_tree_attr     162
+
+/* open_tree / move_mount / fs*: not implemented */
+#define __NR_open_tree          162
+#define __NR_move_mount         162
+#define __NR_fsopen             162
+#define __NR_fsconfig           162
+#define __NR_fsmount            162
+#define __NR_fspick             162
+#define __NR_mount_setattr      162
+
+/* mseal / map_shadow_stack: not applicable */
+#define __NR_mseal              162
+#define __NR_map_shadow_stack   162
+
+/* cachestat: not implemented */
+#define __NR_cachestat          162
+
+/* kcmp: not implemented */
+#define __NR_kcmp               162
+
+/* finit_module / init_module / delete_module: not implemented */
+#define __NR_init_module        162
+#define __NR_delete_module      162
+#define __NR_finit_module       162
+
+/* kexec: not implemented */
+#define __NR_kexec_load         162
+#define __NR_kexec_file_load    162
+
+/* nfsservctl: not applicable */
+#define __NR_nfsservctl         162
+
+/* quotactl: not implemented */
+#define __NR_quotactl           162
+#define __NR_quotactl_fd        162
+
+/* lookup_dcookie: not applicable */
+#define __NR_lookup_dcookie     162
+
+/* acct: not implemented */
+#define __NR_acct               162
+
+/* syslog: not implemented */
+#define __NR_syslog             162
+
+/* personality: not implemented */
+#define __NR_personality        162
+
+/* IDs — setres*/
+#define __NR_setresuid          104
+#define __NR_getresuid          50
+#define __NR_setresgid          105
+#define __NR_getresgid          51
+#define __NR_setfsuid           104
+#define __NR_setfsgid           105
+#define __NR_setreuid           104
+#define __NR_setregid           105
+#define __NR_setgroups          162
+
+/* getcpu: not implemented */
+#define __NR_getcpu             162
+
+/* clock_adjtime / adjtimex: not implemented */
+#define __NR_clock_adjtime      162
+#define __NR_adjtimex           162
+
+/* seccomp: not implemented */
+#define __NR_seccomp            162
+
+/* userfaultfd: not implemented */
+#define __NR_userfaultfd        162
+
+/* membarrier: not implemented */
+#define __NR_membarrier         162
+
+/* io_* (aio): not implemented */
+#define __NR_io_setup           162
+#define __NR_io_destroy         162
+#define __NR_io_submit          162
+#define __NR_io_cancel          162
+#define __NR_io_getevents       162
+#define __NR_io_pgetevents      162
+
+/* mbind / get_mempolicy / set_mempolicy / migrate_pages / move_pages */
+#define __NR_mbind              162
+#define __NR_get_mempolicy      162
+#define __NR_set_mempolicy      162
+#define __NR_set_mempolicy_home_node 162
+#define __NR_migrate_pages      162
+#define __NR_move_pages         162
+
+/* recvmmsg / sendmmsg: not implemented */
+#define __NR_recvmmsg           162
+#define __NR_sendmmsg           162
+
+/* pkey_*: not implemented */
+#define __NR_pkey_mprotect      162
+#define __NR_pkey_alloc         162
+#define __NR_pkey_free          162
+
+/* process_madvise / process_mrelease: not implemented */
+#define __NR_process_madvise    162
+#define __NR_process_mrelease   162
+
+/* process_vm_readv / process_vm_writev: not implemented */
+#define __NR_process_vm_readv   162
+#define __NR_process_vm_writev  162
+
+/* restart_syscall: kernel internal, should never be called from userspace */
+#define __NR_restart_syscall    162
