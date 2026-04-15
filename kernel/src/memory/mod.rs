@@ -24,16 +24,28 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 static KERNEL_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
+// NOTE: these live in BSS.  A stack overflow can corrupt them — see start.S
+// for the boot stack size (must be large enough for the deepest call chain).
 
 /// Translate a kernel virtual address (in the kernel image mapping) to its
 /// physical address.  Returns 0 if called before `memory_init`.
 pub fn kernel_va_to_pa(va: u64) -> u64 {
-    let phys_base = KERNEL_PHYS_BASE.load(Ordering::Relaxed);
-    let virt_base = KERNEL_VIRT_BASE.load(Ordering::Relaxed);
+    let phys_base = KERNEL_PHYS_BASE.load(Ordering::SeqCst);
+    let virt_base = KERNEL_VIRT_BASE.load(Ordering::SeqCst);
     if virt_base == 0 {
         return 0;
     }
     phys_base + (va - virt_base)
+}
+
+/// Debug accessor for the stored kernel physical base.
+pub fn kernel_phys_base() -> u64 {
+    KERNEL_PHYS_BASE.load(Ordering::Relaxed)
+}
+
+/// Debug accessor for the stored kernel virtual base.
+pub fn kernel_virt_base() -> u64 {
+    KERNEL_VIRT_BASE.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +262,8 @@ pub unsafe fn memory_init(
 ) -> Result<(), MapError> {
     // Store for vdso_physical_address() and any other caller that needs to
     // translate kernel image virtual addresses to physical addresses.
-    KERNEL_PHYS_BASE.store(kernel_phys_base, Ordering::Relaxed);
-    KERNEL_VIRT_BASE.store(kernel_virt_base, Ordering::Relaxed);
+    KERNEL_PHYS_BASE.store(kernel_phys_base, Ordering::SeqCst);
+    KERNEL_VIRT_BASE.store(kernel_virt_base, Ordering::SeqCst);
 
     use physical::read_page_size;
     use virtual_memory::{

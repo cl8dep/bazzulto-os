@@ -467,38 +467,84 @@ pub fn print_dec(value: u64) {
 // Kernel panic screen — guaranteed framebuffer output with no heap/locks
 // ---------------------------------------------------------------------------
 
-/// Render a full-screen kernel panic banner on the framebuffer.
+/// Render a full-screen kernel panic banner on the framebuffer AND serial.
 ///
 /// Clears the display with a red background, prints a prominent "KERNEL PANIC"
 /// header, then prints `header` as the first line of context.
 ///
 /// Safe to call from any context: panic handlers, exception handlers, early boot.
-/// Uses `print_str` which accesses the `CONSOLE` static directly without any
-/// heap allocation or lock, so it works even after the allocator or scheduler
-/// have been corrupted.
-///
-/// Call `ConsoleWriter` with `write!` / `writeln!` afterward to print details.
+/// Writes directly to the framebuffer pixel buffer without any heap allocation
+/// or lock, so it works even after the allocator or scheduler have been
+/// corrupted.
 pub fn console_panic_screen(header: &str) {
-    // Set red background + bright white foreground, then clear the screen and
-    // home the cursor.  ESC[2J fills all cells with the current background
-    // color, so setting 41m first makes the entire screen red.
+    // Also send to serial for logging.
     print_str("\x1b[41m\x1b[97m\x1b[2J\x1b[H");
-
-    // Top banner — 64 characters wide to fill an 80-column terminal.
-    print_str(
-        "================================================================\n"
-    );
-    print_str(
-        "                      !! KERNEL PANIC !!                       \n"
-    );
-    print_str(
-        "================================================================\n"
-    );
-
-    // Switch to bright-white text on default (red) background for the message.
-    print_str("\x1b[97m\n");
+    print_str("================================================================\n");
+    print_str("                      !! KERNEL PANIC !!                       \n");
+    print_str("================================================================\n\n");
     print_str(header);
     print_str("\n");
+
+    // Render directly on the framebuffer.
+    unsafe {
+        let c = &*(&raw const CONSOLE);
+        if c.address.is_null() || c.width == 0 {
+            return; // Framebuffer not initialized yet.
+        }
+
+        const PANIC_RED: u32 = 0x00CC0000;
+        const PANIC_WHITE: u32 = 0x00FFFFFF;
+        const PANIC_DARK_RED: u32 = 0x00880000;
+
+        // Fill entire screen with red.
+        let total_pixels = c.rows * CHAR_HEIGHT * c.pitch_pixels;
+        for i in 0..total_pixels {
+            write_volatile(c.address.add(i), PANIC_RED);
+        }
+
+        // Save and set panic colors.
+        let saved_fg = c.current_fg;
+        let saved_bg = c.current_bg;
+        let c_mut = &mut *(&raw mut CONSOLE);
+        c_mut.current_fg = PANIC_WHITE;
+        c_mut.current_bg = PANIC_DARK_RED;
+
+        // Draw banner bar (3 rows of dark red background).
+        let banner_y = 2; // Start at row 2
+        fill_pixels(0, banner_y * CHAR_HEIGHT, c.width, 3 * CHAR_HEIGHT, PANIC_DARK_RED);
+
+        // Draw "!! KERNEL PANIC !!" centered on the banner.
+        let title = "!! KERNEL PANIC !!";
+        let title_col = (c.columns.saturating_sub(title.len())) / 2;
+        for (i, ch) in title.chars().enumerate() {
+            draw_glyph(ch as u32, title_col + i, banner_y + 1);
+        }
+
+        // Draw the message body below the banner.
+        c_mut.current_fg = PANIC_WHITE;
+        c_mut.current_bg = PANIC_RED;
+        let mut col = 2;
+        let mut row = banner_y + 5;
+        for ch in header.chars() {
+            if ch == '\n' {
+                col = 2;
+                row += 1;
+                if row >= c.rows { break; }
+                continue;
+            }
+            if col >= c.columns - 2 {
+                col = 2;
+                row += 1;
+                if row >= c.rows { break; }
+            }
+            draw_glyph(ch as u32, col, row);
+            col += 1;
+        }
+
+        // Restore colors (not strictly needed since we loop forever, but clean).
+        c_mut.current_fg = saved_fg;
+        c_mut.current_bg = saved_bg;
+    }
 }
 
 // ---------------------------------------------------------------------------

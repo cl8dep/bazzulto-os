@@ -17,6 +17,7 @@ const REQUIRED_DIRS: &[&str] = &[
     "/home/user",
     "/home/user/.bin",
     "/home/user/.lib",
+    "/system",
     "/system/lib",
     "/system/share",
     // IANA timezone database (TZif binary files, same layout as Linux/macOS).

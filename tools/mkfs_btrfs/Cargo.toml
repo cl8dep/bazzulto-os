@@ -1,0 +1,12 @@
+[package]
+name    = "mkfs_btrfs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mkfs_btrfs"
+path = "src/main.rs"
+
+[dependencies]
+crc32c = "0.6"
+uuid = { version = "1", features = ["v4"] }

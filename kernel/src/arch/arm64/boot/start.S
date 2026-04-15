@@ -36,9 +36,15 @@ _start:
     b .Lhalt
 
 
-// 16 KB kernel stack in BSS (zero-initialized, not in ELF file).
+// 64 KB kernel boot stack in BSS (zero-initialized, not in ELF file).
+//
+// 16 KiB was insufficient — the Btrfs driver's superblock parsing uses
+// ~3 KiB of stack per call (BtrfsSuperblock has a 2 KiB sys_chunk_array),
+// and nested function calls during mount pushed total usage past 16 KiB,
+// corrupting BSS statics below stack_bottom.  64 KiB matches the per-process
+// kernel stack size (KERNEL_STACK_SIZE in process/mod.rs).
 .section .bss
 .align 4        // 2^4 = 16-byte alignment — required by AAPCS64
 stack_bottom:
-    .space 16384
+    .space 65536
 stack_top:

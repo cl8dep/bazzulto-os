@@ -656,6 +656,73 @@ pub extern "C" fn kernel_main() -> ! {
             };
             let partitions = fs::partition::enumerate_partitions(disk, disk_index);
             for partition in partitions {
+                // ── Btrfs probe ─────────────────────────────────────────────
+                // Check for Btrfs superblock magic (_BHRfS_M at 64 KiB).
+                // Btrfs is the default root filesystem from v1.0 onward.
+                //
+                // Root selection: match the Btrfs volume label against the
+                // root= cmdline value (same as FAT32).  If root= is absent,
+                // fall back to label "BAZZULTO".
+                if fs::btrfs::btrfs_probe(&partition.disk, partition.start_lba) {
+                    let btrfs_root = match fs::btrfs::btrfs_mount(
+                        partition.disk.clone(), partition.start_lba
+                    ) {
+                        Some(root) => root,
+                        None => {
+                            uart::puts("[storage] Btrfs probe passed but mount failed — skipping\r\n");
+                            continue;
+                        }
+                    };
+
+                    // Determine if this Btrfs partition should be root.
+                    //
+                    // Match logic:
+                    // - root=BAZZULTO   → match by label (case-insensitive)
+                    // - root=UUID=...   → UUID is FAT32-specific, so fall back
+                    //                     to default label match ("BAZZULTO")
+                    // - root= absent    → match default label "BAZZULTO"
+                    let btrfs_label = fs::btrfs::btrfs_label(&*partition.disk, partition.start_lba);
+                    let is_root_candidate = if !root_mounted {
+                        match &btrfs_label {
+                            Some(vol_label) => {
+                                let is_uuid_root = root_label.map_or(false, |l|
+                                    l.len() > 5 && l[..5].eq_ignore_ascii_case(b"UUID="));
+                                if is_uuid_root || root_label.is_none() {
+                                    // UUID= is FAT32-specific or no root= at all:
+                                    // default to matching label "BAZZULTO".
+                                    vol_label == "BAZZULTO"
+                                } else if let Some(label) = root_label {
+                                    // root= is a plain label: match directly.
+                                    vol_label.as_bytes().eq_ignore_ascii_case(label)
+                                } else {
+                                    false
+                                }
+                            }
+                            None => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_root_candidate {
+                        unsafe { fs::vfs_mount("/", btrfs_root, &partition.device_path(), "btrfs"); }
+                        uart::puts("[storage] Btrfs mounted as / (label: ");
+                        if let Some(ref l) = btrfs_label {
+                            uart::puts(l);
+                        }
+                        uart::puts(")\r\n");
+                        root_mounted = true;
+                    } else {
+                        // Non-root Btrfs: defer until root is mounted.
+                        uart::puts("[storage] Btrfs partition deferred (label: ");
+                        if let Some(ref l) = btrfs_label {
+                            uart::puts(l);
+                        }
+                        uart::puts(")\r\n");
+                    }
+                    continue;
+                }
+
                 // ── BAFS probe ──────────────────────────────────────────────
                 // Check for BAFS magic before FAT32.  Any partition type may
                 // carry a BAFS filesystem (BAFS does not have a reserved MBR
@@ -698,7 +765,7 @@ pub extern "C" fn kernel_main() -> ! {
                 // - If root=UUID=XXXX-XXXX: match by FAT32 Volume Serial Number.
                 // - If root=LABEL:          match by volume label (fallback for
                 //                           development without a fixed UUID).
-                // - If root= absent:        mount the first FAT32 found as root.
+                // - If root= absent:        mount the first FAT32/Btrfs found as root.
                 let is_root_candidate = match root_label {
                     Some(label) => {
                         if let Some(target_uuid) = parse_uuid_root(label) {
@@ -738,7 +805,46 @@ pub extern "C" fn kernel_main() -> ! {
                     core::hint::spin_loop();
                 }
             }
-            uart::puts("[storage] WARNING: no FAT32 disk found — /system/bin/bzinit must be in ramfs\r\n");
+            uart::puts("[storage] WARNING: no Btrfs/FAT32 disk found — /system/bin/bzinit must be in ramfs\r\n");
+        }
+
+        // Second pass: mount deferred Btrfs partitions now that root is mounted.
+        // The first non-root Btrfs volume is mounted at /home/user.
+        if root_mounted {
+            let mut home_mounted = false;
+            for disk_index in 0..disk_count {
+                if home_mounted { break; }
+                let disk = match hal::disk::get_disk(disk_index) {
+                    Some(device) => device,
+                    None => continue,
+                };
+                let partitions = fs::partition::enumerate_partitions(disk, disk_index);
+                for partition in partitions {
+                    if home_mounted { break; }
+                    if !fs::btrfs::btrfs_probe(&partition.disk, partition.start_lba) {
+                        continue;
+                    }
+                    let btrfs_label = fs::btrfs::btrfs_label(&*partition.disk, partition.start_lba);
+                    let is_root = btrfs_label.as_deref() == Some("BAZZULTO");
+                    if is_root { continue; } // Skip the root partition.
+
+                    let btrfs_root = match fs::btrfs::btrfs_mount(
+                        partition.disk.clone(), partition.start_lba
+                    ) {
+                        Some(root) => root,
+                        None => continue,
+                    };
+                    unsafe {
+                        fs::vfs_mount("/home/user", btrfs_root, &partition.device_path(), "btrfs");
+                    }
+                    uart::puts("[storage] Btrfs mounted at /home/user (label: ");
+                    if let Some(ref l) = btrfs_label {
+                        uart::puts(l);
+                    }
+                    uart::puts(")\r\n");
+                    home_mounted = true;
+                }
+            }
         }
     }
     uart::puts("[storage] ready\r\n");
@@ -787,6 +893,14 @@ pub extern "C" fn kernel_main() -> ! {
             }
             Err(_) => {
                 uart::puts("FATAL: failed to spawn bzinit — system cannot boot\r\n");
+                crate::drivers::console::console_panic_screen(
+                    "Failed to spawn /system/bin/bzinit — system cannot boot.\n\
+                     \n\
+                     The root filesystem was mounted but bzinit could not be\n\
+                     loaded.  Verify that the disk image contains a valid ELF\n\
+                     at /system/bin/bzinit."
+                );
+                loop { core::hint::spin_loop(); }
             }
         }
     }

@@ -1,6 +1,7 @@
 // fs/mod.rs — File system modules.
 
 pub mod bafs_driver;
+pub mod btrfs;
 pub mod devfs;
 pub mod epoll;
 pub mod fat32;

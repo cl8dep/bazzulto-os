@@ -181,18 +181,31 @@ MKFATIMG_BIN := $(MKFATIMG)/target/release/mkfatimg
 $(MKFATIMG_BIN): $(MKFATIMG)/src/main.rs $(MKFATIMG)/Cargo.toml
 	$(CARGO) build --release --manifest-path $(MKFATIMG)/Cargo.toml
 
+MKBTRFS      := tools/mkfs_btrfs
+MKBTRFS_BIN  := $(MKBTRFS)/target/release/mkfs_btrfs
+
+$(MKBTRFS_BIN): $(MKBTRFS)/src/main.rs $(MKBTRFS)/Cargo.toml
+	$(CARGO) build --release --manifest-path $(MKBTRFS)/Cargo.toml
+
+# Root disk — 1 GiB Btrfs volume containing the entire system.
+# Btrfs is the default root filesystem from v1.0 onward.
 .PHONY: disk
-disk: bsl zoneinfo $(MKFATIMG_BIN)
-	$(MKFATIMG_BIN) disk.img 1024 --volume-id BA270001 $(DISK_FILES) $(BSL_DIRS) \
+disk: bsl zoneinfo $(MKBTRFS_BIN)
+	$(MKBTRFS_BIN) disk.img 1024 --label BAZZULTO $(DISK_FILES) $(BSL_DIRS) \
 	  TREE:$(BSL_SVC_DIR):/system/config/services \
 	  TREE:$(ZONEINFO_OUTDIR):/system/share/zoneinfo
 
-# Second disk — mounted at //home:user/ by bzinit.
-# Volume label BZZUTHOME distinguishes it from the root disk (BAZZULTO).
-# Volume ID BA270002 is distinct from the root disk (BA270001).
+# Second disk — 2 GiB Btrfs volume, mounted at /home/user by the kernel.
 .PHONY: disk2
-disk2: $(MKFATIMG_BIN)
-	$(MKFATIMG_BIN) disk2.img 2048 --volume-id BA270002 --label "BZZUTHOME  " DIR:/home DIR:/home/user
+disk2: $(MKBTRFS_BIN)
+	$(MKBTRFS_BIN) disk2.img 2048 --label BZZUTHOME DIR:/home DIR:/home/user
+
+# Legacy FAT32 disk targets — retained for ESP and backwards compatibility.
+.PHONY: disk-fat32
+disk-fat32: bsl zoneinfo $(MKFATIMG_BIN)
+	$(MKFATIMG_BIN) disk.img 1024 --volume-id BA270001 $(DISK_FILES) $(BSL_DIRS) \
+	  TREE:$(BSL_SVC_DIR):/system/config/services \
+	  TREE:$(ZONEINFO_OUTDIR):/system/share/zoneinfo
 
 # ---------------------------------------------------------------------------
 # ISO image — UEFI bootable via xorriso (cross-platform: Linux/macOS/Windows)
@@ -317,4 +330,5 @@ clean:
 	cd $(KERNEL_DIR) && $(CARGO) clean
 	$(CARGO) clean --manifest-path $(BSL_MANIFEST)
 	$(CARGO) clean --manifest-path $(MKFATIMG)/Cargo.toml
-	rm -f esp/bazzulto.elf disk.img $(ISO)
+	$(CARGO) clean --manifest-path $(MKBTRFS)/Cargo.toml
+	rm -f esp/bazzulto.elf disk.img disk2.img $(ISO)
