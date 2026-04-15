@@ -207,6 +207,16 @@ pub trait Inode: Send + Sync {
         false
     }
 
+    /// Return the IPC type discriminant and table index for this inode.
+    ///
+    /// Overridden by IPC inodes (semaphore=1, socket=2, mqueue=3) to expose
+    /// the table index for syscall handlers without encoding it in `nlinks`.
+    ///
+    /// Default returns `None` — non-IPC inodes do not have table indices.
+    fn ipc_table_index(&self) -> Option<(u8, usize)> {
+        None
+    }
+
     // --- Regular file operations ---
 
     /// Read bytes starting at `offset`.

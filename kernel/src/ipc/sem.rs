@@ -188,12 +188,12 @@ impl Inode for SemaphoreInode {
             size: 0,
             // S_IFCHR | 0o666 — character special file.
             mode: 0o020666,
-            // Repurpose nlinks to encode the semaphore table index with a
-            // type discriminant in the upper 32 bits (1 = semaphore) to avoid
-            // collisions with socket (2) and mqueue (3) inodes that use the
-            // same encoding.
-            nlinks: (1u64 << 32) | self.table_index as u64,
+            nlinks: 1,
         }
+    }
+
+    fn ipc_table_index(&self) -> Option<(u8, usize)> {
+        Some((1, self.table_index))
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
@@ -250,17 +250,10 @@ unsafe fn get_semaphore_table_index(fd: i32) -> Option<usize> {
     let guard = fd_table_arc.lock();
     let descriptor = guard.get(fd_index)?;
     if let crate::fs::vfs::FileDescriptor::InoFile { inode, .. } = descriptor {
-        // SemaphoreInode encodes its table index in the nlinks field and has
-        // inode_type() == CharDevice.  We validate the index is in range and
-        // that the table slot is occupied before trusting it, to guard against
-        // accidentally treating a real char device fd as a semaphore.
-        if inode.inode_type() == InodeType::CharDevice {
-            let stat = inode.stat();
-            // Decode: upper 32 bits = discriminant (1 = semaphore), lower 32 = index.
-            if (stat.nlinks >> 32) != 1 { return None; }
-            let candidate_index = (stat.nlinks & 0xFFFF_FFFF) as usize;
+        // Use the Inode trait's ipc_table_index() method instead of encoding
+        // the table index in nlinks. Discriminant 1 = semaphore.
+        if let Some((1, candidate_index)) = inode.ipc_table_index() {
             if candidate_index < SEMAPHORE_TABLE_SIZE {
-                // Validate the slot is actually occupied (semaphore exists).
                 let slot_occupied = unsafe {
                     with_semaphore_table(|table| table.entries[candidate_index].is_some())
                 };

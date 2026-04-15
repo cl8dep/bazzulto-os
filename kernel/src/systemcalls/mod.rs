@@ -206,6 +206,9 @@ pub mod numbers {
     pub const TIMER_DELETE:     u64 = 159;
     pub const SETITIMER:        u64 = 160;
     pub const GETITIMER:        u64 = 161;
+    // SCM_RIGHTS support — added in v0.3 (M2)
+    pub const SENDMSG:          u64 = 162;
+    pub const RECVMSG:          u64 = 163;
 }
 
 use numbers::*;
@@ -410,6 +413,75 @@ pub(crate) fn validate_user_pointer(ptr: u64, len: usize) -> bool {
     ptr >= PAGE_SIZE
         && end >= ptr                              // no overflow
         && end <= crate::process::USER_ADDR_LIMIT
+}
+
+/// Copy `kernel_dst.len()` bytes from user address `user_src` into `kernel_dst`.
+///
+/// Returns `Ok(())` on success or `Err(EFAULT)` if the pointer range is invalid.
+///
+/// This is the canonical way to read user memory from syscall handlers.
+/// All direct `core::slice::from_raw_parts(user_ptr, len)` patterns should be
+/// replaced with this function for consistency and security.
+///
+/// Reference: Linux `copy_from_user()` (arch/arm64/include/asm/uaccess.h).
+#[inline]
+pub(crate) unsafe fn copy_from_user(user_src: *const u8, kernel_dst: &mut [u8]) -> Result<(), i64> {
+    let len = kernel_dst.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if !validate_user_pointer(user_src as u64, len) {
+        return Err(EFAULT);
+    }
+    let src_slice = core::slice::from_raw_parts(user_src, len);
+    kernel_dst.copy_from_slice(src_slice);
+    Ok(())
+}
+
+/// Copy `kernel_src` bytes to user address `user_dst`.
+///
+/// Returns `Ok(())` on success or `Err(EFAULT)` if the pointer range is invalid.
+///
+/// This is the canonical way to write to user memory from syscall handlers.
+/// All direct `core::slice::from_raw_parts_mut(user_ptr, len)` patterns should
+/// be replaced with this function for consistency and security.
+///
+/// Reference: Linux `copy_to_user()` (arch/arm64/include/asm/uaccess.h).
+#[inline]
+pub(crate) unsafe fn copy_to_user(user_dst: *mut u8, kernel_src: &[u8]) -> Result<(), i64> {
+    let len = kernel_src.len();
+    if len == 0 {
+        return Ok(());
+    }
+    if !validate_user_pointer(user_dst as u64, len) {
+        return Err(EFAULT);
+    }
+    let dst_slice = core::slice::from_raw_parts_mut(user_dst, len);
+    dst_slice.copy_from_slice(kernel_src);
+    Ok(())
+}
+
+/// Read a single value of type T from user address space.
+///
+/// Returns `Ok(value)` or `Err(EFAULT)` if the pointer is invalid.
+#[inline]
+pub(crate) unsafe fn get_user<T: Copy>(user_ptr: *const T) -> Result<T, i64> {
+    if !validate_user_pointer(user_ptr as u64, core::mem::size_of::<T>()) {
+        return Err(EFAULT);
+    }
+    Ok(core::ptr::read_volatile(user_ptr))
+}
+
+/// Write a single value of type T to user address space.
+///
+/// Returns `Ok(())` or `Err(EFAULT)` if the pointer is invalid.
+#[inline]
+pub(crate) unsafe fn put_user<T: Copy>(user_ptr: *mut T, value: T) -> Result<(), i64> {
+    if !validate_user_pointer(user_ptr as u64, core::mem::size_of::<T>()) {
+        return Err(EFAULT);
+    }
+    core::ptr::write_volatile(user_ptr, value);
+    Ok(())
 }
 
 /// Copy a NUL-terminated string from user address space into `buf`.
@@ -644,6 +716,9 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             TIMER_DELETE     => posix_abi::sys_timer_delete(arg0 as i32),
             SETITIMER        => posix_abi::sys_setitimer(arg0 as i32, arg1, arg2),
             GETITIMER        => posix_abi::sys_getitimer(arg0 as i32, arg1),
+            // SCM_RIGHTS support (v0.3+)
+            SENDMSG          => crate::ipc::socket::sys_sendmsg(arg0 as i32, arg1, arg2 as i32),
+            RECVMSG          => crate::ipc::socket::sys_recvmsg(arg0 as i32, arg1, arg2 as i32),
             _          => ENOSYS,
         }
     };

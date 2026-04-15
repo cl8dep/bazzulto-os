@@ -142,6 +142,10 @@ impl SocketBuffer {
 // UnixSocket
 // ---------------------------------------------------------------------------
 
+/// Maximum number of file descriptors that can be passed in a single SCM_RIGHTS
+/// control message.  POSIX does not define a limit; Linux uses SCM_MAX_FD = 253.
+pub const SCM_MAX_FD: usize = 253;
+
 /// One entry in the global socket table.
 pub struct UnixSocket {
     /// Unique inode number assigned at creation.
@@ -156,6 +160,12 @@ pub struct UnixSocket {
     pub peer_index: Option<usize>,
     /// Incoming byte buffer (data sent by the peer, consumed by recv).
     pub receive_buffer: SocketBuffer,
+    /// Queued SCM_RIGHTS file descriptors awaiting recvmsg.
+    ///
+    /// Each entry is a batch of kernel-side fd indices (cloned from the sender)
+    /// that the next recvmsg call will install into the receiver's FdTable.
+    /// Entries are consumed FIFO.
+    pub ancillary_fds: VecDeque<Vec<crate::fs::vfs::FileDescriptor>>,
     /// Indices of server-side connected sockets waiting to be accepted.
     pub accept_queue: VecDeque<usize>,
     /// PIDs blocked in recv waiting for data.
@@ -177,6 +187,7 @@ impl UnixSocket {
             bound_path: None,
             peer_index: None,
             receive_buffer: SocketBuffer::new(SOCKET_BUFFER_SIZE),
+            ancillary_fds: VecDeque::new(),
             accept_queue: VecDeque::new(),
             receive_waiters: VecDeque::new(),
             accept_waiters: VecDeque::new(),
@@ -292,9 +303,12 @@ impl Inode for SocketInode {
             // We encode it identically to CharDevice (0o020666) for simplicity;
             // userspace in this kernel does not distinguish socket mode bits.
             mode: 0o020666,
-            // Repurpose nlinks to encode the socket table index with discriminant 2.
-            nlinks: (2u64 << 32) | self.table_index as u64,
+            nlinks: 1,
         }
+    }
+
+    fn ipc_table_index(&self) -> Option<(u8, usize)> {
+        Some((2, self.table_index))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
@@ -349,13 +363,9 @@ unsafe fn get_socket_table_index(fd: i32) -> Option<usize> {
     let guard = fd_table_arc.lock();
     let descriptor = guard.get(fd_index)?;
     if let crate::fs::vfs::FileDescriptor::InoFile { inode, .. } = descriptor {
-        if inode.inode_type() == InodeType::CharDevice {
-            let stat = inode.stat();
-            // Decode: upper 32 bits = discriminant (2 = socket), lower 32 = index.
-            if (stat.nlinks >> 32) != 2 { return None; }
-            let candidate_index = (stat.nlinks & 0xFFFF_FFFF) as usize;
+        // Use the Inode trait's ipc_table_index() method. Discriminant 2 = socket.
+        if let Some((2, candidate_index)) = inode.ipc_table_index() {
             if candidate_index < SOCKET_TABLE_SIZE {
-                // Validate the slot is actually occupied (socket exists).
                 let slot_occupied = unsafe {
                     with_socket_table(|table| table.entries[candidate_index].is_some())
                 };
@@ -776,20 +786,11 @@ pub unsafe fn sys_connect(sockfd: i32, addr_ptr: u64, addr_len: usize) -> i64 {
         Err(_) => return ECONNREFUSED,
     };
 
-    if server_inode.inode_type() != InodeType::CharDevice {
-        return ECONNREFUSED;
-    }
-
-    let server_stat = server_inode.stat();
-    // Decode discriminant (2 = socket) + index from nlinks.
-    if (server_stat.nlinks >> 32) != 2 {
-        return ECONNREFUSED;
-    }
-    let listening_index = (server_stat.nlinks & 0xFFFF_FFFF) as usize;
-
-    if listening_index >= SOCKET_TABLE_SIZE {
-        return ECONNREFUSED;
-    }
+    // Use ipc_table_index() to get the socket table index (discriminant 2 = socket).
+    let listening_index = match server_inode.ipc_table_index() {
+        Some((2, idx)) if idx < SOCKET_TABLE_SIZE => idx,
+        _ => return ECONNREFUSED,
+    };
 
     // Validate that the target is actually listening.
     let is_listening = with_socket_table(|table| {
@@ -1110,4 +1111,304 @@ pub unsafe fn sys_socketpair(
     *sv_out.add(1) = fd_b;
 
     0
+}
+
+// ---------------------------------------------------------------------------
+// SCM_RIGHTS — file descriptor passing over Unix domain sockets
+//
+// sendmsg(2): sender specifies fds in ancillary data (cmsg with
+// SOL_SOCKET / SCM_RIGHTS). The kernel duplicates each fd into an
+// in-kernel transfer buffer attached to the peer socket.
+//
+// recvmsg(2): receiver retrieves the fds — the kernel installs them
+// into the receiver's FdTable and writes the new fd numbers into the
+// ancillary data output buffer.
+//
+// Reference: POSIX.1-2017 §2.10.11, Linux unix(7), cmsg(3).
+// ---------------------------------------------------------------------------
+
+/// Linux ABI constants for ancillary data.
+const SOL_SOCKET: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+
+/// AArch64 ABI: `sizeof(struct cmsghdr)` = 16 bytes (cmsg_len: u64, cmsg_level: i32, cmsg_type: i32).
+const CMSGHDR_SIZE: usize = 16;
+
+/// sys_sendmsg(fd, msg_ptr, flags)
+///
+/// Sends data and optionally passes file descriptors via SCM_RIGHTS.
+///
+/// The user-space `struct msghdr` layout (AArch64 / Linux ABI):
+///   offset  0: *mut sockaddr  msg_name       (8 bytes, ignored for connected sockets)
+///   offset  8: u32            msg_namelen     (4 bytes)
+///   offset 12: [padding]                      (4 bytes)
+///   offset 16: *mut iovec     msg_iov         (8 bytes)
+///   offset 24: u64            msg_iovlen      (8 bytes)
+///   offset 32: *mut u8        msg_control     (8 bytes — ancillary data)
+///   offset 40: u64            msg_controllen  (8 bytes)
+///   offset 48: i32            msg_flags       (4 bytes, output-only on recv)
+///
+/// Total: 56 bytes.
+pub unsafe fn sys_sendmsg(fd: i32, msg_ptr: u64, _flags: i32) -> i64 {
+    use crate::systemcalls::validate_user_pointer;
+    const EBADF: i64 = -9;
+    const EFAULT: i64 = -14;
+    const EINVAL: i64 = -22;
+
+    const MSGHDR_SIZE: usize = 56;
+    if !validate_user_pointer(msg_ptr, MSGHDR_SIZE) {
+        return EFAULT;
+    }
+    let msg = msg_ptr as *const u8;
+
+    // Parse msg_iov and msg_iovlen to get the data payload.
+    let iov_ptr = core::ptr::read_unaligned(msg.add(16) as *const u64);
+    let iov_len = core::ptr::read_unaligned(msg.add(24) as *const u64) as usize;
+
+    // Gather the data from the iov array into a single buffer.
+    let mut data_buf: Vec<u8> = Vec::new();
+    if iov_len > 0 && iov_ptr != 0 {
+        // struct iovec { void *iov_base; size_t iov_len; } = 16 bytes each
+        if !validate_user_pointer(iov_ptr, iov_len * 16) {
+            return EFAULT;
+        }
+        for i in 0..iov_len {
+            let iov_entry = (iov_ptr as *const u8).add(i * 16);
+            let base = core::ptr::read_unaligned(iov_entry as *const u64);
+            let len = core::ptr::read_unaligned(iov_entry.add(8) as *const u64) as usize;
+            if len > 0 && base != 0 {
+                if !validate_user_pointer(base, len) {
+                    return EFAULT;
+                }
+                let slice = core::slice::from_raw_parts(base as *const u8, len);
+                data_buf.extend_from_slice(slice);
+            }
+        }
+    }
+
+    // Parse ancillary data (msg_control / msg_controllen) for SCM_RIGHTS.
+    let control_ptr = core::ptr::read_unaligned(msg.add(32) as *const u64);
+    let control_len = core::ptr::read_unaligned(msg.add(40) as *const u64) as usize;
+
+    let mut fds_to_pass: Vec<crate::fs::vfs::FileDescriptor> = Vec::new();
+
+    if control_len >= CMSGHDR_SIZE && control_ptr != 0 {
+        if !validate_user_pointer(control_ptr, control_len) {
+            return EFAULT;
+        }
+        // Walk the cmsg chain.  For v1.0 we only support a single cmsg.
+        let cmsg = control_ptr as *const u8;
+        let cmsg_len = core::ptr::read_unaligned(cmsg as *const u64) as usize;
+        let cmsg_level = core::ptr::read_unaligned(cmsg.add(8) as *const i32);
+        let cmsg_type = core::ptr::read_unaligned(cmsg.add(12) as *const i32);
+
+        // SECURITY: clamp cmsg_len to control_len to prevent out-of-bounds reads.
+        // A malicious user could set cmsg_len > control_len in the msghdr.
+        let cmsg_len = cmsg_len.min(control_len);
+
+        if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS && cmsg_len > CMSGHDR_SIZE {
+            let fd_data_len = cmsg_len - CMSGHDR_SIZE;
+            let fd_count = fd_data_len / 4; // each fd is an i32
+            if fd_count > SCM_MAX_FD {
+                return EINVAL;
+            }
+
+            // Duplicate each fd from the sender's FdTable.
+            let fd_table_arc = crate::scheduler::with_scheduler(|scheduler| {
+                scheduler.current_process()
+                    .map(|p| alloc::sync::Arc::clone(&p.file_descriptor_table))
+            });
+            let fd_table_arc = match fd_table_arc {
+                Some(arc) => arc,
+                None => return EBADF,
+            };
+            let guard = fd_table_arc.lock();
+
+            for i in 0..fd_count {
+                let passed_fd = core::ptr::read_unaligned(
+                    cmsg.add(CMSGHDR_SIZE + i * 4) as *const i32
+                );
+                if passed_fd < 0 {
+                    return EBADF;
+                }
+                match guard.get(passed_fd as usize) {
+                    Some(descriptor) => match descriptor.dup() {
+                        Some(duped) => fds_to_pass.push(duped),
+                        None => return EBADF,
+                    },
+                    None => return EBADF,
+                }
+            }
+        }
+    }
+
+    // Look up the socket and send data + ancillary fds to the peer.
+    let socket_index = match get_socket_table_index(fd) {
+        Some(idx) => idx,
+        None => return EBADF,
+    };
+
+    with_socket_table(|table| {
+        let peer_index = {
+            let socket = match &table.entries[socket_index] {
+                Some(s) => s,
+                None => return EBADF,
+            };
+            match socket.peer_index {
+                Some(pi) => pi,
+                None => return EINVAL, // not connected
+            }
+        };
+
+        let peer = match &mut table.entries[peer_index] {
+            Some(p) => p,
+            None => return EBADF,
+        };
+
+        // Write data into peer's receive buffer.
+        let written = if !data_buf.is_empty() {
+            peer.receive_buffer.write(&data_buf)
+        } else {
+            0
+        };
+
+        // Attach SCM_RIGHTS fds to the peer's ancillary queue.
+        if !fds_to_pass.is_empty() {
+            peer.ancillary_fds.push_back(fds_to_pass);
+        }
+
+        // Wake any blocked receivers.
+        if let Some(waiter_pid) = peer.receive_waiters.pop_front() {
+            crate::scheduler::with_scheduler(|scheduler| {
+                scheduler.make_ready(waiter_pid);
+            });
+        }
+
+        written as i64
+    })
+}
+
+/// sys_recvmsg(fd, msg_ptr, flags)
+///
+/// Receives data and optionally retrieves passed file descriptors.
+pub unsafe fn sys_recvmsg(fd: i32, msg_ptr: u64, _flags: i32) -> i64 {
+    use crate::systemcalls::validate_user_pointer;
+    const EBADF: i64 = -9;
+    const EFAULT: i64 = -14;
+
+    const MSGHDR_SIZE: usize = 56;
+    if !validate_user_pointer(msg_ptr, MSGHDR_SIZE) {
+        return EFAULT;
+    }
+    let msg = msg_ptr as *mut u8;
+
+    // Parse msg_iov.
+    let iov_ptr = core::ptr::read_unaligned(msg.add(16) as *const u64);
+    let iov_len = core::ptr::read_unaligned(msg.add(24) as *const u64) as usize;
+
+    let socket_index = match get_socket_table_index(fd) {
+        Some(idx) => idx,
+        None => return EBADF,
+    };
+
+    // Read data from socket's receive buffer into the iov.
+    let bytes_read = with_socket_table(|table| -> i64 {
+        let socket = match &mut table.entries[socket_index] {
+            Some(s) => s,
+            None => return EBADF,
+        };
+
+        let mut total_read: usize = 0;
+        if iov_len > 0 && iov_ptr != 0 {
+            if !validate_user_pointer(iov_ptr, iov_len * 16) {
+                return EFAULT;
+            }
+            for i in 0..iov_len {
+                let iov_entry = (iov_ptr as *const u8).add(i * 16);
+                let base = core::ptr::read_unaligned(iov_entry as *const u64);
+                let len = core::ptr::read_unaligned(iov_entry.add(8) as *const u64) as usize;
+                if len > 0 && base != 0 {
+                    if !validate_user_pointer(base, len) {
+                        return EFAULT;
+                    }
+                    let dst = core::slice::from_raw_parts_mut(base as *mut u8, len);
+                    total_read += socket.receive_buffer.read(dst);
+                }
+            }
+        }
+        total_read as i64
+    });
+
+    if bytes_read < 0 {
+        return bytes_read; // error from inner closure
+    }
+
+    // Install any SCM_RIGHTS fds from the ancillary queue into the receiver's FdTable
+    // and write them into msg_control.
+    let control_ptr = core::ptr::read_unaligned(msg.add(32) as *const u64);
+    let control_len = core::ptr::read_unaligned(msg.add(40) as *const u64) as usize;
+
+    let ancillary_fds = with_socket_table(|table| -> Option<Vec<crate::fs::vfs::FileDescriptor>> {
+        let socket = table.entries[socket_index].as_mut()?;
+        socket.ancillary_fds.pop_front()
+    });
+
+    if let Some(fds) = ancillary_fds {
+        // Install fds into receiver's FdTable.
+        let fd_table_arc = crate::scheduler::with_scheduler(|scheduler| {
+            scheduler.current_process()
+                .map(|p| alloc::sync::Arc::clone(&p.file_descriptor_table))
+        });
+
+        if let Some(arc) = fd_table_arc {
+            let mut guard = arc.lock();
+            let mut new_fds: Vec<i32> = Vec::with_capacity(fds.len());
+            for descriptor in fds {
+                let new_fd = guard.install(descriptor);
+                new_fds.push(new_fd);
+            }
+
+            // Write the cmsg header + fd array into msg_control if there's space.
+            let needed = CMSGHDR_SIZE + new_fds.len() * 4;
+            if control_ptr != 0 && control_len >= needed {
+                if validate_user_pointer(control_ptr, needed) {
+                    let out = control_ptr as *mut u8;
+                    // cmsg_len
+                    core::ptr::write_unaligned(out as *mut u64, needed as u64);
+                    // cmsg_level = SOL_SOCKET
+                    core::ptr::write_unaligned(out.add(8) as *mut i32, SOL_SOCKET);
+                    // cmsg_type = SCM_RIGHTS
+                    core::ptr::write_unaligned(out.add(12) as *mut i32, SCM_RIGHTS);
+                    // fd array
+                    for (i, &new_fd) in new_fds.iter().enumerate() {
+                        core::ptr::write_unaligned(
+                            out.add(CMSGHDR_SIZE + i * 4) as *mut i32,
+                            new_fd,
+                        );
+                    }
+                    // Update msg_controllen to actual bytes written.
+                    core::ptr::write_unaligned(
+                        (msg as *mut u8).add(40) as *mut u64,
+                        needed as u64,
+                    );
+                }
+            } else {
+                // No space for ancillary data — set controllen to 0.
+                core::ptr::write_unaligned(
+                    (msg as *mut u8).add(40) as *mut u64,
+                    0u64,
+                );
+            }
+        }
+    } else {
+        // No ancillary data — clear controllen.
+        if validate_user_pointer(msg_ptr + 40, 8) {
+            core::ptr::write_unaligned(
+                (msg as *mut u8).add(40) as *mut u64,
+                0u64,
+            );
+        }
+    }
+
+    bytes_read
 }

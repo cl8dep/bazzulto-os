@@ -203,6 +203,10 @@ abi_frozen!(TIMER_DELETE    == 159);
 abi_frozen!(SETITIMER       == 160);
 abi_frozen!(GETITIMER       == 161);
 
+// SCM_RIGHTS support (added in v0.3)
+abi_frozen!(SENDMSG         == 162);
+abi_frozen!(RECVMSG         == 163);
+
 // Verify the SVC encoding formula produces the correct instruction.
 const _: () = {
     let expected_svc_0 = 0xD4000001_u32; // svc #0

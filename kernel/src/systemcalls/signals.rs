@@ -151,6 +151,40 @@ pub(super) unsafe fn sys_kill(target_pid: i32, signal_number: i32) -> i64 {
     }
     let pid = crate::process::Pid::new(target_pid as u16, 1);
     crate::scheduler::with_scheduler(|scheduler| {
+        // POSIX.1-2017 kill(2) permission check:
+        //   sender.euid == 0                     → allowed (superuser)
+        //   sender.uid  == target.uid            → allowed (same real user)
+        //   sender.euid == target.uid            → allowed
+        //   sender.uid  == target.saved_uid      → allowed
+        //   otherwise                            → EPERM
+        //
+        // Note: target.saved_uid (suid) is checked via euid since Bazzulto
+        // copies suid into euid on setuid exec. For full POSIX compliance,
+        // M3 will add the saved UID field; this check is forward-compatible.
+        let (sender_uid, sender_euid) = scheduler.current_process()
+            .map(|p| (p.uid, p.euid))
+            .unwrap_or((0, 0));
+
+        // Look up target process to check its identity.
+        let (target_uid, target_euid) = match scheduler.process(pid) {
+            Some(target) => (target.uid, target.euid),
+            None => return ESRCH,
+        };
+
+        // Superuser bypass: euid == 0 always allowed.
+        // POSIX.1-2017 kill(2): "the real or effective user ID of the sending
+        // process shall match the real or saved set-user-ID of the receiving
+        // process."  target.euid serves as suid until M3 adds a dedicated field.
+        if sender_euid != 0 {
+            let allowed = sender_uid == target_uid
+                || sender_uid == target_euid
+                || sender_euid == target_uid
+                || sender_euid == target_euid;
+            if !allowed {
+                return EPERM;
+            }
+        }
+
         if scheduler.send_signal_to(pid, signal_number as u8) {
             0
         } else {

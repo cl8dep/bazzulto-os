@@ -236,9 +236,12 @@ impl Inode for MqueueInode {
             inode_number: self.inode_number,
             size: 0,
             mode: 0o020666,
-            // Repurpose nlinks to encode the queue table index with discriminant 3.
-            nlinks: (3u64 << 32) | self.table_index as u64,
+            nlinks: 1,
         }
+    }
+
+    fn ipc_table_index(&self) -> Option<(u8, usize)> {
+        Some((3, self.table_index))
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, FsError> {
@@ -289,11 +292,8 @@ unsafe fn get_queue_table_index(fd: i32) -> Option<usize> {
     let guard = fd_table_arc.lock();
     let descriptor = guard.get(fd_index)?;
     if let crate::fs::vfs::FileDescriptor::InoFile { inode, .. } = descriptor {
-        if inode.inode_type() == InodeType::CharDevice {
-            let stat = inode.stat();
-            // Decode: upper 32 bits = discriminant (3 = mqueue), lower 32 = index.
-            if (stat.nlinks >> 32) != 3 { return None; }
-            let candidate_index = (stat.nlinks & 0xFFFF_FFFF) as usize;
+        // Use the Inode trait's ipc_table_index() method. Discriminant 3 = mqueue.
+        if let Some((3, candidate_index)) = inode.ipc_table_index() {
             if candidate_index < MESSAGE_QUEUE_TABLE_SIZE {
                 let slot_occupied = unsafe {
                     with_message_queue_table(|table| {

@@ -112,7 +112,7 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
         // backing so we can act on it outside the scheduler lock.
         let region_info = crate::scheduler::with_scheduler(|scheduler| {
             scheduler.current_process().and_then(|process| {
-                process.mmap_regions.iter().find(|r| {
+                process.mmap_regions.values().find(|r| {
                     r.demand && page_va >= r.base && page_va < r.base + r.length
                 }).map(|r| (r.base, r.backing.clone()))
             })
@@ -175,7 +175,7 @@ pub unsafe fn handle_page_fault(fault_address: u64, iss: u32, is_data_abort: boo
         crate::uart::puts("\r\n");
         crate::scheduler::with_scheduler(|scheduler| {
             if let Some(process) = scheduler.current_process() {
-                for r in &process.mmap_regions {
+                for r in process.mmap_regions.values() {
                     if r.demand {
                         crate::uart::puts("  demand region: [");
                         crate::uart::put_hex(r.base);

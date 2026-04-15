@@ -109,7 +109,7 @@ fn procfs_process_maps(pid_index: u16) -> Option<ProcSnapshot> {
         let process = scheduler.process(pid)?;
 
         let mut text = String::new();
-        for region in &process.mmap_regions {
+        for region in process.mmap_regions.values() {
             let start = region.base;
             let end   = region.base.saturating_add(region.length);
             // Anonymous mappings: report as rw-p (readable, writable, not

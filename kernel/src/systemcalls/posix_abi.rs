@@ -92,22 +92,18 @@ pub unsafe fn sys_brk(new_brk: u64) -> i64 {
             }
             process.brk_current = new_brk;
             // Register or grow the anonymous demand region for the heap.
-            let heap_region_exists = process.mmap_regions.iter()
-                .any(|r| r.base == process.brk_base);
-            if !heap_region_exists {
-                process.mmap_regions.push(crate::process::MmapRegion {
-                    base:   process.brk_base,
-                    length: new_brk - process.brk_base,
-                    demand: true,
-                    backing: crate::process::MmapBacking::Anonymous,
-                });
+            let brk_base = process.brk_base;
+            if let Some(r) = process.mmap_regions.get_mut(&brk_base) {
+                r.length = new_brk - brk_base;
             } else {
-                for r in process.mmap_regions.iter_mut() {
-                    if r.base == process.brk_base {
-                        r.length = new_brk - process.brk_base;
-                        break;
-                    }
-                }
+                let region = crate::process::MmapRegion {
+                    base:   brk_base,
+                    length: new_brk - brk_base,
+                    demand: true,
+                    shared: false,
+                    backing: crate::process::MmapBacking::Anonymous,
+                };
+                process.mmap_regions.insert(brk_base, region);
             }
             new_brk as i64
         } else {

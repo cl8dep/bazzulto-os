@@ -535,12 +535,14 @@ pub unsafe fn spawn_from_ramfs(
 
     // Register the demand-paged stack region.  The top page is already mapped
     // (it holds argv/envp); the rest of the range will be faulted in on access.
-    child.mmap_regions.push(crate::process::MmapRegion {
+    let stack_region = crate::process::MmapRegion {
         base:   loaded.stack_demand_base,
         length: loaded.stack_demand_top - loaded.stack_demand_base,
         demand: true,
+        shared: false,
         backing: crate::process::MmapBacking::Anonymous,
-    });
+    };
+    child.mmap_regions.insert(loaded.stack_demand_base, stack_region);
 
     // Build the initial ExceptionFrame on the child's kernel stack.
     use crate::arch::arm64::exceptions::ExceptionFrame;
@@ -610,12 +612,14 @@ pub unsafe fn spawn_from_vfs(
     child.page_table = Some(page_table_box);
 
     // Register the demand-paged stack region.
-    child.mmap_regions.push(crate::process::MmapRegion {
+    let stack_region = crate::process::MmapRegion {
         base:   loaded.stack_demand_base,
         length: loaded.stack_demand_top - loaded.stack_demand_base,
         demand: true,
+        shared: false,
         backing: crate::process::MmapBacking::Anonymous,
-    });
+    };
+    child.mmap_regions.insert(loaded.stack_demand_base, stack_region);
 
     use crate::arch::arm64::exceptions::ExceptionFrame;
     let frame_ptr = (child.kernel_stack.top as usize

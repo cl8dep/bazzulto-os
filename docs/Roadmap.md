@@ -157,89 +157,60 @@ Assign `[RESERVED]` to any remaining entries that currently return `ENOSYS` and 
 
 **Goal:** Resolve every item in `docs/debts/SECURITY_DEBT.md`, `docs/debts/MEMORY_DEBT.md`, and `docs/debts/KERNEL_MISC_DEBT.md` that is in scope for v1.0.
 
-### Tasks
+### Already complete (verified in codebase)
+
+The following were listed as M2 tasks but are already implemented. They are retained here as documentation of what was audited and confirmed working.
+
+- **Kernel stack guard pages** — `KernelStack::allocate()` in `kernel/src/process/mod.rs` already unmaps a 4 KiB guard page below the 64 KiB stack. EL1 translation fault on that page produces a panic.
+- **ASLR entropy pool** — `read_aslr_entropy()` in `kernel/src/loader/mod.rs` uses CNTPCT_EL0, CNTFRQ_EL0, TTBR1_EL1, and a monotonic call counter, mixed through xorshift64. Already exceeds the original task spec.
+- **`select()` syscall** — Full implementation in `kernel/src/systemcalls/multiplexing.rs` (~160 lines). Supports fd_set bitmasks, blocking/non-blocking/timeout modes. `[STABLE]`.
+- **FdTable thread sharing** — `Arc<SpinLock<FileDescriptorTable>>` in `Process`. `fork()` deep-clones, `clone(CLONE_THREAD)` shares the Arc. Already correct.
+- **`CLOCK_REALTIME` wall clock** — PL031 RTC boot snapshot in `kernel/src/platform/qemu_virt/rtc.rs`, combined with elapsed monotonic ticks. vDSO fast path reads CNTPCT_EL0 + boot_rtc_seconds from data page.
+- **`/proc/self` symlink** — Dynamic symlink in `kernel/src/fs/procfs.rs` resolving to `/proc/<current_pid>`. Per-PID directories with `status`, `maps`, `comm`. `/proc/meminfo`, `/proc/cpuinfo`, `/proc/uptime` also present.
+- **`SIGALRM` / `alarm()`** — `alarm_deadline_tick` in Process struct. `sys_alarm()` sets tick deadline. Scheduler tick handler on CPU 0 scans and delivers SIGALRM.
+
+### Tasks (remaining)
 
 **2.1 — `copy_from_user` / `copy_to_user`** (SECURITY_DEBT §3)
 
-Define `USER_SPACE_END: usize = 0x0000_FFFF_FFFF_F000`. Implement two functions in `kernel/src/systemcalls/`:
+The kernel has `validate_user_pointer(ptr, len) -> bool` in `kernel/src/systemcalls/mod.rs` which checks `ptr >= PAGE_SIZE`, no overflow, and `end <= USER_ADDR_LIMIT`. Most handlers already use it, but some (e.g. `sys_clock_gettime`, `sys_nanosleep`) do manual ad-hoc checks. Formalize into two canonical helpers:
 
 ```rust
-fn copy_from_user(user_src: usize, len: usize, kernel_dst: &mut [u8]) -> Result<(), Errno>
-fn copy_to_user(user_dst: usize, kernel_src: &[u8]) -> Result<(), Errno>
+fn copy_from_user(user_src: *const u8, len: usize, kernel_dst: &mut [u8]) -> Result<(), Errno>
+fn copy_to_user(user_dst: *mut u8, kernel_src: &[u8]) -> Result<(), Errno>
 ```
 
-Validation: `user_src + len` must not overflow and must be `<= USER_SPACE_END`. The range `[user_src, user_src+len)` must be present in the current process's VMA (call `vma_contains_range()`). Return `EFAULT` on any violation. Replace every direct user-pointer dereference in all syscall handlers with these helpers.
+Both must call `validate_user_pointer()` and return `EFAULT` on violation. Audit and replace every ad-hoc pointer validation in syscall handlers with these helpers for consistency.
 
-**2.2 — Kernel stack guard pages** (MEMORY_DEBT §5)
+**2.2 — VMA: Vec → BTreeMap** (MEMORY_DEBT implicit)
 
-In `kernel/src/process/`, after allocating the 16 KiB kernel stack for a new process or kernel thread, unmap the page immediately below the stack base using `virtual_memory_unmap(stack_base - PAGE_SIZE)`. On EL1 translation fault from that address, the exception handler must print a stack-overflow panic with the faulting PID and halt.
+In `kernel/src/process/`, replace `Vec<MmapRegion>` (flat list, max 1024) with `BTreeMap<u64, MmapRegion>` keyed by region start address. Update `find_vma(addr)` to use `range(..=addr).next_back()` with an overlap check. Update insertions (`insert`) and removals (`remove`). Maximum VMA count: 4096 regions. Enforce at mmap time with `ENOMEM`.
 
-**2.3 — ASLR entropy pool** (MEMORY_DEBT §6)
-
-In `kernel/src/memory/`, replace the single `CNTPCT_EL0` seed with a 64-bit pool register initialized from:
-`pool = CNTPCT_EL0 ^ (MIDR_EL1 << 17) ^ (kernel_stack_physical_address >> 3) ^ tick_count_at_first_irq`
-
-Each call to `aslr_next() -> u64` applies one xorshift64 step (using polynomial `x^64 + x^4 + x^3 + x + 1`) and XORs in a fresh `CNTPCT_EL0` read before returning. Use this for all ASLR offsets: stack, mmap base, vDSO, shared library load bases.
-
-**2.4 — VMA: Vec → BTreeMap** (MEMORY_DEBT implicit)
-
-In `kernel/src/process/`, replace `Vec<VmaRegion>` with `BTreeMap<VirtAddr, VmaRegion>` keyed by region start address. Update `find_vma(addr)` to use `range(..=addr).next_back()` with an overlap check. Update insertions (`insert`) and removals (`remove`). Maximum VMA count: 4096 regions. Enforce at mmap time with `ENOMEM`.
-
-**2.5 — `select()` syscall** (KERNEL_MISC_DEBT §1)
-
-Implement `sys_select(nfds, readfds, writefds, exceptfds, timeout)` in `kernel/src/systemcalls/multiplexing.rs`. `fd_set` is a 128-byte bitmask (1024 bits). Convert the bitmask to an epoll interest set, call into the existing epoll readiness logic, and translate results back to the three `fd_set` outputs. `timeout == NULL` means block indefinitely. `timeout.tv_sec == 0 && timeout.tv_usec == 0` means poll immediately and return. Return the total count of ready fds, or 0 on timeout. Set `[STABLE]` in the ABI table after this task.
-
-**2.6 — FdTable thread sharing** (KERNEL_MISC_DEBT §4)
-
-Wrap the `FdTable` in `Arc<Mutex<FdTable>>` inside the `Process` struct. In `sys_fork()`: deep-clone the FdTable contents into a new `Arc` (parent and child get independent copies). In `sys_clone()` with `CLONE_FILES` set: clone only the `Arc` pointer (parent and child share the same `FdTable`). Without `CLONE_FILES`: behave like fork. Update all syscall handlers that access the FdTable to lock through the `Arc`.
-
-**2.7 — `CLOCK_REALTIME` wall clock** (KERNEL_MISC_DEBT §8)
-
-During `kernel_main()` init, read the PL031 RTC Data Register (`DR`) at MMIO base `0x09010000 + 0x000`. Store `rtc_boot_epoch_seconds: u64` and `rtc_boot_cntpct: u64`. In `sys_clock_gettime(CLOCK_REALTIME)`:
-```
-elapsed_seconds = (CNTPCT_EL0 - rtc_boot_cntpct) / CNTFRQ_EL0
-result.tv_sec   = rtc_boot_epoch_seconds + elapsed_seconds
-result.tv_nsec  = remainder in nanoseconds
-```
-
-**2.8 — `/proc/self` symlink** (KERNEL_MISC_DEBT §5)
-
-Add `InodeType::Symlink` to the VFS inode trait. Implement `readlink() -> Vec<u8>` on symlink inodes. In procfs, create `/proc/self` as a magic symlink whose `readlink()` returns the ASCII-decimal PID of the calling process (resolved dynamically per-call). Add `/proc/self/exe` (symlink to the binary path), `/proc/self/fd/` (directory of fd→path symlinks), `/proc/self/maps` (text file: one VMA region per line, format: `start-end rwxp offset 00:00 0 [description]`).
-
-**2.9 — `SIGALRM` / `alarm()`** (KERNEL_MISC_DEBT §3)
-
-Add `alarm_deadline: Option<u64>` (CNTPCT_EL0 ticks) to `Process`. Implement `sys_alarm(seconds: u32) -> u32`: compute deadline; return remaining time from prior alarm; `seconds=0` cancels. In the per-tick scheduler handler, scan all processes: if `CNTPCT_EL0 >= alarm_deadline`, deliver `SIGALRM` and clear the deadline.
-
-**2.10 — `SCM_RIGHTS` fd passing** (KERNEL_MISC_DEBT §2)
+**2.3 — `SCM_RIGHTS` fd passing** (KERNEL_MISC_DEBT §2)
 
 Implement ancillary data for `sendmsg(2)` / `recvmsg(2)`. Define `struct cmsghdr` layout (identical to Linux ABI). For `SOL_SOCKET` / `SCM_RIGHTS`: sender duplicates each listed fd into a kernel transfer buffer attached to the socket message. Receiver installs each fd from the buffer into its own FdTable and returns the new fds in `recvmsg` ancillary data. Limit: 253 fds per message.
 
-**2.11 — `MAP_SHARED` anonymous regions** (MEMORY_DEBT §2)
+**2.4 — `MAP_SHARED` file-backed regions** (MEMORY_DEBT §2)
 
-In `sys_mmap()` with `MAP_SHARED | MAP_ANONYMOUS`: mark the VMA as shared. Allocate physical pages as normal. In `cow_copy_user()` during `fork()`, skip CoW marking for shared VMAs — both parent and child map to the same physical pages with write permission intact. For `MAP_SHARED` file-backed regions: on page fault write, call the inode's `write_page()` method to flush the dirty page to the backing file.
+Anonymous `MAP_SHARED` works via `SHARED_REGION_TABLE`. The `shared` flag has been added to `MmapRegion` and is set correctly on mmap. File-backed `MAP_SHARED` demand-pages are read from the inode correctly via the page fault handler. Remaining work: add a `PageTable::remap_range_writable()` method to un-CoW shared region pages after `fork()`, and implement writeback (flush dirty shared pages to inode on `msync`/`munmap`). This requires coordinated changes to the MMU code, fork path, and page fault handler — deferred to a dedicated sub-task to avoid risk to the fork correctness.
 
-**2.12 — BAFS `truncate()` extent freeing** (MEMORY_DEBT §2 / BAFS)
-
-Fix `truncate()` in `kernel/src/fs/bafs/`: when `new_size < old_size`, walk the extent B-tree from `new_size` forward, return all blocks in fully-beyond-EOF extents to the block allocator free list, and remove those extent entries from the B-tree. Validate: create a 16 MiB file, truncate to 0, verify the free block count is restored to its pre-creation value.
-
-**2.13 — `kill()` permission enforcement** (SECURITY_DEBT §4)
+**2.5 — `kill()` permission enforcement** (SECURITY_DEBT §4)
 
 In `sys_kill()`: before delivering a signal, check: `sender.euid == 0 OR sender.uid == target.uid OR sender.euid == target.uid OR sender.uid == target.saved_uid`. Return `EPERM` if none match. Special case: `kill(-1, sig)` sends to all processes for which permission holds. (UID fields are added in M3; for M2, gate this check on a `kernel_has_uid_support` flag that M3 will enable.)
 
-**2.14 — IPC inode `nlinks` field collision** (KERNEL_MISC_DEBT §7)
+**2.6 — IPC inode `nlinks` field collision** (KERNEL_MISC_DEBT §7)
 
-In `SemaphoreInode`, `SocketInode`, and `MqueueInode`: replace the use of `nlinks` as a table index with a dedicated `table_index: u32` field. Set `nlinks = 1` in all IPC inodes.
+In `SemaphoreInode`, `SocketInode`, and `MqueueInode`: the `nlinks` field in `InodeStat` is repurposed as a table index with type discriminants encoded in the upper 32 bits (`1=sem`, `2=socket`, `3=mqueue`). This violates POSIX stat semantics. Fix: each inode already has a `table_index: usize` field — use it directly for lookups instead of encoding/decoding through `nlinks`. Set `nlinks = 1` in all IPC inode `stat()` methods.
 
-**2.15 — Slab allocator per-slab capacity** (MEMORY_DEBT §4)
+**2.7** Tag commit `v0.3-kernel-correctness`.
 
-In `kernel/src/memory/heap.rs`, replace the fixed 64-objects-per-slab constant with:
-`capacity = (arena_size / object_size).next_power_of_two() / 2`
-Ensure capacity is at least 1 for any object size ≤ arena_size.
-
-**2.16** Tag commit `v0.3-kernel-correctness`.
+> **Note:** The slab allocator task originally listed here (fixed capacity per slab)
+> does not apply — the allocator already uses dynamic freelists per size class with
+> no fixed capacity constant. Each slot is individually allocated from the first-fit
+> heap on demand.
 
 ### Exit criteria
-All 15 items individually testable via QEMU. `select()` returns correct fd count. `CLOCK_REALTIME` reports real wall time. SIGALRM fires within 100 ms of deadline. SCM_RIGHTS passes an fd across a Unix socket boundary. Writing to a kernel stack guard page produces a fault instead of silent corruption.
+All 7 remaining items individually testable via QEMU. SCM_RIGHTS passes an fd across a Unix socket boundary. `kill()` from uid=1000 to uid=0 returns `EPERM`. IPC inodes report `nlinks=1` in stat output.
 
 ---
 

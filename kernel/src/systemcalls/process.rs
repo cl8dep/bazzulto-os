@@ -141,12 +141,14 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
         // Install the new page table.
         child.page_table = Some(loaded_page_table);
         // Register the demand-paged stack region.
-        child.mmap_regions.push(crate::process::MmapRegion {
+        let stack_region = crate::process::MmapRegion {
             base:   loaded.stack_demand_base,
             length: loaded.stack_demand_top - loaded.stack_demand_base,
             demand: true,
+            shared: false,
             backing: crate::process::MmapBacking::Anonymous,
-        });
+        };
+        child.mmap_regions.insert(loaded.stack_demand_base, stack_region);
         // Grant requested capabilities (already validated above).
         child.capabilities = capability_mask;
         // Inherit the parent's environment.
@@ -528,12 +530,14 @@ pub(super) unsafe fn sys_exec(
             process.mmap_next_va = crate::process::MMAP_USER_BASE;
             process.mmap_regions.clear();
             // Register the demand-paged stack region for the new image.
-            process.mmap_regions.push(crate::process::MmapRegion {
+            let stack_region = crate::process::MmapRegion {
                 base:   loaded.stack_demand_base,
                 length: loaded.stack_demand_top - loaded.stack_demand_base,
                 demand: true,
+                shared: false,
                 backing: crate::process::MmapBacking::Anonymous,
-            });
+            };
+            process.mmap_regions.insert(loaded.stack_demand_base, stack_region);
 
             // Apply Binary Permission Model tier result.
             // Tier 1/4: replace both sets.

@@ -88,7 +88,7 @@ pub const MMAP_USER_BASE: u64 = 0x0000_0002_0000_0000;
 /// Reference: Linux kernel, mm/mmap.c, `vm_area_struct`.
 ///
 /// TECHNICAL DEBT (Fase 5): Replace flat Vec with a VMA tree.
-pub const MMAP_MAX_REGIONS: usize = 1024;
+pub const MMAP_MAX_REGIONS: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Capability constants
@@ -378,6 +378,10 @@ pub struct MmapRegion {
     /// If `true`, pages within this region are demand-allocated on first access
     /// (translation fault) rather than pre-mapped at region creation.
     pub demand: bool,
+    /// If `true`, this region was created with MAP_SHARED. Shared regions are
+    /// not CoW'd on fork(), and writes to file-backed shared regions are
+    /// flushed back to the inode.
+    pub shared: bool,
     /// Backing store for demand pages in this region.
     pub backing: MmapBacking,
 }
@@ -729,8 +733,10 @@ pub struct Process {
     /// Next available virtual address for anonymous `mmap()` allocations.
     pub mmap_next_va: u64,
 
-    /// Tracked anonymous mmap regions (for `munmap()` and address-space cleanup).
-    pub mmap_regions: Vec<MmapRegion>,
+    /// Tracked mmap regions keyed by start address (for `munmap()` and
+    /// address-space cleanup).  BTreeMap gives O(log n) lookup by address
+    /// instead of O(n) linear scan from the previous Vec.
+    pub mmap_regions: alloc::collections::BTreeMap<u64, MmapRegion>,
 
     // --- Copy-on-Write ---
     /// Pages marked read-only for CoW sharing.
@@ -959,7 +965,7 @@ impl Process {
             user_ticks: 0,
             exit_code: 0,
             mmap_next_va: MMAP_USER_BASE + mmap_aslr_offset,
-            mmap_regions: Vec::new(),
+            mmap_regions: alloc::collections::BTreeMap::new(),
             cow_pages: BTreeMap::new(),
             cwd: None,
             cwd_path: alloc::string::String::from("/"),

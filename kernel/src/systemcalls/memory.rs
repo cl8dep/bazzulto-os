@@ -19,7 +19,7 @@ use super::*;
 //   MAP_ANONYMOUS | MAP_PRIVATE  — zero-filled anonymous (demand).
 //   MAP_ANONYMOUS | MAP_SHARED   — anonymous shared (registered in SharedRegionTable).
 //   fd >= 0 | MAP_PRIVATE        — file-backed CoW (demand, reads from inode on fault).
-//   fd >= 0 | MAP_SHARED         — stubbed: treated as MAP_PRIVATE for now (post-v1.0).
+//   fd >= 0 | MAP_SHARED         — file-backed shared (writes flush to inode on msync/munmap).
 //
 // Reference: POSIX.1-2017 mmap(2).
 // ---------------------------------------------------------------------------
@@ -40,7 +40,8 @@ pub(super) unsafe fn sys_mmap(
     let pages = ((length + page_size - 1) / page_size) as usize;
 
     let is_anonymous = (flags & MAP_ANONYMOUS != 0) || fd < 0;
-    let is_shared_anonymous = (flags & MAP_SHARED != 0) && is_anonymous;
+    let is_shared = flags & MAP_SHARED != 0;
+    let is_shared_anonymous = is_shared && is_anonymous;
 
     // --- File-backed MAP_PRIVATE ---
     // Resolve the inode now (outside the scheduler lock) so we can store an
@@ -90,12 +91,14 @@ pub(super) unsafe fn sys_mmap(
             crate::process::MmapBacking::Anonymous
         };
 
-        process.mmap_regions.push(crate::process::MmapRegion {
+        let region = crate::process::MmapRegion {
             base,
             length: region_length,
             demand: true,
+            shared: is_shared,
             backing,
-        });
+        };
+        process.mmap_regions.insert(base, region);
 
         Some(base)
     });

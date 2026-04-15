@@ -20,34 +20,28 @@ pub(super) unsafe fn sys_clock_gettime(clock_id: i32, timespec_ptr: *mut u64) ->
     if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
         return EINVAL;
     }
-    if timespec_ptr.is_null() || (timespec_ptr as u64) >= crate::process::USER_ADDR_LIMIT {
-        return EINVAL;
-    }
 
     // struct timespec { time_t tv_sec; long tv_nsec; } — two 8-byte words.
-    match clock_id {
+    let (seconds, nanoseconds) = match clock_id {
         CLOCK_MONOTONIC => {
             // Read hardware counter and frequency for nanosecond-precision monotonic time.
             let cntpct: u64;
             let cntfrq: u64;
             core::arch::asm!("mrs {}, cntpct_el0", out(reg) cntpct, options(nostack, nomem));
             core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nostack, nomem));
-            let seconds     = cntpct / cntfrq;
-            let nanoseconds = (cntpct % cntfrq) * 1_000_000_000 / cntfrq;
-            *timespec_ptr        = seconds;
-            *timespec_ptr.add(1) = nanoseconds;
+            (cntpct / cntfrq, (cntpct % cntfrq) * 1_000_000_000 / cntfrq)
         }
         CLOCK_REALTIME => {
             // Use PL031-derived wall clock: boot-time epoch + elapsed ticks.
             let tick = crate::platform::qemu_virt::timer::current_tick();
             let tick_ms = crate::platform::qemu_virt::timer::TICK_INTERVAL_MS;
-            let (seconds, nanoseconds) =
-                crate::platform::qemu_virt::rtc::realtime_now(tick, tick_ms);
-            *timespec_ptr        = seconds;
-            *timespec_ptr.add(1) = nanoseconds;
+            crate::platform::qemu_virt::rtc::realtime_now(tick, tick_ms)
         }
         _ => return EINVAL,
-    }
+    };
+
+    if let Err(e) = put_user(timespec_ptr, seconds) { return e; }
+    if let Err(e) = put_user(timespec_ptr.add(1), nanoseconds) { return e; }
     0
 }
 
@@ -62,12 +56,14 @@ pub(super) unsafe fn sys_clock_gettime(clock_id: i32, timespec_ptr: *mut u64) ->
 ///
 /// Reference: POSIX.1-2017 nanosleep(2).
 pub(super) unsafe fn sys_nanosleep(timespec_ptr: *const u64, rmtp: *mut u64) -> i64 {
-    if timespec_ptr.is_null() || (timespec_ptr as u64) >= crate::process::USER_ADDR_LIMIT {
-        return EINVAL;
-    }
-
-    let seconds = *timespec_ptr;
-    let nanoseconds = *timespec_ptr.add(1);
+    let seconds = match get_user(timespec_ptr) {
+        Ok(v) => v,
+        Err(_) => return EINVAL,
+    };
+    let nanoseconds = match get_user(timespec_ptr.add(1)) {
+        Ok(v) => v,
+        Err(_) => return EINVAL,
+    };
 
     // Convert the requested duration to kernel ticks.
     // One tick = TICK_INTERVAL_MS milliseconds = TICK_INTERVAL_MS * 1_000_000 ns.
@@ -116,15 +112,14 @@ pub(super) unsafe fn sys_nanosleep(timespec_ptr: *const u64, rmtp: *mut u64) -> 
     if has_pending_signal {
         let woke_at = crate::platform::qemu_virt::timer::current_tick();
         // Write remaining time into *rmtp if the pointer is valid.
-        if !rmtp.is_null() && (rmtp as u64) < crate::process::USER_ADDR_LIMIT
-            && (rmtp as u64).saturating_add(16) <= crate::process::USER_ADDR_LIMIT
-        {
+        if !rmtp.is_null() {
             let remaining_ticks = wake_at_tick.saturating_sub(woke_at);
             let remaining_ns = remaining_ticks.saturating_mul(tick_interval_ns);
             let remaining_secs = remaining_ns / 1_000_000_000;
             let remaining_nsec = remaining_ns % 1_000_000_000;
-            *rmtp = remaining_secs;
-            *rmtp.add(1) = remaining_nsec;
+            // Best-effort write; ignore EFAULT on rmtp (POSIX allows this).
+            let _ = put_user(rmtp, remaining_secs);
+            let _ = put_user(rmtp.add(1), remaining_nsec);
         }
         return EINTR;
     }
@@ -139,23 +134,23 @@ pub(super) unsafe fn sys_nanosleep(timespec_ptr: *const u64, rmtp: *mut u64) -> 
 // ---------------------------------------------------------------------------
 
 pub(super) unsafe fn sys_gettimeofday(tv_ptr: *mut u64, tz_ptr: u64) -> i64 {
-    if !tv_ptr.is_null() && (tv_ptr as u64) < crate::process::USER_ADDR_LIMIT {
+    if !tv_ptr.is_null() {
         let tick    = crate::platform::qemu_virt::timer::current_tick();
         let tick_ms = crate::platform::qemu_virt::timer::TICK_INTERVAL_MS;
         let (seconds, nanoseconds) =
             crate::platform::qemu_virt::rtc::realtime_now(tick, tick_ms);
         let useconds = nanoseconds / 1_000;
 
-        *tv_ptr        = seconds;
-        *tv_ptr.add(1) = useconds;
+        if let Err(e) = put_user(tv_ptr, seconds) { return e; }
+        if let Err(e) = put_user(tv_ptr.add(1), useconds) { return e; }
     }
 
     // tz_ptr: if non-null, write {tz_minuteswest=0, tz_dsttime=0} (UTC, no DST).
     // Reference: Linux gettimeofday(2) — timezone struct is deprecated; callers
     // should pass NULL. We zero-fill for compatibility.
-    if tz_ptr != 0 && validate_user_pointer(tz_ptr, 2 * core::mem::size_of::<u64>()) {
-        *(tz_ptr as *mut u64) = 0;
-        *((tz_ptr + 8) as *mut u64) = 0;
+    if tz_ptr != 0 {
+        if let Err(e) = put_user(tz_ptr as *mut u64, 0u64) { return e; }
+        if let Err(e) = put_user((tz_ptr + 8) as *mut u64, 0u64) { return e; }
     }
 
     0

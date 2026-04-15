@@ -710,10 +710,7 @@ impl Scheduler {
             child_granted_actions,
         ) = {
             let parent = self.pool.get(parent_pid).ok_or(ForkError::InternalError)?;
-            let regions: alloc::vec::Vec<MmapRegion> = parent.mmap_regions
-                .iter()
-                .cloned()
-                .collect();
+            let regions = parent.mmap_regions.clone();
             // fork(): deep-clone into an independent FD table (POSIX fork semantics).
             let fd_table_clone = {
                 let guard = parent.file_descriptor_table.lock();
@@ -836,8 +833,7 @@ impl Scheduler {
             let fd_table_arc = alloc::sync::Arc::clone(&parent.file_descriptor_table);
             let cwd = parent.cwd.clone();
             let cwd_path = parent.cwd_path.clone();
-            let regions: alloc::vec::Vec<crate::process::MmapRegion> =
-                parent.mmap_regions.iter().cloned().collect();
+            let regions = parent.mmap_regions.clone();
             (
                 parent.tgid,
                 parent.nice,
@@ -1309,12 +1305,14 @@ impl Scheduler {
         let next_va = base_va + pages as u64 * page_size;
         let process = self.pool.get_mut(current_pid)?;
         process.mmap_next_va = next_va;
-        process.mmap_regions.push(crate::process::MmapRegion {
+        let region = crate::process::MmapRegion {
             base: base_va,
             length: pages as u64 * page_size,
             demand: false,
+            shared: false,
             backing: crate::process::MmapBacking::Anonymous,
-        });
+        };
+        process.mmap_regions.insert(base_va, region);
 
         Some(base_va)
     }
@@ -1363,12 +1361,14 @@ impl Scheduler {
         let region_length = pages as u64 * page_size;
         let process = self.pool.get_mut(current_pid)?;
         process.mmap_next_va += region_length;
-        process.mmap_regions.push(crate::process::MmapRegion {
+        let region = crate::process::MmapRegion {
             base:   base_va,
             length: region_length,
             demand: false,
+            shared: false,
             backing: crate::process::MmapBacking::Anonymous,
-        });
+        };
+        process.mmap_regions.insert(base_va, region);
 
         Some(base_va)
     }
@@ -1395,9 +1395,7 @@ impl Scheduler {
             None => return false,
         };
 
-        let before = process.mmap_regions.len();
-        process.mmap_regions.retain(|r| r.base != addr);
-        if process.mmap_regions.len() == before {
+        if process.mmap_regions.remove(&addr).is_none() {
             return false; // region not found
         }
 
