@@ -695,7 +695,11 @@ impl Scheduler {
         }
 
         // Copy mmap state, signal handlers, FD table, cwd, environ, umask,
-        // signal stack, and Binary Permission Model sets from parent to child.
+        // signal stack, identity, and Binary Permission Model sets from parent.
+        //
+        // POSIX.1-2017 fork(2): "The child process shall have [...] the same
+        // real user ID, real group ID, effective user ID, effective group ID,
+        // [...] supplementary group IDs [...]".
         let (
             child_mmap_next_va,
             child_mmap_regions,
@@ -708,6 +712,10 @@ impl Scheduler {
             child_signal_stack,
             child_granted_permissions,
             child_granted_actions,
+            child_uid, child_gid, child_euid, child_egid,
+            child_suid, child_sgid,
+            child_supplemental_groups, child_ngroups,
+            child_capabilities,
         ) = {
             let parent = self.pool.get(parent_pid).ok_or(ForkError::InternalError)?;
             let regions = parent.mmap_regions.clone();
@@ -727,7 +735,19 @@ impl Scheduler {
             // Binary Permission Model: permissions are inherited across fork().
             let granted_permissions = parent.granted_permissions.clone();
             let granted_actions = parent.granted_actions.clone();
-            (parent.mmap_next_va, regions, parent.signal_handlers, child_fd_table_arc, cwd, cwd_path, environ, umask, signal_stack, granted_permissions, granted_actions)
+            // POSIX identity: all UID/GID fields inherited.
+            let uid = parent.uid;
+            let gid = parent.gid;
+            let euid = parent.euid;
+            let egid = parent.egid;
+            let suid = parent.suid;
+            let sgid = parent.sgid;
+            let supplemental_groups = parent.supplemental_groups;
+            let ngroups = parent.ngroups;
+            let capabilities = parent.capabilities;
+            (parent.mmap_next_va, regions, parent.signal_handlers, child_fd_table_arc,
+             cwd, cwd_path, environ, umask, signal_stack, granted_permissions, granted_actions,
+             uid, gid, euid, egid, suid, sgid, supplemental_groups, ngroups, capabilities)
         };
 
         // Build the child's initial kernel stack frame (copy of parent's ExceptionFrame
@@ -755,6 +775,16 @@ impl Scheduler {
         // Binary Permission Model: child inherits parent's permission sets.
         child.granted_permissions = child_granted_permissions;
         child.granted_actions = child_granted_actions;
+        child.capabilities = child_capabilities;
+        // POSIX identity: child inherits all UID/GID fields.
+        child.uid = child_uid;
+        child.gid = child_gid;
+        child.euid = child_euid;
+        child.egid = child_egid;
+        child.suid = child_suid;
+        child.sgid = child_sgid;
+        child.supplemental_groups = child_supplemental_groups;
+        child.ngroups = child_ngroups;
         // POSIX: pending alarm is not inherited — child starts with no alarm.
         child.alarm_deadline_tick = 0;
 
@@ -827,7 +857,10 @@ impl Scheduler {
 
         // Collect parent data we need before borrowing `child`.
         let (parent_tgid, parent_nice, parent_signal_handlers, parent_fd_table_arc, parent_cwd,
-             parent_cwd_path, parent_mmap_next_va, parent_mmap_regions) = {
+             parent_cwd_path, parent_mmap_next_va, parent_mmap_regions,
+             parent_uid, parent_gid, parent_euid, parent_egid,
+             parent_suid, parent_sgid, parent_supplemental_groups, parent_ngroups,
+        ) = {
             let parent = self.pool.get(parent_pid).ok_or(ForkError::InternalError)?;
             // clone_thread(): share the SAME FD table (POSIX thread semantics).
             let fd_table_arc = alloc::sync::Arc::clone(&parent.file_descriptor_table);
@@ -843,6 +876,8 @@ impl Scheduler {
                 cwd_path,
                 parent.mmap_next_va,
                 regions,
+                parent.uid, parent.gid, parent.euid, parent.egid,
+                parent.suid, parent.sgid, parent.supplemental_groups, parent.ngroups,
             )
         };
 
@@ -867,6 +902,15 @@ impl Scheduler {
         child.cwd_path = parent_cwd_path;
         child.mmap_next_va = parent_mmap_next_va;
         child.mmap_regions = parent_mmap_regions;
+        // POSIX threads share the process identity.
+        child.uid = parent_uid;
+        child.gid = parent_gid;
+        child.euid = parent_euid;
+        child.egid = parent_egid;
+        child.suid = parent_suid;
+        child.sgid = parent_sgid;
+        child.supplemental_groups = parent_supplemental_groups;
+        child.ngroups = parent_ngroups;
 
         // Place the ExceptionFrame on the child's kernel stack.
         // Copy from parent's frame, then patch child-specific fields.

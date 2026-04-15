@@ -1,10 +1,13 @@
 //! Boot-time POSIX compatibility setup.
 //!
 //! Creates the directories required by the POSIX path translation table if
-//! they don't already exist. Logs a warning for any directory that cannot be
-//! created (e.g. if the parent doesn't exist yet).
+//! they don't already exist, then creates compatibility symlinks so that
+//! software hardcoding traditional Unix paths still works.
 //!
 //! Directory creation order matters: parents must be created before children.
+//!
+//! ALL compatibility path translations are centralised here — do not scatter
+//! symlink or directory creation across multiple files.
 
 use bazzulto_system::raw;
 use bazzulto_io::stream::stderr;
@@ -42,7 +45,6 @@ const REQUIRED_DIRS: &[&str] = &[
     "/system/share/zoneinfo/Mexico",
     "/system/share/zoneinfo/Pacific",
     "/system/share/zoneinfo/US",
-    "/etc",
     "/data",
     "/data/temp",
     "/data/logs",
@@ -51,13 +53,36 @@ const REQUIRED_DIRS: &[&str] = &[
     "/apps",
 ];
 
-/// Ensure all POSIX compat translation targets exist.
+/// POSIX compatibility symlinks — traditional Unix paths → Bazzulto equivalents.
+///
+/// Bazzulto uses `/system/` as the system root instead of the traditional Unix
+/// FHS layout.  These symlinks ensure that software hardcoding traditional
+/// paths (e.g. `/etc/passwd`, `/bin/sh`) still resolves correctly.
+///
+/// Format: `(link_path, target_path)`
+///   - `link_path`:   the traditional Unix path (created as a symlink)
+///   - `target_path`: the real Bazzulto path it points to
+///
+/// **To add a new compat symlink, add ONE line here.**  Do not scatter symlink
+/// creation across multiple files — this is the single source of truth for all
+/// path compatibility translations.
+///
+/// Reference: docs/Roadmap.md M3 §3.7, Bazzulto Path Model.
+const COMPAT_SYMLINKS: &[(&str, &str)] = &[
+    // /etc → /system/config: user database (passwd, group, shadow, hostname),
+    // fstab, mtab, shells, and other POSIX configuration files.
+    ("/etc", "/system/config"),
+];
+
+/// Ensure all POSIX compat directories exist and symlinks are created.
 ///
 /// Creates missing directories via mkdir. Already-existing directories are
-/// silently skipped. Logs a warning to stderr only if mkdir fails for a
-/// reason other than the directory already existing.
+/// silently skipped. Then creates each symlink in `COMPAT_SYMLINKS`.
+/// Logs a warning to stderr for any operation that fails.
 pub fn validate_compat_targets() {
     let error_output = stderr();
+
+    // Phase 1: create required directories.
     for path in REQUIRED_DIRS {
         if path_exists(path) {
             continue;
@@ -70,6 +95,29 @@ pub fn validate_compat_targets() {
             let _ = error_output.write_all(b"bzinit: warn: POSIX compat target '");
             let _ = error_output.write_all(path.as_bytes());
             let _ = error_output.write_all(b"' does not exist -- translations to it will fail\n");
+        }
+    }
+
+    // Phase 2: create compatibility symlinks.
+    for &(link_path, target_path) in COMPAT_SYMLINKS {
+        if path_exists(link_path) {
+            continue; // Already exists (directory, file, or symlink) — skip.
+        }
+        let mut target_buf = [0u8; 512];
+        let target_len = target_path.len().min(511);
+        target_buf[..target_len].copy_from_slice(&target_path.as_bytes()[..target_len]);
+
+        let mut link_buf = [0u8; 512];
+        let link_len = link_path.len().min(511);
+        link_buf[..link_len].copy_from_slice(&link_path.as_bytes()[..link_len]);
+
+        let result = raw::raw_symlink(target_buf.as_ptr(), link_buf.as_ptr());
+        if result < 0 {
+            let _ = error_output.write_all(b"bzinit: warn: compat symlink '");
+            let _ = error_output.write_all(link_path.as_bytes());
+            let _ = error_output.write_all(b"' -> '");
+            let _ = error_output.write_all(target_path.as_bytes());
+            let _ = error_output.write_all(b"' failed\n");
         }
     }
 }

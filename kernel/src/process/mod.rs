@@ -851,10 +851,19 @@ pub struct Process {
     pub uid: u32,
     /// Real group ID.
     pub gid: u32,
-    /// Effective user ID.  Used for permission checks.
+    /// Effective user ID.  Used for DAC permission checks.
     pub euid: u32,
     /// Effective group ID.
     pub egid: u32,
+    /// Saved user ID.  Set on exec of setuid binary; used by setuid()/setreuid().
+    /// Reference: POSIX.1-2017 §4.12 "Process Identity".
+    pub suid: u32,
+    /// Saved group ID.  Set on exec of setgid binary.
+    pub sgid: u32,
+    /// Supplementary group IDs.  POSIX NGROUPS_MAX = 16 for Bazzulto.
+    pub supplemental_groups: [u32; 16],
+    /// Number of valid entries in `supplemental_groups`.
+    pub ngroups: usize,
 
     // --- POSIX alarm ---
     /// Scheduler-tick deadline for SIGALRM delivery.
@@ -999,6 +1008,10 @@ impl Process {
             gid: 1000,
             euid: 1000,
             egid: 1000,
+            suid: 1000,
+            sgid: 1000,
+            supplemental_groups: [0u32; 16],
+            ngroups: 0,
             alarm_deadline_tick: 0,
             file_descriptor_table: Arc::new(SpinLock::new(FileDescriptorTable::new_with_tty())),
             clear_child_tid: 0,

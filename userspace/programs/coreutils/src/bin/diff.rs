@@ -1199,19 +1199,23 @@ fn diff_two_files(
 ) {
     let old_data = match open_file(old_path) {
         Ok(fd) => { let d = read_fd_to_end(fd); raw::raw_close(fd); d }
-        Err(_) => {
+        Err(errno) => {
             write_stderr("diff: ");
             write_stderr(old_path);
-            write_stderr(": cannot open\n");
+            write_stderr(": ");
+            write_stderr(coreutils::strerror(errno));
+            write_stderr("\n");
             return;
         }
     };
     let new_data = match open_file(new_path) {
         Ok(fd) => { let d = read_fd_to_end(fd); raw::raw_close(fd); d }
-        Err(_) => {
+        Err(errno) => {
             write_stderr("diff: ");
             write_stderr(new_path);
-            write_stderr(": cannot open\n");
+            write_stderr(": ");
+            write_stderr(coreutils::strerror(errno));
+            write_stderr("\n");
             return;
         }
     };

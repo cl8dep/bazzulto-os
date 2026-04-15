@@ -247,12 +247,16 @@ impl Inode for BtrfsInode {
                 size: i.size,
                 mode: i.mode as u64,
                 nlinks: i.nlink as u64,
+                uid: i.uid,
+                gid: i.gid,
             },
             None => InodeStat {
                 inode_number: self.vfs_inode_number,
                 size: 0,
                 mode: 0o100644,
                 nlinks: 1,
+                uid: 0,
+                gid: 0,
             },
         }
     }

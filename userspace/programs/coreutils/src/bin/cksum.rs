@@ -184,10 +184,12 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
                     let checksum = compute_posix_crc32(&data);
                     print_cksum_result(checksum, data.len(), Some(path));
                 }
-                Err(_) => {
+                Err(errno) => {
                     write_stderr("cksum: ");
                     write_stderr(path);
-                    write_stderr(": No such file or directory\n");
+                    write_stderr(": ");
+                    write_stderr(coreutils::strerror(errno));
+                    write_stderr("\n");
                     all_succeeded = false;
                 }
             }

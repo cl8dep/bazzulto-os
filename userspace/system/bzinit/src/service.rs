@@ -56,6 +56,14 @@ pub struct ServiceDefinition {
     /// If true, this service IS the display server.  bzinit passes the read
     /// end of the display pipe as its stdin so it can render incoming text.
     pub is_display_server: bool,
+    /// Optional user to run this service as (e.g. `"user"`).
+    ///
+    /// If set, bzinit uses fork + setuid/setgid + exec instead of spawn,
+    /// dropping privileges to the specified UID/GID before executing the binary.
+    /// The UID/GID are resolved from `/system/config/passwd` at boot time.
+    /// If unset, the service inherits bzinit's identity (uid=0, system).
+    pub run_as_uid: Option<u32>,
+    pub run_as_gid: Option<u32>,
 }
 
 impl ServiceDefinition {
@@ -98,6 +106,12 @@ impl ServiceDefinition {
             .map(|value| value == "true")
             .unwrap_or(false);
 
+        // Optional `user` field: resolve to uid/gid from /system/config/passwd.
+        let (run_as_uid, run_as_gid) = match toml.get_string("Service", "user") {
+            Some(username) => resolve_user(username),
+            None => (None, None),
+        };
+
         Some(ServiceDefinition {
             name: String::from(name),
             binary: String::from(binary),
@@ -108,6 +122,8 @@ impl ServiceDefinition {
             capabilities,
             display_output,
             is_display_server,
+            run_as_uid,
+            run_as_gid,
         })
     }
 }
@@ -178,4 +194,40 @@ fn parse_capabilities(names: &[String]) -> u64 {
         }
     }
     mask
+}
+
+/// Resolve a username to (uid, gid) by parsing `/system/config/passwd`.
+///
+/// Returns `(Some(uid), Some(gid))` on success, `(None, None)` if the user
+/// is not found or the file cannot be read.
+fn resolve_user(username: &str) -> (Option<u32>, Option<u32>) {
+    use bazzulto_system::raw;
+    // Read /system/config/passwd
+    let mut path_buf = [0u8; 32];
+    let path = b"/system/config/passwd\0";
+    path_buf[..path.len()].copy_from_slice(path);
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
+    if fd < 0 { return (None, None); }
+    let mut buf = [0u8; 1024];
+    let n = raw::raw_read(fd as i32, buf.as_mut_ptr(), buf.len());
+    raw::raw_close(fd as i32);
+    if n <= 0 { return (None, None); }
+
+    // Parse line by line: name:x:uid:gid:...
+    let content = match core::str::from_utf8(&buf[..n as usize]) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    for line in content.lines() {
+        let mut fields = line.splitn(5, ':');
+        let name = match fields.next() { Some(n) => n, None => continue };
+        if name != username { continue; }
+        let _pass = fields.next(); // "x"
+        let uid_str = match fields.next() { Some(s) => s, None => continue };
+        let gid_str = match fields.next() { Some(s) => s, None => continue };
+        let uid: u32 = match uid_str.parse() { Ok(v) => v, Err(_) => continue };
+        let gid: u32 = match gid_str.parse() { Ok(v) => v, Err(_) => continue };
+        return (Some(uid), Some(gid));
+    }
+    (None, None)
 }

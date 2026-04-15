@@ -208,6 +208,21 @@ pub(super) unsafe fn sys_mkdir(path_ptr: *const u8, mode: u32) -> i64 {
         Err(err) => return err.to_errno(),
     };
 
+    // DAC: POSIX mkdir(2) requires write+execute on the parent directory.
+    {
+        let denied = crate::scheduler::with_scheduler(|scheduler| {
+            match scheduler.current_process() {
+                Some(p) => crate::fs::vfs_check_access(
+                    &parent.stat(), p.euid, p.egid,
+                    &p.supplemental_groups, p.ngroups,
+                    crate::fs::ACCESS_WRITE | crate::fs::ACCESS_EXECUTE,
+                ).is_err(),
+                None => false,
+            }
+        });
+        if denied { return EACCES; }
+    }
+
     let umask = crate::scheduler::with_scheduler(|scheduler| {
         scheduler.current_process().map(|p| p.umask).unwrap_or(0o022)
     });
@@ -243,6 +258,21 @@ pub(super) unsafe fn sys_rmdir(path_ptr: *const u8) -> i64 {
         Ok(pair) => pair,
         Err(err) => return err.to_errno(),
     };
+
+    // DAC: POSIX rmdir(2) requires write+execute on the parent directory.
+    {
+        let denied = crate::scheduler::with_scheduler(|scheduler| {
+            match scheduler.current_process() {
+                Some(p) => crate::fs::vfs_check_access(
+                    &parent.stat(), p.euid, p.egid,
+                    &p.supplemental_groups, p.ngroups,
+                    crate::fs::ACCESS_WRITE | crate::fs::ACCESS_EXECUTE,
+                ).is_err(),
+                None => false,
+            }
+        });
+        if denied { return EACCES; }
+    }
 
     // Verify the target is a directory before unlinking.
     let target = match parent.lookup(&dir_name) {

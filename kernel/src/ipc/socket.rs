@@ -304,6 +304,8 @@ impl Inode for SocketInode {
             // userspace in this kernel does not distinguish socket mode bits.
             mode: 0o020666,
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

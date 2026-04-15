@@ -57,6 +57,22 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
         (cwd, cwd_path)
     });
     let vfs_inode = crate::fs::vfs_resolve(name, cwd.as_ref()).ok();
+
+    // DAC execute permission check (POSIX.1-2017 exec(2)).
+    if let Some(ref inode) = vfs_inode {
+        let denied = crate::scheduler::with_scheduler(|scheduler| {
+            match scheduler.current_process() {
+                Some(p) => crate::fs::vfs_check_access(
+                    &inode.stat(), p.euid, p.egid,
+                    &p.supplemental_groups, p.ngroups,
+                    crate::fs::ACCESS_EXECUTE,
+                ).is_err(),
+                None => false, // kernel boot context — no check needed
+            }
+        });
+        if denied { return EACCES; }
+    }
+
     let owned_elf: alloc::vec::Vec<u8>;
     let elf_data: &[u8] = if let Some(ref inode) = vfs_inode {
         let size = inode.stat().size as usize;
@@ -122,11 +138,18 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
 
         // Clone the parent's current fd table so the child inherits open fds
         // (including any pipe ends that bzinit redirected via dup2 before spawn).
-        let parent_fd_table_clone = scheduler.current_process()
-            .map(|p| {
-                let guard = p.file_descriptor_table.lock();
-                guard.clone_for_fork()
-            });
+        let (parent_fd_table_clone, parent_identity) = match scheduler.current_process() {
+            Some(p) => {
+                let fd_clone = {
+                    let guard = p.file_descriptor_table.lock();
+                    guard.clone_for_fork()
+                };
+                let identity = (p.uid, p.gid, p.euid, p.egid, p.suid, p.sgid,
+                                p.supplemental_groups, p.ngroups);
+                (Some(fd_clone), Some(identity))
+            }
+            None => (None, None),
+        };
 
         let child_pid = match scheduler.create_process(Some(parent_pid)) {
             Some(pid) => pid,
@@ -159,6 +182,18 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
         // Inherit the parent's working directory.
         child.cwd      = cwd.clone();
         child.cwd_path = parent_cwd_path.clone();
+
+        // POSIX identity: child inherits parent's UID/GID fields.
+        if let Some((uid, gid, euid, egid, suid, sgid, groups, ngroups)) = parent_identity {
+            child.uid = uid;
+            child.gid = gid;
+            child.euid = euid;
+            child.egid = egid;
+            child.suid = suid;
+            child.sgid = sgid;
+            child.supplemental_groups = groups;
+            child.ngroups = ngroups;
+        }
 
         // Replace the fresh fd table with the parent's clone (inheriting pipes).
         if let Some(fd_clone) = parent_fd_table_clone {
@@ -409,13 +444,24 @@ pub(super) unsafe fn sys_exec(
     let ramfs_data = if vfs_inode.is_none() { crate::fs::ramfs_find(name) } else { None };
 
     // INODE_KERNEL_EXEC_ONLY check: reject userspace exec of kernel-only binaries.
-    //
-    // vfs_mark_kernel_exec_only() is called during boot for /system/bin/bzinit.
-    // Any subsequent userspace exec() of that path returns EPERM.
-    //
-    // Reference: docs/features/Binary Permission Model.md §INODE_KERNEL_EXEC_ONLY.
     if crate::fs::vfs_is_kernel_exec_only(name) {
         return EPERM;
+    }
+
+    // DAC execute permission check (POSIX.1-2017 exec(2)).
+    // The caller must have execute permission on the binary.
+    if let Some(ref inode) = vfs_inode {
+        let denied = crate::scheduler::with_scheduler(|scheduler| {
+            match scheduler.current_process() {
+                Some(p) => crate::fs::vfs_check_access(
+                    &inode.stat(), p.euid, p.egid,
+                    &p.supplemental_groups, p.ngroups,
+                    crate::fs::ACCESS_EXECUTE,
+                ).is_err(),
+                None => false,
+            }
+        });
+        if denied { return EACCES; }
     }
 
     // We need owned data for the VFS path because the inode may be backed by a
@@ -522,8 +568,44 @@ pub(super) unsafe fn sys_exec(
         guard.nonblock_mask = [0u64; 16];
     }
 
+    // Setuid/setgid on exec: check inode mode bits and adjust identity.
+    //
+    // POSIX.1-2017 exec(2): if the new program file has the S_ISUID bit set,
+    // the effective UID of the process is set to the owner of the file.
+    // Similarly for S_ISGID.  The saved UID/GID are set to the new effective
+    // values.  If neither bit is set, suid/sgid are set to euid/egid (clearing
+    // any previous saved set-id state).
+    let setuid_identity: Option<(u32, u32, u32, u32)> = vfs_inode.as_ref().map(|inode| {
+        let stat = inode.stat();
+        let mode = stat.mode;
+        let s_isuid = mode & 0o4000 != 0;
+        let s_isgid = mode & 0o2000 != 0;
+        let new_euid = if s_isuid { stat.uid } else { u32::MAX }; // MAX = no change
+        let new_egid = if s_isgid { stat.gid } else { u32::MAX };
+        let new_suid = if s_isuid { stat.uid } else { u32::MAX }; // will be set to euid
+        let new_sgid = if s_isgid { stat.gid } else { u32::MAX };
+        (new_euid, new_egid, new_suid, new_sgid)
+    });
+
     crate::scheduler::with_scheduler(|scheduler| {
         if let Some(process) = scheduler.current_process_mut() {
+
+            // Apply setuid/setgid identity changes.
+            if let Some((new_euid, new_egid, new_suid, new_sgid)) = setuid_identity {
+                if new_euid != u32::MAX {
+                    process.euid = new_euid;
+                    process.suid = new_euid;
+                } else {
+                    // No setuid: saved UID becomes current effective UID.
+                    process.suid = process.euid;
+                }
+                if new_egid != u32::MAX {
+                    process.egid = new_egid;
+                    process.sgid = new_egid;
+                } else {
+                    process.sgid = process.egid;
+                }
+            }
 
             // Replace address space.
             process.page_table = Some(loaded_page_table);

@@ -281,6 +281,8 @@ impl Inode for ProcfsRootInode {
             size: 0,
             mode: 0o040555,  // dr-xr-xr-x
             nlinks: 2,
+            uid: 0,
+            gid: 0,
         }
     }
 
@@ -370,6 +372,8 @@ impl Inode for ProcPidDirInode {
             size: 0,
             mode: 0o040555,
             nlinks: 2,
+            uid: 0,
+            gid: 0,
         }
     }
 
@@ -455,6 +459,8 @@ impl Inode for ProcSnapshotInode {
             size: len,
             mode: 0o100444,  // -r--r--r--
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

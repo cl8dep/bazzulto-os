@@ -242,6 +242,31 @@ pub(super) unsafe fn sys_open(name_ptr: *const u8, _name_length: usize, flags: i
             });
             match crate::fs::vfs_resolve(name, cwd.as_ref()) {
                 Ok(inode) => {
+                    // DAC permission check (POSIX.1-2017 open(2)).
+                    //
+                    // Enforce POSIX file permissions before granting access.
+                    // This check ensures that e.g. a uid=1000 process cannot
+                    // read /system/config/shadow (mode 0600, owner root).
+                    {
+                        let access_needed = {
+                            let mut a = 0u32;
+                            let access_mode = flags & 0o3;
+                            if access_mode == 0 || access_mode == 2 { a |= crate::fs::ACCESS_READ; }
+                            if access_mode == 1 || access_mode == 2 { a |= crate::fs::ACCESS_WRITE; }
+                            a
+                        };
+                        let denied = crate::scheduler::with_scheduler(|scheduler| {
+                            match scheduler.current_process() {
+                                Some(p) => crate::fs::vfs_check_access(
+                                    &inode.stat(), p.euid, p.egid,
+                                    &p.supplemental_groups, p.ngroups, access_needed,
+                                ).is_err(),
+                                None => false,
+                            }
+                        });
+                        if denied { return EACCES; }
+                    }
+
                     if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
                         return EEXIST;
                     }
@@ -283,6 +308,26 @@ pub(super) unsafe fn sys_open(name_ptr: *const u8, _name_length: usize, flags: i
             });
             match crate::fs::vfs_resolve(name, cwd.as_ref()) {
                 Ok(inode) => {
+                    // DAC check (same as absolute path branch above).
+                    {
+                        let access_needed = {
+                            let mut a = 0u32;
+                            let access_mode = flags & 0o3;
+                            if access_mode == 0 || access_mode == 2 { a |= crate::fs::ACCESS_READ; }
+                            if access_mode == 1 || access_mode == 2 { a |= crate::fs::ACCESS_WRITE; }
+                            a
+                        };
+                        let denied = crate::scheduler::with_scheduler(|scheduler| {
+                            match scheduler.current_process() {
+                                Some(p) => crate::fs::vfs_check_access(
+                                    &inode.stat(), p.euid, p.egid,
+                                    &p.supplemental_groups, p.ngroups, access_needed,
+                                ).is_err(),
+                                None => false,
+                            }
+                        });
+                        if denied { return EACCES; }
+                    }
                     if flags & O_EXCL != 0 && flags & O_CREAT != 0 {
                         return EEXIST;
                     }
@@ -514,8 +559,20 @@ pub(super) unsafe fn sys_unlink(name_ptr: *const u8) -> i64 {
     let name = name_abs.as_str();
 
     // Resolve to parent + name, then call unlink via VFS.
+    // DAC: POSIX unlink(2) requires write+execute on the parent directory.
     match crate::fs::vfs_resolve_parent(name) {
         Ok((parent, file_name)) => {
+            let denied = crate::scheduler::with_scheduler(|scheduler| {
+                match scheduler.current_process() {
+                    Some(p) => crate::fs::vfs_check_access(
+                        &parent.stat(), p.euid, p.egid,
+                        &p.supplemental_groups, p.ngroups,
+                        crate::fs::ACCESS_WRITE | crate::fs::ACCESS_EXECUTE,
+                    ).is_err(),
+                    None => false,
+                }
+            });
+            if denied { return EACCES; }
             match parent.unlink(&file_name) {
                 Ok(()) => 0,
                 Err(error) => error.to_errno(),
@@ -576,6 +633,8 @@ pub(super) unsafe fn sys_fstat(fd: i32, stat_ptr: *mut u8) -> i64 {
                     // S_IFREG = 0o100000 | r--r--r-- = 0o444.
                     mode: 0o100444,
                     nlinks: 1,
+                    uid: 0,
+                    gid: 0,
                 }, crate::fs::InodeType::RegularFile))
             }
             Some(crate::fs::vfs::FileDescriptor::Pipe(_)) => {
@@ -585,6 +644,8 @@ pub(super) unsafe fn sys_fstat(fd: i32, stat_ptr: *mut u8) -> i64 {
                     // S_IFIFO = 0o010000 (Linux/POSIX named pipe file type bit).
                     mode: 0o010000,
                     nlinks: 1,
+                    uid: 0,
+                    gid: 0,
                 }, crate::fs::InodeType::Fifo))
             }
             Some(crate::fs::vfs::FileDescriptor::Tty) => {
@@ -594,6 +655,8 @@ pub(super) unsafe fn sys_fstat(fd: i32, stat_ptr: *mut u8) -> i64 {
                     // S_IFCHR = 0o020000 (character device) | rw-rw-rw- = 0o666.
                     mode: 0o020666,
                     nlinks: 1,
+                    uid: 0,
+                    gid: 0,
                 }, crate::fs::InodeType::CharDevice))
             }
             _ => None,
@@ -615,6 +678,10 @@ pub(super) unsafe fn sys_fstat(fd: i32, stat_ptr: *mut u8) -> i64 {
     out[16..20].copy_from_slice(&(stat.mode as u32).to_le_bytes());
     // st_nlink at offset 20 (u32).
     out[20..24].copy_from_slice(&(stat.nlinks as u32).to_le_bytes());
+    // st_uid at offset 24 (u32).
+    out[24..28].copy_from_slice(&stat.uid.to_le_bytes());
+    // st_gid at offset 28 (u32).
+    out[28..32].copy_from_slice(&stat.gid.to_le_bytes());
     // st_size at offset 40.
     out[40..48].copy_from_slice(&stat.size.to_le_bytes());
     // st_blksize at offset 48 (4096 bytes = one page).

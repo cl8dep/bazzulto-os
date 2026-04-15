@@ -231,6 +231,8 @@ impl Inode for FifoInode {
             // Reference: POSIX.1-2017 sys/stat.h S_IFIFO.
             mode: 0o010666,
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

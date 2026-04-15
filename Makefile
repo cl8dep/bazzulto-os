@@ -66,7 +66,11 @@ BSL_DIRS := \
 DISK_FILES := \
 	$(_BSL_BIN_MAPPINGS) \
 	$(BSL_FONT_DIR)/JetBrainsMono/JetBrainsMono-Regular.ttf:/system/fonts/JetBrainsMono/JetBrainsMono-Regular.ttf \
-	userspace/config/disk-mounts:/system/config/disk-mounts
+	userspace/config/disk-mounts:/system/config/disk-mounts \
+	userspace/config/system_config/passwd:/system/config/passwd \
+	userspace/config/system_config/shadow:/system/config/shadow \
+	userspace/config/system_config/group:/system/config/group \
+	userspace/config/system_config/hostname:/system/config/hostname
 
 # ---------------------------------------------------------------------------
 # Default: build everything (kernel + disk image)

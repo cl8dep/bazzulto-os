@@ -29,6 +29,8 @@ struct TmpfsFileInner {
     inode_number: u64,
     data: Vec<u8>,
     mode: u64,
+    uid: u32,
+    gid: u32,
 }
 
 pub struct TmpfsFile(UnsafeCell<TmpfsFileInner>);
@@ -43,6 +45,8 @@ impl TmpfsFile {
             inode_number: alloc_inode_number(),
             data: Vec::new(),
             mode: 0o100644,
+            uid: 0,
+            gid: 0,
         })))
     }
 
@@ -62,6 +66,8 @@ impl TmpfsFile {
             inode_number: alloc_inode_number(),
             data: Vec::new(),
             mode,
+            uid: 0,
+            gid: 0,
         })))
     }
 
@@ -78,12 +84,21 @@ impl Inode for TmpfsFile {
         let inner = unsafe { self.inner() };
         let mut stat = InodeStat::regular(inner.inode_number, inner.data.len() as u64);
         stat.mode = inner.mode;
+        stat.uid = inner.uid;
+        stat.gid = inner.gid;
         stat
     }
 
     fn set_mode(&self, mode: u64) -> Result<(), FsError> {
         let inner = unsafe { self.inner() };
         inner.mode = mode;
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FsError> {
+        let inner = unsafe { self.inner() };
+        if uid != u32::MAX { inner.uid = uid; }
+        if gid != u32::MAX { inner.gid = gid; }
         Ok(())
     }
 
@@ -140,6 +155,8 @@ struct TmpfsDirInner {
     inode_number: u64,
     entries: BTreeMap<String, Arc<dyn Inode>>,
     mode: u64,
+    uid: u32,
+    gid: u32,
 }
 
 pub struct TmpfsDir(UnsafeCell<TmpfsDirInner>);
@@ -154,6 +171,8 @@ impl TmpfsDir {
             inode_number: alloc_inode_number(),
             entries: BTreeMap::new(),
             mode: 0o040755,
+            uid: 0,
+            gid: 0,
         })))
     }
 
@@ -163,6 +182,8 @@ impl TmpfsDir {
             inode_number: alloc_inode_number(),
             entries: BTreeMap::new(),
             mode,
+            uid: 0,
+            gid: 0,
         })))
     }
 
@@ -185,12 +206,21 @@ impl Inode for TmpfsDir {
         let inner = unsafe { self.inner() };
         let mut stat = InodeStat::directory(inner.inode_number);
         stat.mode = inner.mode;
+        stat.uid = inner.uid;
+        stat.gid = inner.gid;
         stat
     }
 
     fn set_mode(&self, mode: u64) -> Result<(), FsError> {
         let inner = unsafe { self.inner() };
         inner.mode = mode;
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) -> Result<(), FsError> {
+        let inner = unsafe { self.inner() };
+        if uid != u32::MAX { inner.uid = uid; }
+        if gid != u32::MAX { inner.gid = gid; }
         Ok(())
     }
 

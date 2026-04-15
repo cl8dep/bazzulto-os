@@ -189,6 +189,8 @@ impl Inode for SemaphoreInode {
             // S_IFCHR | 0o666 — character special file.
             mode: 0o020666,
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

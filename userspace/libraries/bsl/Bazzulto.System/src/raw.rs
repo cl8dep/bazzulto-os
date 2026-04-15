@@ -394,3 +394,64 @@ pub fn raw_uname(buf: *mut u8) -> i64 {
 pub fn raw_sysinfo(buf: *mut u64) -> i64 {
     vdso_call1!(SLOT_SYSINFO, buf)
 }
+
+// ---------------------------------------------------------------------------
+// Syscalls beyond vDSO slot range (> 114) — use inline SVC directly
+// ---------------------------------------------------------------------------
+
+/// Create a symbolic link at `linkpath` pointing to `target`.
+/// Both paths must be NUL-terminated.
+///
+/// Syscall 140 (SYMLINK) — beyond vDSO range, uses inline SVC.
+/// Returns 0 on success or a negative errno.
+#[inline]
+pub fn raw_symlink(target: *const u8, linkpath: *const u8) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #140",
+            in("x0") target as u64,
+            in("x1") linkpath as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Set the real and effective user ID of the calling process.
+///
+/// Syscall 104 (SETUID). Privileged (euid==0): sets uid, euid, suid.
+/// Unprivileged: may only set euid to uid or suid.
+/// Returns 0 on success or a negative errno.
+#[inline]
+pub fn raw_setuid(uid: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #104",
+            in("x0") uid as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Set the real and effective group ID of the calling process.
+///
+/// Syscall 105 (SETGID). Same privilege rules as setuid.
+/// Returns 0 on success or a negative errno.
+#[inline]
+pub fn raw_setgid(gid: u32) -> i64 {
+    let ret: i64;
+    unsafe {
+        core::arch::asm!(
+            "svc #105",
+            in("x0") gid as u64,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}

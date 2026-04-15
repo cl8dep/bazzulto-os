@@ -83,21 +83,48 @@ pub fn read_fd_to_end(fd: i32) -> Vec<u8> {
     buffer
 }
 
-/// Open a file for reading. Returns the fd on success or an error string.
-pub fn open_file(path: &str) -> Result<i32, &'static str> {
+/// Open a file for reading. Returns the fd on success or the negative errno.
+pub fn open_file(path: &str) -> Result<i32, i64> {
     let mut path_buf = [0u8; 512];
     let path_len = path.len().min(511);
     path_buf[..path_len].copy_from_slice(&path.as_bytes()[..path_len]);
     let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
     if fd < 0 {
-        Err("cannot open file")
+        Err(fd)
     } else {
         Ok(fd as i32)
     }
 }
 
+/// Convert a negative errno to a human-readable POSIX error string.
+pub fn strerror(errno: i64) -> &'static str {
+    match errno {
+        -1  => "Operation not permitted",
+        -2  => "No such file or directory",
+        -5  => "Input/output error",
+        -9  => "Bad file descriptor",
+        -11 => "Resource temporarily unavailable",
+        -12 => "Cannot allocate memory",
+        -13 => "Permission denied",
+        -14 => "Bad address",
+        -17 => "File exists",
+        -19 => "No such device",
+        -20 => "Not a directory",
+        -21 => "Is a directory",
+        -22 => "Invalid argument",
+        -24 => "Too many open files",
+        -28 => "No space left on device",
+        -32 => "Broken pipe",
+        -36 => "File name too long",
+        -38 => "Function not implemented",
+        -39 => "Directory not empty",
+        -40 => "Too many levels of symbolic links",
+        _   => "Unknown error",
+    }
+}
+
 /// Read a named file or stdin (when `path` is `None` or `"-"`) into a Vec<u8>.
-pub fn read_file_or_stdin(path: Option<&str>) -> Result<Vec<u8>, &'static str> {
+pub fn read_file_or_stdin(path: Option<&str>) -> Result<Vec<u8>, i64> {
     match path {
         None | Some("-") => Ok(read_stdin_to_end()),
         Some(p) => {

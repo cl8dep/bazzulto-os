@@ -28,10 +28,12 @@ fn cat_one(path: &str) -> bool {
             write_bytes_stdout(&data);
             true
         }
-        Err(_) => {
+        Err(errno) => {
             write_stderr("cat: ");
             write_stderr(path);
-            write_stderr(": No such file or directory\n");
+            write_stderr(": ");
+            write_stderr(coreutils::strerror(errno));
+            write_stderr("\n");
             false
         }
     }

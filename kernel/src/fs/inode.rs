@@ -78,23 +78,96 @@ pub struct InodeStat {
     /// Maps to `st_mode` in POSIX struct stat.
     pub mode: u64,
     pub nlinks: u64,
+    /// Owner user ID.  Used by DAC permission checks.
+    pub uid: u32,
+    /// Owner group ID.
+    pub gid: u32,
 }
 
 impl InodeStat {
-    /// Construct stat for a regular file.
+    /// Construct stat for a regular file (owner root:root).
     pub fn regular(inode_number: u64, size: u64) -> Self {
-        Self { inode_number, size, mode: 0o100644, nlinks: 1 }
+        Self { inode_number, size, mode: 0o100644, nlinks: 1, uid: 0, gid: 0 }
     }
 
-    /// Construct stat for a directory.
+    /// Construct stat for a directory (owner root:root).
     pub fn directory(inode_number: u64) -> Self {
-        Self { inode_number, size: 0, mode: 0o040755, nlinks: 2 }
+        Self { inode_number, size: 0, mode: 0o040755, nlinks: 2, uid: 0, gid: 0 }
     }
 
-    /// Construct stat for a character device.
+    /// Construct stat for a character device (owner root:root).
     pub fn char_device(inode_number: u64) -> Self {
-        Self { inode_number, size: 0, mode: 0o020666, nlinks: 1 }
+        Self { inode_number, size: 0, mode: 0o020666, nlinks: 1, uid: 0, gid: 0 }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DAC access check — POSIX Discretionary Access Control
+// ---------------------------------------------------------------------------
+
+/// Access mode flags for `vfs_check_access`.
+pub const ACCESS_READ:    u32 = 4; // R_OK
+pub const ACCESS_WRITE:   u32 = 2; // W_OK
+pub const ACCESS_EXECUTE: u32 = 1; // X_OK
+
+/// Check POSIX DAC permissions for `process` accessing `inode`.
+///
+/// Returns `Ok(())` if access is allowed, `Err(FsError::PermissionDenied)` otherwise.
+///
+/// Rules (POSIX.1-2017 §2.7.1):
+///   1. euid==0 (superuser): read/write always allowed.  Execute requires
+///      at least one execute bit set (any of owner/group/other).
+///   2. euid == inode.uid: use owner permission bits (mode >> 6).
+///   3. egid == inode.gid OR inode.gid in supplementary groups: use group bits (mode >> 3).
+///   4. Otherwise: use other permission bits (mode & 0o7).
+///
+/// Reference: POSIX.1-2017 §2.7.1, Linux VFS `inode_permission()`.
+pub fn vfs_check_access(
+    stat: &InodeStat,
+    euid: u32,
+    egid: u32,
+    supplemental_groups: &[u32; 16],
+    ngroups: usize,
+    access: u32,
+) -> Result<(), FsError> {
+    // Rule 1: superuser bypass.
+    if euid == 0 {
+        // Even root needs at least one execute bit to execute a file.
+        if access & ACCESS_EXECUTE != 0 {
+            let any_x = stat.mode & 0o111;
+            if any_x == 0 {
+                return Err(FsError::PermissionDenied);
+            }
+        }
+        return Ok(());
+    }
+
+    // Determine applicable permission bits.
+    let mode_bits = if euid == stat.uid {
+        // Owner.
+        ((stat.mode >> 6) & 0o7) as u32
+    } else if egid == stat.gid || group_match(stat.gid, supplemental_groups, ngroups) {
+        // Group.
+        ((stat.mode >> 3) & 0o7) as u32
+    } else {
+        // Other.
+        (stat.mode & 0o7) as u32
+    };
+
+    // Check requested access against applicable bits.
+    if access & mode_bits == access {
+        Ok(())
+    } else {
+        Err(FsError::PermissionDenied)
+    }
+}
+
+/// Check if `gid` is in the supplementary group list.
+fn group_match(gid: u32, groups: &[u32; 16], ngroups: usize) -> bool {
+    for i in 0..ngroups {
+        if groups[i] == gid { return true; }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -279,11 +352,20 @@ pub trait Inode: Send + Sync {
 
     /// Set the POSIX mode bits of this inode.
     ///
-    /// Used by `open(O_CREAT, mode)` and `mkdir(mode)` to apply the
-    /// caller-requested mode after creation (before umask masking).
-    /// Default implementation is a no-op — filesystems that do not track
-    /// per-inode mode (FAT32, devfs) silently ignore this call.
+    /// Used by `chmod()`, `fchmod()`, and `open(O_CREAT, mode)` to set
+    /// permission bits.  Default implementation is a no-op — filesystems that
+    /// do not track per-inode mode (FAT32, devfs) silently ignore this call.
     fn set_mode(&self, _mode: u64) -> Result<(), FsError> {
+        Ok(())
+    }
+
+    /// Set the owner (uid, gid) of this inode.
+    ///
+    /// Used by `chown()` and `fchown()`.  Pass `u32::MAX` for either field
+    /// to leave it unchanged (matching POSIX chown semantics where -1 = no change).
+    /// Default implementation is a no-op — filesystems without ownership
+    /// tracking (FAT32, devfs) silently ignore this call.
+    fn set_owner(&self, _uid: u32, _gid: u32) -> Result<(), FsError> {
         Ok(())
     }
 
@@ -363,6 +445,8 @@ impl Inode for SymlinkInode {
             size: self.target.len() as u64,
             mode: 0o120777,   // S_IFLNK | rwxrwxrwx
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

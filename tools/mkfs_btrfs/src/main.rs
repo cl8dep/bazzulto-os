@@ -254,7 +254,18 @@ fn main() {
         let (mode, file_type) = if entry.is_dir {
             (0o040755u32, BTRFS_FT_DIR)
         } else {
-            (0o100644u32, BTRFS_FT_REG_FILE)
+            // File permissions based on path:
+            //   /system/bin/*  → 0755 (executables)
+            //   */shadow       → 0600 (passwords, root only)
+            //   everything else → 0644 (world-readable)
+            let file_mode = if path.contains("/system/bin/") {
+                0o100755u32  // Executables need +x for DAC
+            } else if path.ends_with("/shadow") {
+                0o100600u32  // Only root can read shadow
+            } else {
+                0o100644u32
+            };
+            (file_mode, BTRFS_FT_REG_FILE)
         };
 
         // INODE_ITEM.

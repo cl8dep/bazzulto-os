@@ -869,11 +869,18 @@ pub extern "C" fn kernel_main() -> ! {
                 // Register PID 1 with the scheduler for orphan reparenting.
                 scheduler::with_scheduler(|sched| sched.set_init_pid(pid));
 
-                // Grant bzinit all capabilities so it can distribute them
-                // to services via sys_spawn.
+                // Grant bzinit all capabilities and root identity.
+                // PID 1 is the system init — it runs as uid=0 ("system")
+                // and distributes narrower identity/permissions to children.
                 scheduler::with_scheduler(|sched| {
                     if let Some(process) = sched.process_mut(pid) {
                         process.capabilities = crate::process::CAP_ALL;
+                        process.uid  = 0;
+                        process.gid  = 0;
+                        process.euid = 0;
+                        process.egid = 0;
+                        process.suid = 0;
+                        process.sgid = 0;
                     }
                 });
 

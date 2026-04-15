@@ -236,8 +236,43 @@ fn spawn_with_binary(
     do_spawn(service_state, &binary);
 }
 
-/// Perform the actual spawn syscall and update service state.
+/// Perform the actual spawn and update service state.
+///
+/// If the service specifies a `user`, bzinit uses fork + setuid/setgid + exec
+/// to drop privileges before executing the binary (standard Unix pattern).
+/// Otherwise it uses the simpler `spawn` syscall (inherits bzinit's uid=0).
 fn do_spawn(service_state: &mut ServiceState, binary: &str) {
+    let run_as_uid = service_state.definition.run_as_uid;
+    let run_as_gid = service_state.definition.run_as_gid;
+
+    if let (Some(uid), Some(gid)) = (run_as_uid, run_as_gid) {
+        // fork + setuid/setgid + exec — drops privileges to target user.
+        let pid = raw::raw_fork();
+        if pid < 0 {
+            service_state.status = ServiceStatus::Failed;
+            return;
+        }
+        if pid == 0 {
+            // Child: drop privileges, then exec.
+            raw::raw_setgid(gid);
+            raw::raw_setuid(uid);
+            let mut binary_buf = [0u8; 512];
+            let binary_len = binary.len().min(511);
+            binary_buf[..binary_len].copy_from_slice(&binary.as_bytes()[..binary_len]);
+            let argv: [*const u8; 1] = [core::ptr::null()];
+            let envp: [*const u8; 1] = [core::ptr::null()];
+            raw::raw_exec(binary_buf.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            // exec failed — exit child.
+            raw::raw_exit(1);
+            unreachable!();
+        }
+        // Parent: pid is the child's PID.
+        service_state.pid = pid as i32;
+        service_state.status = ServiceStatus::Running;
+        return;
+    }
+
+    // No user specified — use spawn (inherits bzinit's uid=0).
     let capability_mask = service_state.definition.capabilities;
     let mut binary_buf = [0u8; 512];
     let binary_len = binary.len().min(511);

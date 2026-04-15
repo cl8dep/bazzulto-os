@@ -237,6 +237,8 @@ impl Inode for MqueueInode {
             size: 0,
             mode: 0o020666,
             nlinks: 1,
+            uid: 0,
+            gid: 0,
         }
     }
 

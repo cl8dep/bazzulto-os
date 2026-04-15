@@ -209,6 +209,10 @@ pub mod numbers {
     // SCM_RIGHTS support — added in v0.3 (M2)
     pub const SENDMSG:          u64 = 162;
     pub const RECVMSG:          u64 = 163;
+    // M3 — POSIX identity extensions
+    pub const SETREUID:         u64 = 164;
+    pub const SETREGID:         u64 = 165;
+    pub const SETGROUPS:        u64 = 166;
 }
 
 use numbers::*;
@@ -707,7 +711,7 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             PWRITE64         => posix_abi::sys_pwrite64(arg0 as i32, arg1 as *const u8, arg2 as usize, arg3),
             RENAMEAT         => posix_abi::sys_renameat(arg0 as i32, arg1 as *const u8, arg2 as i32, arg3 as *const u8),
             TIMES            => posix_abi::sys_times(arg0 as *mut u64),
-            GETGROUPS        => posix_abi::sys_getgroups(arg0 as i32, arg1 as *mut u32),
+            GETGROUPS        => identity::sys_getgroups(arg0 as i32, arg1 as *mut u32),
             GETPGID          => posix_abi::sys_getpgid_syscall(arg0 as i32),
             CLOCK_SETTIME    => posix_abi::sys_clock_settime(arg0 as i32, arg1 as *const u64),
             TIMER_CREATE     => posix_abi::sys_timer_create(arg0 as i32, arg1, arg2 as *mut i32),
@@ -719,6 +723,10 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             // SCM_RIGHTS support (v0.3+)
             SENDMSG          => crate::ipc::socket::sys_sendmsg(arg0 as i32, arg1, arg2 as i32),
             RECVMSG          => crate::ipc::socket::sys_recvmsg(arg0 as i32, arg1, arg2 as i32),
+            // M3 — POSIX identity extensions
+            SETREUID         => identity::sys_setreuid(arg0 as u32, arg1 as u32),
+            SETREGID         => identity::sys_setregid(arg0 as u32, arg1 as u32),
+            SETGROUPS        => identity::sys_setgroups(arg0 as usize, arg1 as *const u32),
             _          => ENOSYS,
         }
     };

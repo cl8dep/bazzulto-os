@@ -5,3 +5,4 @@ after          = ["bzdisplayd"]
 restart        = "always"
 max_retries    = "0"
 display_output = "true"
+user           = "user"
