@@ -58,6 +58,7 @@ BSL_DIRS := \
 	DIR:/data \
 	DIR:/data/temp \
 	DIR:/data/logs \
+	DIR:/data/test \
 	DIR:/dev \
 	DIR:/proc \
 	DIR:/apps \
@@ -70,7 +71,10 @@ DISK_FILES := \
 	userspace/config/system_config/passwd:/system/config/passwd \
 	userspace/config/system_config/shadow:/system/config/shadow \
 	userspace/config/system_config/group:/system/config/group \
-	userspace/config/system_config/hostname:/system/config/hostname
+	userspace/config/system_config/hostname:/system/config/hostname \
+	userspace/config/test_files/root_secret.txt:/data/test/root_secret.txt \
+	userspace/config/test_files/public.txt:/data/test/public.txt \
+	userspace/config/test_files/script.sh:/data/test/script.sh
 
 # ---------------------------------------------------------------------------
 # Default: build everything (kernel + disk image)

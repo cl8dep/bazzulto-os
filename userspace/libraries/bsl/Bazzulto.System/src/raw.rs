@@ -15,7 +15,8 @@ use crate::vdso::{vdso_slot_va, SLOT_EXIT, SLOT_WRITE, SLOT_READ, SLOT_YIELD,
                   SLOT_UMASK, SLOT_SIGALTSTACK, SLOT_ALARM,
                   SLOT_MACHINE_REBOOT, SLOT_MACHINE_POWEROFF,
                   SLOT_MOUNT, SLOT_GETMOUNTS,
-                  SLOT_UNAME, SLOT_SYSINFO};
+                  SLOT_UNAME, SLOT_SYSINFO,
+                  SLOT_GETUID, SLOT_GETGID};
 
 // Branch into a vDSO slot that takes 0 arguments and returns i64.
 macro_rules! vdso_call0 {
@@ -396,62 +397,62 @@ pub fn raw_sysinfo(buf: *mut u64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Syscalls beyond vDSO slot range (> 114) — use inline SVC directly
+// Identity syscalls — all now within vDSO range (200 slots)
 // ---------------------------------------------------------------------------
+
+use crate::vdso::{SLOT_GETEUID, SLOT_GETEGID, SLOT_SETUID, SLOT_SETGID,
+                  SLOT_SYMLINK, SLOT_GETGROUPS};
 
 /// Create a symbolic link at `linkpath` pointing to `target`.
 /// Both paths must be NUL-terminated.
-///
-/// Syscall 140 (SYMLINK) — beyond vDSO range, uses inline SVC.
 /// Returns 0 on success or a negative errno.
 #[inline]
 pub fn raw_symlink(target: *const u8, linkpath: *const u8) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #140",
-            in("x0") target as u64,
-            in("x1") linkpath as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    vdso_call2!(SLOT_SYMLINK, target, linkpath)
 }
 
 /// Set the real and effective user ID of the calling process.
-///
-/// Syscall 104 (SETUID). Privileged (euid==0): sets uid, euid, suid.
+/// Privileged (euid==0): sets uid, euid, suid.
 /// Unprivileged: may only set euid to uid or suid.
-/// Returns 0 on success or a negative errno.
 #[inline]
 pub fn raw_setuid(uid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #104",
-            in("x0") uid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    vdso_call1!(SLOT_SETUID, uid)
 }
 
-/// Set the real and effective group ID of the calling process.
-///
-/// Syscall 105 (SETGID). Same privilege rules as setuid.
-/// Returns 0 on success or a negative errno.
+/// Set the real and effective group ID.  Same privilege rules as setuid.
 #[inline]
 pub fn raw_setgid(gid: u32) -> i64 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "svc #105",
-            in("x0") gid as u64,
-            lateout("x0") ret,
-            options(nostack),
-        );
-    }
-    ret
+    vdso_call1!(SLOT_SETGID, gid)
+}
+
+/// Get the real user ID.
+#[inline]
+pub fn raw_getuid() -> u32 {
+    vdso_call0!(SLOT_GETUID) as u32
+}
+
+/// Get the real group ID.
+#[inline]
+pub fn raw_getgid() -> u32 {
+    vdso_call0!(SLOT_GETGID) as u32
+}
+
+/// Get the effective user ID.
+#[inline]
+pub fn raw_geteuid() -> u32 {
+    vdso_call0!(SLOT_GETEUID) as u32
+}
+
+/// Get the effective group ID.
+#[inline]
+pub fn raw_getegid() -> u32 {
+    vdso_call0!(SLOT_GETEGID) as u32
+}
+
+/// Get supplementary group IDs.
+/// If `size` == 0, returns the number of supplementary groups.
+/// Otherwise fills `list[0..size]` and returns the count.
+#[inline]
+pub fn raw_getgroups(size: i32, list: *mut u32) -> i64 {
+    vdso_call2!(SLOT_GETGROUPS, size, list)
 }

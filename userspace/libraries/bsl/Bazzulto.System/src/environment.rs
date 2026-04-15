@@ -24,6 +24,97 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
 // ---------------------------------------------------------------------------
+// Well-known system directories (Bazzulto Path Model)
+// ---------------------------------------------------------------------------
+//
+// These enums are the SINGLE SOURCE OF TRUTH for all system paths.
+// To add a new path, add a variant here — do not hardcode paths elsewhere.
+//
+// Reference: docs/Roadmap.md M3 §3.7, Bazzulto Path Model.
+
+/// Well-known system directories.
+///
+/// Use `Environment::get_special_folder()` to resolve to a path string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialFolder {
+    /// `/system` — system root (binaries, libraries, config, fonts).
+    SystemRoot,
+    /// `/system/bin` — system executables.
+    SystemBin,
+    /// `/system/lib` — system shared libraries.
+    SystemLib,
+    /// `/system/config` — system configuration (passwd, group, services).
+    /// Equivalent of `/etc` on traditional Unix.
+    SystemConfig,
+    /// `/system/config/services` — bzinit service definitions.
+    SystemServices,
+    /// `/system/fonts` — system font files.
+    SystemFonts,
+    /// `/system/share` — architecture-independent data (timezones, etc.).
+    SystemShare,
+    /// `/home/user` — default user home directory.
+    UserHome,
+    /// `/data` — persistent application data.
+    Data,
+    /// `/data/temp` — temporary files (cleared on reboot).
+    DataTemp,
+    /// `/data/logs` — system and application logs.
+    DataLogs,
+    /// `/apps` — user-installed applications.
+    Apps,
+}
+
+impl SpecialFolder {
+    /// Return the absolute path for this folder.
+    pub const fn path(self) -> &'static str {
+        match self {
+            SpecialFolder::SystemRoot     => "/system",
+            SpecialFolder::SystemBin      => "/system/bin",
+            SpecialFolder::SystemLib      => "/system/lib",
+            SpecialFolder::SystemConfig   => "/system/config",
+            SpecialFolder::SystemServices => "/system/config/services",
+            SpecialFolder::SystemFonts    => "/system/fonts",
+            SpecialFolder::SystemShare    => "/system/share",
+            SpecialFolder::UserHome       => "/home/user",
+            SpecialFolder::Data           => "/data",
+            SpecialFolder::DataTemp       => "/data/temp",
+            SpecialFolder::DataLogs       => "/data/logs",
+            SpecialFolder::Apps           => "/apps",
+        }
+    }
+}
+
+/// Well-known system files.
+///
+/// Use `Environment::get_special_file()` to resolve to a path string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialFile {
+    /// `/system/config/passwd` — user database (name, uid, gid, shell).
+    Passwd,
+    /// `/system/config/shadow` — password hashes (root-readable only).
+    Shadow,
+    /// `/system/config/group` — group database (name, gid, members).
+    Group,
+    /// `/system/config/hostname` — machine hostname.
+    Hostname,
+    /// `/system/config/disk-mounts` — disk mount configuration.
+    DiskMounts,
+}
+
+impl SpecialFile {
+    /// Return the absolute path for this file.
+    pub const fn path(self) -> &'static str {
+        match self {
+            SpecialFile::Passwd     => "/system/config/passwd",
+            SpecialFile::Shadow     => "/system/config/shadow",
+            SpecialFile::Group      => "/system/config/group",
+            SpecialFile::Hostname   => "/system/config/hostname",
+            SpecialFile::DiskMounts => "/system/config/disk-mounts",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Minimal SpinLock for single-threaded userspace use
 // ---------------------------------------------------------------------------
 //
@@ -260,6 +351,31 @@ impl Environment {
             owned.push_str(s);
             owned
         }).collect()
+    }
+
+    // --- Well-known system paths (Bazzulto Path Model) ---
+    //
+    // All system paths are centralised here.  Coreutils and services should
+    // NEVER hardcode paths like "/system/config/passwd" — use these methods.
+
+    /// Resolve a well-known system directory.
+    ///
+    /// ```ignore
+    /// let config = Environment::get_special_folder(SpecialFolder::SystemConfig);
+    /// // → "/system/config"
+    /// ```
+    pub fn get_special_folder(folder: SpecialFolder) -> &'static str {
+        folder.path()
+    }
+
+    /// Resolve a well-known system file.
+    ///
+    /// ```ignore
+    /// let passwd = Environment::get_special_file(SpecialFile::Passwd);
+    /// // → "/system/config/passwd"
+    /// ```
+    pub fn get_special_file(file: SpecialFile) -> &'static str {
+        file.path()
     }
 
     // --- Static properties (no syscall required) ---

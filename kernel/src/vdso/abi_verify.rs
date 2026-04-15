@@ -216,9 +216,9 @@ const _: () = {
     }
 };
 
-// Verify slot count covers the highest vDSO-mapped syscall (GETMOUNTS = 114).
+// Verify slot count covers the highest syscall number (SETGROUPS = 166).
 const _: () = {
-    if VDSO_SLOT_COUNT <= 114 {
-        panic!("VDSO_SLOT_COUNT must be > 114 (GETMOUNTS)");
+    if VDSO_SLOT_COUNT <= 166 {
+        panic!("VDSO_SLOT_COUNT must be > 166 (SETGROUPS)");
     }
 };

@@ -255,13 +255,16 @@ fn main() {
             (0o040755u32, BTRFS_FT_DIR)
         } else {
             // File permissions based on path:
+            //   /system/bin/su → 4755 (setuid root — privilege escalation)
             //   /system/bin/*  → 0755 (executables)
             //   */shadow       → 0600 (passwords, root only)
             //   everything else → 0644 (world-readable)
-            let file_mode = if path.contains("/system/bin/") {
+            let file_mode = if path == "/system/bin/su" {
+                0o104755u32  // Setuid root: S_ISUID + rwxr-xr-x
+            } else if path.contains("/system/bin/") || path.ends_with(".sh") {
                 0o100755u32  // Executables need +x for DAC
-            } else if path.ends_with("/shadow") {
-                0o100600u32  // Only root can read shadow
+            } else if path.ends_with("/shadow") || path.ends_with("/root_secret.txt") {
+                0o100600u32  // Root only — tests DAC denial for uid=1000
             } else {
                 0o100644u32
             };

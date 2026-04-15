@@ -52,16 +52,20 @@ pub const VDSO_DATA_VA: usize = 0x3000;
 /// Number of syscall slots in the vDSO.
 ///
 /// Must be ≥ (highest syscall number + 1). Increase when adding syscalls.
-/// Current highest: GETMOUNTS = 114 → need at least 115 slots.
-pub const VDSO_SLOT_COUNT: usize = 115;
+/// Current highest: SETGROUPS = 166 → need at least 167 slots.
+///
+/// The 4 KiB page fits at most 248 slots (3968 bytes) with room for the
+/// fast clock_gettime implementation (128 bytes).  200 slots provides
+/// headroom for ~33 more syscalls before another increase is needed.
+pub const VDSO_SLOT_COUNT: usize = 200;
 
 /// Bytes per slot: 4 instructions × 4 bytes.
 pub const VDSO_SLOT_SIZE: usize = 16;
 
 /// Word index within the code page where the fast clock_gettime implementation
-/// begins.  Must be > VDSO_SLOT_COUNT * 4 (last slot word = 114*4+3 = 459).
-/// Using 464 (word offset 0x730 / byte offset 0x1CC0 from page start).
-const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 464;
+/// begins.  Must be > VDSO_SLOT_COUNT * 4 (last slot word = 199*4+3 = 799).
+/// Using 800 (byte offset 3200 from page start).
+const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 800;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -194,13 +198,11 @@ const fn generate_vdso_page() -> VdsoPage {
     // Replace slot 19 (clock_gettime) with a direct branch to the fast impl.
     //
     // Slot 19 base word index: 19 * 4 = 76.
-    // Fast impl base word index: FAST_CLOCK_GETTIME_WORD_OFFSET = 416.
-    // Branch imm26 = 416 - 76 = 340.
-    // B encoding: 0x14000000 | imm26.
+    // B encoding: 0x14000000 | imm26 (word offset to target).
     {
         let slot_base = SYSCALL_CLOCK_GETTIME * 4; // 76
-        let target = FAST_CLOCK_GETTIME_WORD_OFFSET; // 288
-        let imm26 = (target - slot_base) as u32; // 212
+        let target = FAST_CLOCK_GETTIME_WORD_OFFSET;
+        let imm26 = (target - slot_base) as u32;
         words[slot_base]     = 0x14000000 | imm26; // B #fast_clock_gettime
         words[slot_base + 1] = NOP;
         words[slot_base + 2] = NOP;
