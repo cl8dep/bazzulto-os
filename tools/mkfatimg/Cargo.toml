@@ -1,0 +1,11 @@
+[package]
+name    = "mkfatimg"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "mkfatimg"
+path = "src/main.rs"
+
+[dependencies]
+fatfs = "0.3"
