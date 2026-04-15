@@ -44,8 +44,8 @@ site/
 # MkDocs directory — generated output and config, not tracked
 docs/mkdocs/
 
-# Wiki is a separate git repository (GitHub Wiki clone), not tracked here
-docs/wiki/
+# Wiki is tracked as a git submodule (GitHub Wiki)
+# docs/wiki/
 
 # Reference PDFs — large binary files, not tracked in git
 docs/*.pdf

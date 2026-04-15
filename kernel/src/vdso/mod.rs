@@ -402,3 +402,6 @@ pub unsafe fn vdso_map_data_into_process(
         allocator,
     )
 }
+
+// Compile-time ABI verification — see abi_verify.rs for details.
+mod abi_verify;

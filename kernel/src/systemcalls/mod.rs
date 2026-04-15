@@ -1,5 +1,15 @@
 // systemcalls/mod.rs — System call dispatch and shared infrastructure.
 //
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │  SYSCALL ABI — FROZEN AT v0.2                                      │
+// │                                                                     │
+// │  Syscall numbers 0–161 are immutable.                               │
+// │  To add a new syscall, use the next available number >= 162.        │
+// │  Never reassign an existing number.                                 │
+// │                                                                     │
+// │  Authoritative reference: docs/wiki/System-Calls.md                │
+// └─────────────────────────────────────────────────────────────────────┘
+//
 // Syscall ABI (AAPCS64 + Linux-compatible convention):
 //   x8  = syscall number
 //   x0–x5 = arguments (arg0..arg5)

@@ -8,6 +8,7 @@
 #   - Homebrew (if missing)
 #   - QEMU (qemu-system-aarch64 + EDK2 UEFI firmware)
 #   - xorriso  (ISO builder, needed for make run-iso)
+#   - aarch64-elf-gcc (bare-metal cross-compiler, needed by kernel build.rs)
 #   - Rust nightly toolchain via rustup
 #   - aarch64-unknown-none target
 #   - llvm-tools and rust-src components (needed for bare-metal kernel build)
@@ -70,7 +71,19 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Rust (rustup)
+# 4. AArch64 bare-metal cross-compiler (needed by kernel build.rs)
+# ---------------------------------------------------------------------------
+
+print_step "aarch64-elf-gcc"
+if command -v aarch64-elf-gcc &>/dev/null; then
+    print_skip "aarch64-elf-gcc"
+else
+    brew install aarch64-elf-gcc
+    print_ok "aarch64-elf-gcc installed"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Rust (rustup)
 # ---------------------------------------------------------------------------
 
 print_step "Rust / rustup"
@@ -87,7 +100,7 @@ fi
 source "$HOME/.cargo/env" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 5. Rust nightly toolchain
+# 6. Rust nightly toolchain
 # ---------------------------------------------------------------------------
 
 print_step "Rust nightly toolchain"
@@ -102,7 +115,7 @@ rustup default nightly
 print_ok "nightly set as default"
 
 # ---------------------------------------------------------------------------
-# 6. aarch64-unknown-none target
+# 7. aarch64-unknown-none target
 # ---------------------------------------------------------------------------
 
 print_step "aarch64-unknown-none target"
@@ -114,7 +127,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Rust components: llvm-tools + rust-src
+# 8. Rust components: llvm-tools + rust-src
 # ---------------------------------------------------------------------------
 
 print_step "llvm-tools component"

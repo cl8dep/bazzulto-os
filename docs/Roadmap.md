@@ -124,7 +124,7 @@ M6 (musl) may start in parallel with M3. M8 (terminal/shell) may start in parall
 
 ### Tasks
 
-**1.1** Create `docs/abi/syscall-table.md`. List all 162 syscalls (numbers 0–161) with: syscall number, name, C-equivalent signature (argument types + return type), errno values, and one stability marker:
+**1.1** Update `docs/wiki/System-Calls.md` (wiki submodule). List all 162 syscalls (numbers 0–161) with: syscall number, name, C-equivalent signature (argument types + return type), errno values, and one stability marker:
 - `[STABLE]` — fully implemented, behavior frozen
 - `[PROVISIONAL]` — implemented but behavior may change; number is frozen
 - `[RESERVED]` — currently returns `ENOSYS`; number reserved for future use
@@ -144,12 +144,12 @@ Assign `[RESERVED]` to any remaining entries that currently return `ENOSYS` and 
 // Never reassign an existing number.
 ```
 
-**1.3** In `kernel/src/vdso/`, verify every stub uses the number from `docs/abi/syscall-table.md`. Add a test (`tests/vdso_numbers.rs`) that assembles each stub and asserts the `MOV x8, #N` immediate matches the documented number.
+**1.3** In `kernel/src/vdso/mod.rs`, add compile-time assertions (`abi_frozen!` macro) that verify every syscall number constant matches its documented ABI value. If any constant is renumbered, the kernel fails to compile. This replaces the need for a runtime vDSO test since the vDSO generates `svc #N` for slot N at compile time.
 
 **1.4** Tag commit `v0.2-syscall-abi-freeze`.
 
 ### Exit criteria
-`docs/abi/syscall-table.md` exists and is complete. vDSO number test passes. Build produces a compile error if any syscall constant is renamed.
+`docs/wiki/System-Calls.md` exists and is complete. Kernel compiles with all 162 `abi_frozen!` assertions passing. Any syscall renumbering produces a compile error.
 
 ---
 
@@ -388,7 +388,7 @@ Before tagging this milestone, run the following inside QEMU:
 
 **4.6 — Freeze BAFS on-disk format**
 
-Document the format in `docs/abi/bafs-format-v1.md`: superblock layout (magic `0x42414653_00000001`; version field; block size; journal offset; B-tree root pointer), extent B-tree node layout, inode layout (uid, gid, mode, nlink, size, atime, mtime, ctime, 8 inline extents), directory entry layout, journal record types. After this document is tagged, any breaking change to the on-disk layout requires `version = 2` and a migration tool. Version 1 volumes must always be mountable by a v1.0 kernel.
+Document the format in `docs/wiki/BAFS.md`: superblock layout (magic `0x42414653_00000001`; version field; block size; journal offset; B-tree root pointer), extent B-tree node layout, inode layout (uid, gid, mode, nlink, size, atime, mtime, ctime, 8 inline extents), directory entry layout, journal record types. After this document is tagged, any breaking change to the on-disk layout requires `version = 2` and a migration tool. Version 1 volumes must always be mountable by a v1.0 kernel.
 
 **4.7 — Fix `truncate()` extent freeing**
 
@@ -427,7 +427,7 @@ Run the same four tests from 4.5 against a mounted BAFS partition. Run `fsck.baf
 
 **5.1 — Complete Tier 1**
 
-In `kernel/src/permission/`: verify that every binary whose path is under `//system:/bin/` or `//system:/sbin/` is checked against the path-based capability list before exec. Any path outside those prefixes does not receive Tier 1 privileges. Ensure `vfs_exec()` calls the permission check and returns `EPERM` for Tier 1 violations. Document the exact path prefixes and capability grants in `docs/abi/permission-model.md`.
+In `kernel/src/permission/`: verify that every binary whose path is under `//system:/bin/` or `//system:/sbin/` is checked against the path-based capability list before exec. Any path outside those prefixes does not receive Tier 1 privileges. Ensure `vfs_exec()` calls the permission check and returns `EPERM` for Tier 1 violations. Document the exact path prefixes and capability grants in `docs/wiki/Permission-Model.md`.
 
 **5.2 — Policy store on BAFS**
 
@@ -512,7 +512,7 @@ Esto protege contextos no interactivos: un servicio de bzinit o un cron job no p
 
 **5.10 — Documentar comportamiento de scripts**
 
-Añadir sección "Scripts y el BPM" en `docs/abi/permission-model.md`:
+Añadir sección "Scripts y el BPM" en `docs/wiki/Permission-Model.md`:
 
 - Un script con shebang ejecutado como `./script.sh` resulta en `exec(interprete, ["interprete", "./script.sh"])`. El BPM evalúa el intérprete, no el script.
 - El contenido del script hereda las caps del intérprete.
@@ -539,7 +539,7 @@ Añadir sección "Scripts y el BPM" en `docs/abi/permission-model.md`:
 
 **6.1 — Syscall coverage audit**
 
-For every `__syscall` invocation in `musl/src/` and `musl/arch/aarch64/`, verify the Bazzulto syscall number in the patch overlay matches `docs/abi/syscall-table.md`. Document every musl-invoked syscall in `docs/abi/musl-syscall-coverage.md` with: musl name, Bazzulto number, implementation status. Fix any syscall that musl calls but that is currently `[RESERVED]` (implement it or map it to the correct existing syscall).
+For every `__syscall` invocation in `musl/src/` and `musl/arch/aarch64/`, verify the Bazzulto syscall number in the patch overlay matches `docs/wiki/System-Calls.md`. Document every musl-invoked syscall in `docs/wiki/Musl-Syscall-Coverage.md` with: musl name, Bazzulto number, implementation status. Fix any syscall that musl calls but that is currently `[RESERVED]` (implement it or map it to the correct existing syscall).
 
 **6.2 — Finalize musl patch overlay**
 
@@ -583,7 +583,7 @@ Add `make test-libc` target: builds all tests against `libc.a` (static), boots Q
 **6.6** Tag commit `v0.6-musl-stable`.
 
 ### Exit criteria
-`make test-libc` prints `PASS` for all six tests. `libc.so.6` and `ld-bazzulto.so.1` are present on `disk.img`. `docs/abi/musl-syscall-coverage.md` shows no uncovered gaps.
+`make test-libc` prints `PASS` for all six tests. `libc.so.6` and `ld-bazzulto.so.1` are present on `disk.img`. `docs/wiki/Musl-Syscall-Coverage.md` shows no uncovered gaps.
 
 ---
 
@@ -1385,8 +1385,8 @@ A commit is tagged `v1.0` only when all of the following are simultaneously true
 - [ ] Btrfs root filesystem consistent after the test run; `fsck.bafs` clean on BAFS partitions (if mounted)
 - [ ] `bazzulto-1.0.iso` boots to bzsh in QEMU and VirtualBox 7.x AArch64
 - [ ] No `unimplemented!()`, `todo!()`, or `panic!("stub")` in any code path reachable from userspace
-- [ ] All `[STABLE]` syscalls in `docs/abi/syscall-table.md` have a passing test case
-- [ ] `docs/abi/syscall-table.md`, `docs/abi/bafs-format-v1.md`, `docs/abi/permission-model.md`, and `docs/abi/musl-syscall-coverage.md` are complete and accurate
+- [ ] All `[STABLE]` syscalls in `docs/wiki/System-Calls.md` have a passing test case
+- [ ] `docs/wiki/System-Calls.md`, `docs/wiki/BAFS.md`, `docs/wiki/Permission-Model.md`, and `docs/wiki/Musl-Syscall-Coverage.md` are complete and accurate
 - [ ] `docs/release/v1.0.md` is written and accurate
 - [ ] BSL version is `"1.0.0"` with no `TODO` in any frozen module
 - [ ] `docs/virtualbox.md` contains verified VirtualBox boot instructions

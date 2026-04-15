@@ -7,3 +7,6 @@
 [submodule "userspace/libraries/libc/musl"]
 	path = userspace/libraries/libc/musl
 	url = git://git.musl-libc.org/musl
+[submodule "docs/wiki"]
+	path = docs/wiki
+	url = https://github.com/cl8dep/bazzulto-os.wiki.git
