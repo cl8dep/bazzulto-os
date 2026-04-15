@@ -28,8 +28,6 @@ userspace/target/
 # Cargo build output — all BSL library crates (includes rustdoc HTML under target/doc/)
 userspace/libraries/**/target/
 
-# Internal tools — not tracked in the repository
-tools/
 
 # Compiled IANA TZif binaries — generated at build time from third_party/tz
 third_party/zoneinfo/
