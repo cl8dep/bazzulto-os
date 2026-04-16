@@ -52,6 +52,7 @@ fn main() {
 
     // Diagnostic: list key directories so boot problems are visible in logs.
     log_directory_contents(&standard_output, "/");
+    log_directory_contents(&standard_output, "/data/test/");
     log_directory_contents(&standard_output, "/system/config/");
     log_directory_contents(&standard_output, "/system/config/services/");
 

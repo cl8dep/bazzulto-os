@@ -460,6 +460,40 @@ QEMU arranca con `-smp 4` y los 4 cores están activos. `cat /proc/cpuinfo` list
 
 **Goal:** Los binarios que declaran sus permisos via sección ELF `.bazzulto_permissions` muestran un dialog específico al usuario indicando exactamente qué namespaces necesitan. El usuario decide con información completa.
 
+### Prerequisites from M5 (must be completed before N8)
+
+These items were identified during M5 but deferred because they require
+infrastructure that N8 builds on:
+
+**N8.0a — Policy store integration (Tier 2 fast path)**
+
+The in-memory `PolicyStore` (`kernel/src/permission/policy_store.rs`) has
+`lookup_best()`, `insert()`, and `load_from_text()` but is not connected to the
+exec dispatch. Before N8 can persist Tier 3 grants, the plumbing must work:
+
+1. In `sys_exec`, before submitting a request to permissiond, call
+   `policy_store.lookup_best(hash_hex, uid)`. If a policy exists, apply it
+   directly (skip prompt — Tier 2 fast path).
+2. Add `bpm_store_policy(hash, permissions, scope)` syscall so permissiond can
+   persist grants after user approval.
+3. Load `/system/config/policies/*.policy` at boot to pre-populate the store.
+
+This is what makes "approve once, never ask again" work.
+
+**N8.0b — permissiond TTY routing**
+
+Currently permissiond writes prompts to stdout (display pipe). The correct
+architecture: write to the **blocked process's controlling TTY** so the prompt
+appears where the user is working (display, serial, SSH).
+
+New kernel syscalls:
+- `bpm_write_to_blocked_tty(blocked_pid, buf, len)` — kernel resolves the
+  blocked process's controlling TTY and writes the prompt there.
+- `bpm_read_from_blocked_tty(blocked_pid, buf, len)` — reads the response
+  from the same TTY.
+
+This enables correct behavior across multiple terminals and SSH sessions.
+
 ### Tasks
 
 **N8.1 — Parsear sección ELF `.bazzulto_permissions`**

@@ -113,15 +113,28 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
                 b"?"
             };
 
-            // Show interactive prompt.
+            // Show interactive prompt on the display (fd 1 = display pipe).
             sys_write(1, b"\n[bazzulto] ".as_ptr(), 12);
             sys_write(1, path.as_ptr(), path.len());
             sys_write(1, b" has no permission record.\n".as_ptr(), 27);
-            sys_write(1, b"           Run with inherited permissions? [s/N]: ".as_ptr(), 50);
+            sys_write(1, b"           Allow execution? [yes/No]: ".as_ptr(), 38);
 
+            // Read response from keyboard (fd 0 = TTY).
+            // Accept "yes" (or "y") — anything else is denied.
             let mut input = [0u8; 64];
             let nr = sys_read(0, input.as_mut_ptr(), input.len());
-            let approved = nr > 0 && (input[0] == b's' || input[0] == b'S');
+            let response = if nr > 0 {
+                let len = (nr as usize).min(input.len());
+                // Strip trailing newline/CR.
+                let mut end = len;
+                while end > 0 && (input[end - 1] == b'\n' || input[end - 1] == b'\r') {
+                    end -= 1;
+                }
+                &input[..end]
+            } else {
+                &[]
+            };
+            let approved = response == b"yes" || response == b"y";
             sys_write(1, b"\n".as_ptr(), 1);
 
             if approved {

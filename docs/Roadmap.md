@@ -492,10 +492,40 @@ Añadir sección "Scripts y el BPM" en `docs/wiki/Permission-Model.md`:
 
 **5.11** Tag commit `v0.5.1-permission-tiers-1-2-4`.
 
+**5.12 — Policy store integration (deferred to post-M5)**
+
+The in-memory `PolicyStore` exists (`kernel/src/permission/policy_store.rs`) with
+`lookup_best()`, `insert()`, and `load_from_text()`. Two pieces remain:
+
+1. **Connect store to exec dispatch:** Before prompting the user, `sys_exec`
+   should call `policy_store.lookup_best(hash_hex, uid)`. If a policy exists,
+   skip the prompt and apply the stored permissions directly (Tier 2 fast path).
+2. **Persist grants:** When permissiond receives `GrantedInherited` from the
+   user, it should call a new `bpm_store_policy(hash, permissions)` syscall that
+   inserts the entry into the kernel policy store. Subsequent execs of the same
+   binary (same SHA-256 hash) will hit Tier 2 and skip the prompt.
+
+This is the difference between M5 (prompt every time) and the full spec (prompt
+once, remember forever).
+
+**5.13 — permissiond TTY routing (deferred to M8)**
+
+Currently permissiond writes prompts to stdout (display pipe). The correct
+architecture: permissiond should write to the **blocked process's TTY**, not its
+own stdout. This requires new kernel syscalls:
+
+- `bpm_write_to_blocked_tty(blocked_pid, buf, len)` — kernel resolves the
+  blocked process's controlling TTY and writes the prompt there.
+- `bpm_read_from_blocked_tty(blocked_pid, buf, len)` — kernel reads the
+  response from the same TTY.
+
+This enables correct behavior across multiple terminals, SSH sessions (future),
+and serial consoles. Deferred to M8 (Terminal Experience).
+
 ### Exit criteria
 - Binario con entrada en `/system/policy/`: ejecuta sin prompt ni warning
 - Binario con policy `DENIED`: EPERM inmediato
-- Binario desconocido ejecutado desde terminal interactivo: muestra prompt `[s/N]`, respuesta `n` produce EPERM, respuesta `s` ejecuta con caps heredadas
+- Binario desconocido ejecutado desde terminal interactivo: muestra prompt `[yes/No]`, respuesta `No` produce EPERM, respuesta `yes` ejecuta con caps heredadas
 - Binario desconocido ejecutado desde script o servicio (sin TTY): EPERM automático con entrada en bzlogd
 - Script con shebang: no muestra ningún prompt (el intérprete lo absorbe)
 - `permissiond` corriendo y queryable via `bzpermctl list`

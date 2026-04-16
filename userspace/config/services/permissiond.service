@@ -5,3 +5,4 @@ after          = []
 restart        = "always"
 max_retries    = "3"
 capabilities   = ["setcap"]
+display_output = "true"
