@@ -154,6 +154,9 @@ pub struct GlyphBitmap {
     pub advance_width: f32,
     /// Signed vertical offset from baseline to the top of the bitmap (pixels).
     pub y_offset:      i32,
+    /// Signed horizontal offset from the glyph origin to the left edge of
+    /// the bitmap (left side bearing, pixels).
+    pub x_offset:      i32,
 }
 
 /// A loaded font face — the parsed fontdue object plus its identity.
@@ -442,6 +445,7 @@ impl FontManager {
             height:        metrics.height as u32,
             advance_width: metrics.advance_width,
             y_offset:      metrics.ymin,
+            x_offset:      metrics.xmin,
         })
     }
 }

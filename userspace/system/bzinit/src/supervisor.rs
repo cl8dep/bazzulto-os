@@ -98,9 +98,6 @@ pub fn handle_child_exit(
             }
 
             RestartStrategy::Always => {
-                let _ = error_output.write_all(b"bzinit: restarting '");
-                let _ = error_output.write_all(service_state.definition.name.as_bytes());
-                let _ = error_output.write_all(b"'\n");
                 spawn_service(service_state, display_pipe);
             }
 

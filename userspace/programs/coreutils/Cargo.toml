@@ -118,3 +118,7 @@ path = "src/bin/cksum.rs"
 [[bin]]
 name = "diff"
 path = "src/bin/diff.rs"
+
+[[bin]]
+name = "clear"
+path = "src/bin/clear.rs"

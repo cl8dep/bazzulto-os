@@ -392,11 +392,16 @@ impl Scheduler {
         }
     }
 
-    /// Enqueue `pid` on the least-loaded CPU's run queue.
+    /// Enqueue `pid` on the current CPU's run queue.
+    ///
+    /// In single-core mode (the only mode currently supported), this always
+    /// targets CPU 0.  The previous load-balanced implementation distributed
+    /// PIDs across `MAX_CPUS` queues, but only CPU 0 is active — processes
+    /// placed on other queues were never dequeued (work stealing only triggers
+    /// when the local queue is empty, which rarely happens when other processes
+    /// are already running on CPU 0).
     fn enqueue_load_balanced_with_nice(&mut self, pid: Pid, nice: i8) {
-        let target_cpu = (0..MAX_CPUS)
-            .min_by_key(|&cpu_index| self.run_queues[cpu_index].total_len())
-            .unwrap_or(0);
+        let target_cpu = Self::current_cpu_id();
         self.run_queues[target_cpu].push_with_nice(pid, nice);
     }
 
@@ -943,18 +948,18 @@ impl Scheduler {
 
     /// Mark the current process as a zombie and schedule away.
     ///
-    /// Called from `sys_exit()`. The process releases its address space
+    /// Called from `sys_exit()` and from the exception handler for fatal
+    /// signals (SIGSEGV, etc.).  The process releases its address space
     /// immediately; the slot is reclaimed when the parent calls `wait()`.
-    ///
-    /// Processes with no living parent (or whose parent never calls wait)
-    /// are reparented to PID 1 (init) — TECHNICAL DEBT (Fase 5): for now
-    /// we free them immediately.
     ///
     /// # Safety
     /// Must be called with IRQs disabled. Does not return.
     pub unsafe fn exit(&mut self, exit_code: i32) -> ! {
         let cpu_id = Self::current_cpu_id();
         let pid = self.current_pids[cpu_id];
+
+        // Clean up BPM permissiond registration if this is the permissiond process.
+        crate::permission::ipc_channel::unregister_permissiond(pid);
 
         // Free the address space but keep the slot alive (zombie state).
         if let Some(process) = self.pool.get_mut(pid) {

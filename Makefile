@@ -58,6 +58,7 @@ BSL_DIRS := \
 	DIR:/data \
 	DIR:/data/temp \
 	DIR:/data/logs \
+	DIR:/system/config/policies \
 	DIR:/data/test \
 	DIR:/dev \
 	DIR:/proc \
@@ -74,7 +75,9 @@ DISK_FILES := \
 	userspace/config/system_config/hostname:/system/config/hostname \
 	userspace/config/test_files/root_secret.txt:/data/test/root_secret.txt \
 	userspace/config/test_files/public.txt:/data/test/public.txt \
-	userspace/config/test_files/script.sh:/data/test/script.sh
+	userspace/config/test_files/script.sh:/data/test/script.sh \
+	userspace/target/aarch64-unknown-none/release/hello:/home/user/hello \
+	userspace/target/aarch64-unknown-none/release/readhome:/home/user/readhome
 
 # ---------------------------------------------------------------------------
 # Default: build everything (kernel + disk image)

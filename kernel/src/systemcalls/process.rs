@@ -10,11 +10,11 @@ use super::*;
 
 pub(super) unsafe fn sys_exit(exit_code: i32) -> i64 {
     let pid = crate::scheduler::with_scheduler(|s| s.current_pid());
-    crate::drivers::uart::puts("[exit] pid=");
-    crate::drivers::uart::put_hex(pid.index as u64);
-    crate::drivers::uart::puts(" code=");
-    crate::drivers::uart::put_hex(exit_code as u64);
-    crate::drivers::uart::puts("\r\n");
+
+    // If this is the permissiond process, clear the registration so a
+    // restart can re-register.
+    crate::permission::ipc_channel::unregister_permissiond(pid);
+
     // Grab the FD table Arc before entering the scheduler critical section.
     let fd_table_arc = crate::scheduler::with_scheduler(|scheduler| {
         scheduler.current_process()
@@ -144,7 +144,7 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
 
         // Clone the parent's current fd table so the child inherits open fds
         // (including any pipe ends that bzinit redirected via dup2 before spawn).
-        let (parent_fd_table_clone, parent_identity) = match scheduler.current_process() {
+        let (parent_fd_table_clone, parent_identity, parent_bpm) = match scheduler.current_process() {
             Some(p) => {
                 let fd_clone = {
                     let guard = p.file_descriptor_table.lock();
@@ -152,9 +152,10 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
                 };
                 let identity = (p.uid, p.gid, p.euid, p.egid, p.suid, p.sgid,
                                 p.supplemental_groups, p.ngroups);
-                (Some(fd_clone), Some(identity))
+                let bpm = (p.granted_permissions.clone(), p.granted_actions.clone());
+                (Some(fd_clone), Some(identity), Some(bpm))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
         let child_pid = match scheduler.create_process(Some(parent_pid)) {
@@ -204,6 +205,21 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
         // Replace the fresh fd table with the parent's clone (inheriting pipes).
         if let Some(fd_clone) = parent_fd_table_clone {
             *child.file_descriptor_table.lock() = fd_clone;
+        }
+
+        // Binary Permission Model — resolve tier and apply to child.
+        // NOTE: This block runs INSIDE the scheduler closure where `child`
+        // is borrowed mutably.  `elf_data` and `name` are captured from
+        // the outer scope and must still be valid.
+        {
+            let (pp, pa) = parent_bpm.clone().unwrap_or_default();
+            let has_perm_section = crate::permission::elf_has_bazzulto_permissions_section(elf_data);
+            if let Some((new_perms, new_actions)) = crate::permission::resolve_exec_permissions(
+                name, has_perm_section, &pp, &pa, name,
+            ) {
+                child.granted_permissions = new_perms;
+                child.granted_actions = new_actions;
+            }
         }
 
         // Build the initial ExceptionFrame on the child's kernel stack.
@@ -490,26 +506,88 @@ pub(super) unsafe fn sys_exec(
 
     // Binary Permission Model — tier dispatch at exec time.
     //
-    // Tier 1: system binary → full trust (wildcard permissions).
-    // Tier 4: no .bazzulto_permissions section → inherit from parent + warn.
-    // Tier 2/3: section present → permissiond handles it (post-v1.0); we do
-    //           not touch the sets and leave them as-is.
+    // 1. Compute SHA-256 hash of PT_LOAD segments (binary identity).
+    // 2. Check Tier 1 (system binary path → full trust).
+    // 3. If permissiond is available, check Tier 2 (policy exists).
+    // 4. If no policy, check Tier 3/4 via permissiond IPC or inheritance.
     //
     // Reference: docs/features/Binary Permission Model.md §Tier Dispatch.
+    let binary_hash = crate::loader::compute_binary_hash(elf_data);
+    let has_perm_section = crate::permission::elf_has_bazzulto_permissions_section(elf_data);
+
     let exec_permission_tier_result = {
-        let has_perm_section = crate::permission::elf_has_bazzulto_permissions_section(elf_data);
         let (parent_perms, parent_actions) = crate::scheduler::with_scheduler(|scheduler| {
             scheduler.current_process()
                 .map(|p| (p.granted_permissions.clone(), p.granted_actions.clone()))
                 .unwrap_or_default()
         });
-        crate::permission::resolve_exec_permissions(
-            name,
-            has_perm_section,
-            &parent_perms,
-            &parent_actions,
-            name,
-        )
+
+        // Tier 1: system binary — unconditional full trust.
+        if crate::permission::is_system_binary_path(name) {
+            Some(crate::permission::resolve_exec_permissions(
+                name, has_perm_section, &parent_perms, &parent_actions, name,
+            ).unwrap_or_else(|| (parent_perms.clone(), parent_actions.clone())))
+        }
+        // Tier 2: check permissiond policy store (if permissiond available).
+        else if crate::permission::ipc_channel::is_permissiond_available() {
+            if let Some(ref hash) = binary_hash {
+                let mut hex_buf = [0u8; 64];
+                crate::crypto::hex_digest(hash, &mut hex_buf);
+                let hex_str = core::str::from_utf8(&hex_buf).unwrap_or("");
+
+                // Submit request to permissiond and let it decide.
+                let (caller_uid, has_tty) = crate::scheduler::with_scheduler(|s| {
+                    s.current_process().map(|p| (p.uid, true)).unwrap_or((0, false))
+                });
+                let request = crate::permission::ipc_channel::PermRequest {
+                    blocked_pid: crate::scheduler::with_scheduler(|s| s.current_pid()),
+                    binary_path: alloc::string::String::from(name),
+                    hash_hex: alloc::string::String::from(hex_str),
+                    has_elf_section: has_perm_section,
+                    caller_uid,
+                    has_tty,
+                };
+
+                if let Some(_slot) = crate::permission::ipc_channel::submit_request(request) {
+                    // Block the current process while permissiond evaluates.
+                    crate::scheduler::with_scheduler(|scheduler| unsafe {
+                        scheduler.block_current();
+                    });
+
+                    // After unblock, check the response.
+                    let current_pid = crate::scheduler::with_scheduler(|s| s.current_pid());
+                    match crate::permission::ipc_channel::take_response(current_pid) {
+                        Some(crate::permission::ipc_channel::PermDecision::Granted(patterns)) => {
+                            Some((patterns, parent_actions.clone()))
+                        }
+                        Some(crate::permission::ipc_channel::PermDecision::GrantedInherited) => {
+                            Some((parent_perms.clone(), parent_actions.clone()))
+                        }
+                        Some(crate::permission::ipc_channel::PermDecision::Denied) => {
+                            return EPERM;
+                        }
+                        None => {
+                            // No response (timeout/error) — fall through to Tier 4.
+                            Some((parent_perms.clone(), parent_actions.clone()))
+                        }
+                    }
+                } else {
+                    // Queue full — fall back to Tier 4.
+                    crate::permission::emit_tier4_warning(name);
+                    Some((parent_perms.clone(), parent_actions.clone()))
+                }
+            } else {
+                // Can't compute hash — fall back to Tier 4.
+                crate::permission::emit_tier4_warning(name);
+                Some((parent_perms.clone(), parent_actions.clone()))
+            }
+        }
+        // Tier 4 (no permissiond): inherit from parent.
+        else {
+            crate::permission::resolve_exec_permissions(
+                name, has_perm_section, &parent_perms, &parent_actions, name,
+            )
+        }
     };
 
     // Parse argv: NULL-terminated array of NUL-terminated C string pointers.

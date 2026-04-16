@@ -278,6 +278,39 @@ unsafe fn handle_key_event(state: &mut KeyboardState, keycode: u16, event_value:
         return;
     }
 
+    // Arrow keys and special keys → ANSI escape sequences.
+    // These keycodes fall outside the ASCII keymap and must be handled
+    // separately.  Each arrow emits a 3-byte CSI sequence: ESC [ A/B/C/D.
+    //
+    // Linux evdev keycodes:
+    //   103 = KEY_UP,  105 = KEY_LEFT,  106 = KEY_RIGHT,  108 = KEY_DOWN
+    //   102 = KEY_HOME, 107 = KEY_END,  111 = KEY_DELETE
+    {
+        let escape_char: u8 = match keycode {
+            103 => b'A', // Up
+            108 => b'B', // Down
+            106 => b'C', // Right
+            105 => b'D', // Left
+            102 => b'H', // Home
+            107 => b'F', // End
+            _ => 0,
+        };
+        if escape_char != 0 {
+            crate::drivers::tty::tty_receive_char(0x1B);
+            crate::drivers::tty::tty_receive_char(b'[');
+            crate::drivers::tty::tty_receive_char(escape_char);
+            return;
+        }
+        // Delete key → ESC[3~
+        if keycode == 111 {
+            crate::drivers::tty::tty_receive_char(0x1B);
+            crate::drivers::tty::tty_receive_char(b'[');
+            crate::drivers::tty::tty_receive_char(b'3');
+            crate::drivers::tty::tty_receive_char(b'~');
+            return;
+        }
+    }
+
     let keycode_idx = keycode as usize;
     if keycode_idx >= 128 {
         return;

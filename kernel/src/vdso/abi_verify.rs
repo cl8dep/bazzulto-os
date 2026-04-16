@@ -216,9 +216,9 @@ const _: () = {
     }
 };
 
-// Verify slot count covers the highest syscall number (SETGROUPS = 166).
+// Verify slot count covers the highest syscall number (BPM_RESPOND = 169).
 const _: () = {
-    if VDSO_SLOT_COUNT <= 166 {
-        panic!("VDSO_SLOT_COUNT must be > 166 (SETGROUPS)");
+    if VDSO_SLOT_COUNT <= 169 {
+        panic!("VDSO_SLOT_COUNT must be > 169 (BPM_RESPOND)");
     }
 };

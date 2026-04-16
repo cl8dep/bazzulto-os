@@ -9,6 +9,7 @@
 extern crate alloc;
 
 mod arch;
+mod crypto;
 mod display;
 mod drivers;
 mod fs;

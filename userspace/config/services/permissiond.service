@@ -1,0 +1,7 @@
+[Service]
+name           = "permissiond"
+binary         = "/system/bin/permissiond"
+after          = []
+restart        = "always"
+max_retries    = "3"
+capabilities   = ["setcap"]

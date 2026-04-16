@@ -38,6 +38,10 @@ impl Color {
 // TextRenderer
 // ---------------------------------------------------------------------------
 
+/// Maximum columns and rows for the screen buffer.
+const SCREEN_MAX_COLS: usize = 256;
+const SCREEN_MAX_ROWS: usize = 128;
+
 pub struct TextRenderer {
     /// Current pen position — top-left of the next character.
     cursor_x:   u32,
@@ -52,24 +56,36 @@ pub struct TextRenderer {
     margin_top:  u32,
     /// Line height in pixels (point_size + leading).
     line_height: u32,
-    /// Advance width of the last rendered character.
+    /// Fixed cell width for monospace rendering.
     ///
-    /// Used by `backspace()` to move the cursor back the correct distance.
-    /// JetBrainsMono is monospaced so this value is constant after the first
-    /// character is rendered.  Initialized to an estimate; updated on each
-    /// `draw_char` call.
-    last_advance: u32,
+    /// Every character occupies this exact width regardless of its individual
+    /// glyph metrics.  Computed once at initialization from a reference glyph
+    /// ('M') and never changed.  This ensures uniform spacing across the grid.
+    cell_width: u32,
+    /// Screen buffer: stores the character at each (col, row) cell so
+    /// the cursor can be drawn as an inverted block and then restored
+    /// without losing the glyph underneath.
+    screen: [[char; SCREEN_MAX_COLS]; SCREEN_MAX_ROWS],
 }
 
 impl TextRenderer {
     pub fn new(
-        point_size:  f32,
-        foreground:  Color,
-        background:  Color,
-        margin_left: u32,
-        margin_top:  u32,
+        point_size:   f32,
+        foreground:   Color,
+        background:   Color,
+        margin_left:  u32,
+        margin_top:   u32,
+        font_id:      FontId,
+        font_manager: &mut FontManager,
     ) -> TextRenderer {
         let line_height = (point_size * 1.25) as u32;
+        // Compute fixed cell width from the reference glyph 'M'.
+        // For a monospace font every glyph should have the same advance,
+        // but fontdue returns floats that truncate differently per glyph.
+        // Using a single rounded value eliminates the drift.
+        let cell_width = font_manager.rasterize(font_id, 'M', point_size)
+            .map(|bm| (bm.advance_width + 0.5) as u32)
+            .unwrap_or((point_size * 0.6) as u32);
         TextRenderer {
             cursor_x: margin_left,
             cursor_y: margin_top,
@@ -79,7 +95,8 @@ impl TextRenderer {
             margin_left,
             margin_top,
             line_height,
-            last_advance: (point_size * 0.6) as u32,
+            cell_width,
+            screen: [[' '; SCREEN_MAX_COLS]; SCREEN_MAX_ROWS],
         }
     }
 
@@ -117,12 +134,12 @@ impl TextRenderer {
         if self.cursor_x <= self.margin_left {
             return; // already at left margin — nothing to erase
         }
-        self.cursor_x = self.cursor_x.saturating_sub(self.last_advance).max(self.margin_left);
+        self.cursor_x = self.cursor_x.saturating_sub(self.cell_width).max(self.margin_left);
         // Erase the cell by filling it with the background colour.
         surface.fill_rect(
             self.cursor_x,
             self.cursor_y,
-            self.last_advance,
+            self.cell_width,
             self.line_height,
             self.background.r,
             self.background.g,
@@ -130,36 +147,125 @@ impl TextRenderer {
         );
     }
 
-    /// Draw a block cursor at the current cursor position.
+    /// Draw a block cursor at the current position with inverted colours.
     ///
-    /// The cursor is a filled rectangle `last_advance` wide and `line_height`
-    /// tall, drawn in the foreground colour.  Call `erase_cursor` before
-    /// rendering new text so the cursor cell is cleared first.
-    pub fn draw_cursor(&self, surface: &mut FramebufferSurface) {
-        let width = self.last_advance.max(1);
+    /// The character under the cursor (from the screen buffer) is re-rendered
+    /// with swapped foreground/background, matching the macOS Terminal style.
+    /// If the cell is empty (space), a solid foreground block is drawn.
+    pub fn draw_cursor_with_font(
+        &mut self,
+        font_id: FontId,
+        font_manager: &mut FontManager,
+        surface: &mut FramebufferSurface,
+    ) {
+        let advance = self.cell_width.max(1);
+        // Fill the cell with foreground colour (the "block").
         surface.fill_rect(
-            self.cursor_x,
-            self.cursor_y,
-            width,
-            self.line_height,
-            self.foreground.r,
-            self.foreground.g,
-            self.foreground.b,
+            self.cursor_x, self.cursor_y,
+            advance, self.line_height,
+            self.foreground.r, self.foreground.g, self.foreground.b,
+        );
+        // Render the character in background colour (inverted) on top.
+        let ch = self.char_at_cursor();
+        if ch != ' ' {
+            self.render_char_at_cursor(ch, font_id, font_manager, surface,
+                self.background, self.foreground);
+        }
+    }
+
+    /// Erase the block cursor by restoring the character with normal colours.
+    pub fn erase_cursor_with_font(
+        &mut self,
+        font_id: FontId,
+        font_manager: &mut FontManager,
+        surface: &mut FramebufferSurface,
+    ) {
+        let advance = self.cell_width.max(1);
+        // Fill the cell with background colour.
+        surface.fill_rect(
+            self.cursor_x, self.cursor_y,
+            advance, self.line_height,
+            self.background.r, self.background.g, self.background.b,
+        );
+        // Re-render the character normally.
+        let ch = self.char_at_cursor();
+        if ch != ' ' {
+            self.render_char_at_cursor(ch, font_id, font_manager, surface,
+                self.foreground, self.background);
+        }
+    }
+
+    /// Legacy cursor methods (no font) — used for blink toggle when we
+    /// don't want to pass font through.  Kept as thin wrappers.
+    pub fn draw_cursor(&self, surface: &mut FramebufferSurface) {
+        let advance = self.cell_width.max(1);
+        surface.fill_rect(
+            self.cursor_x, self.cursor_y,
+            advance, self.line_height,
+            self.foreground.r, self.foreground.g, self.foreground.b,
         );
     }
 
-    /// Erase the cursor cell by filling it with the background colour.
     pub fn erase_cursor(&self, surface: &mut FramebufferSurface) {
-        let width = self.last_advance.max(1);
+        let advance = self.cell_width.max(1);
         surface.fill_rect(
-            self.cursor_x,
-            self.cursor_y,
-            width,
-            self.line_height,
-            self.background.r,
-            self.background.g,
-            self.background.b,
+            self.cursor_x, self.cursor_y,
+            advance, self.line_height,
+            self.background.r, self.background.g, self.background.b,
         );
+    }
+
+    /// Clear the entire screen and reset the cursor to the home position.
+    ///
+    /// Called when the ANSI escape sequence `ESC[2J` is received.
+    pub fn clear_screen(&mut self, surface: &mut FramebufferSurface) {
+        surface.fill_rect(0, 0, surface.width, surface.height,
+            self.background.r, self.background.g, self.background.b);
+        self.cursor_x = self.margin_left;
+        self.cursor_y = self.margin_top;
+        self.screen = [[' '; SCREEN_MAX_COLS]; SCREEN_MAX_ROWS];
+    }
+
+    /// Reset the cursor to the home position (top-left).
+    ///
+    /// Called when the ANSI escape sequence `ESC[H` is received.
+    pub fn cursor_home(&mut self) {
+        self.cursor_x = self.margin_left;
+        self.cursor_y = self.margin_top;
+    }
+
+    /// Erase from the cursor to the end of the current line.
+    ///
+    /// Called when the ANSI escape sequence `ESC[K` is received.
+    pub fn erase_to_end_of_line(&mut self, surface: &mut FramebufferSurface) {
+        let remaining_width = surface.width.saturating_sub(self.cursor_x);
+        if remaining_width > 0 {
+            surface.fill_rect(
+                self.cursor_x, self.cursor_y,
+                remaining_width, self.line_height,
+                self.background.r, self.background.g, self.background.b,
+            );
+        }
+    }
+
+    /// Move the cursor forward (right) by `count` character cells.
+    ///
+    /// Called when the ANSI escape sequence `ESC[<n>C` is received.
+    pub fn cursor_forward(&mut self, count: u32, surface: &FramebufferSurface) {
+        let advance = self.cell_width.max(1);
+        self.cursor_x = (self.cursor_x + advance * count).min(
+            surface.width.saturating_sub(advance),
+        );
+    }
+
+    /// Move the cursor backward (left) by `count` character cells.
+    ///
+    /// Called when the ANSI escape sequence `ESC[<n>D` is received.
+    pub fn cursor_backward(&mut self, count: u32) {
+        let advance = self.cell_width.max(1);
+        self.cursor_x = self.cursor_x
+            .saturating_sub(advance * count)
+            .max(self.margin_left);
     }
 
     /// Move cursor to a new line, scrolling the framebuffer if at the bottom.
@@ -176,6 +282,70 @@ impl TextRenderer {
     }
 
     // -----------------------------------------------------------------------
+    // Screen buffer helpers
+    // -----------------------------------------------------------------------
+
+    /// Current column in character grid coordinates.
+    fn cursor_col(&self) -> usize {
+        let advance = self.cell_width.max(1);
+        ((self.cursor_x.saturating_sub(self.margin_left)) / advance) as usize
+    }
+
+    /// Current row in character grid coordinates.
+    fn cursor_row(&self) -> usize {
+        ((self.cursor_y.saturating_sub(self.margin_top)) / self.line_height) as usize
+    }
+
+    /// Get the character stored at the current cursor position.
+    fn char_at_cursor(&self) -> char {
+        let col = self.cursor_col();
+        let row = self.cursor_row();
+        if row < SCREEN_MAX_ROWS && col < SCREEN_MAX_COLS {
+            self.screen[row][col]
+        } else {
+            ' '
+        }
+    }
+
+    /// Store a character in the screen buffer at the current cursor position.
+    fn store_char(&mut self, character: char) {
+        let col = self.cursor_col();
+        let row = self.cursor_row();
+        if row < SCREEN_MAX_ROWS && col < SCREEN_MAX_COLS {
+            self.screen[row][col] = character;
+        }
+    }
+
+    /// Render a single character at the current cursor position with
+    /// explicit foreground/background colours (used for cursor inversion).
+    fn render_char_at_cursor(
+        &self,
+        character: char,
+        font_id: FontId,
+        font_manager: &mut FontManager,
+        surface: &mut FramebufferSurface,
+        fg: Color,
+        bg: Color,
+    ) {
+        let ascender = font_manager.ascender_pixels(font_id, self.point_size);
+        if let Some(bitmap) = font_manager.rasterize(font_id, character, self.point_size) {
+            let glyph_x = (self.cursor_x as i32 + bitmap.x_offset).max(0) as u32;
+            let glyph_top = (self.cursor_y as i32
+                + ascender as i32
+                - bitmap.y_offset
+                - bitmap.height as i32
+                + 1)
+                .max(0) as u32;
+            surface.draw_bitmap(
+                glyph_x, glyph_top,
+                &bitmap.coverage, bitmap.width, bitmap.height,
+                fg.r, fg.g, fg.b,
+                bg.r, bg.g, bg.b,
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -186,54 +356,36 @@ impl TextRenderer {
         font_manager: &mut FontManager,
         surface:      &mut FramebufferSurface,
     ) {
+        // Store in screen buffer before advancing cursor.
+        self.store_char(character);
+
         let ascender = font_manager.ascender_pixels(font_id, self.point_size);
         let bitmap_opt = font_manager.rasterize(font_id, character, self.point_size);
 
-        let advance = match bitmap_opt {
-            Some(bitmap) => {
-                let advance_pixels = bitmap.advance_width as u32;
-                // Place glyph so its baseline aligns with cursor_y + ascender.
-                //
-                // fontdue coordinate system (y-up from baseline):
-                //   bitmap row 0        = font-space y = ymin + height - 1  (topmost pixel)
-                //   bitmap row height-1 = font-space y = ymin               (bottommost pixel)
-                //   baseline            = font-space y = 0
-                //
-                // In screen space (y-down), the baseline is at cursor_y + ascender.
-                //   glyph_top_screen = cursor_y + ascender - ymin - height + 1
-                //
-                // Note: ymin is signed (negative for descenders), so use i32 arithmetic.
-                let ymin = bitmap.y_offset; // signed: negative for descenders
-                let glyph_top = (self.cursor_y as i32
-                    + ascender as i32
-                    - ymin
-                    - bitmap.height as i32
-                    + 1)
-                    .max(0) as u32;
+        if let Some(bitmap) = bitmap_opt {
+            let glyph_x = (self.cursor_x as i32 + bitmap.x_offset).max(0) as u32;
+            let glyph_top = (self.cursor_y as i32
+                + ascender as i32
+                - bitmap.y_offset
+                - bitmap.height as i32
+                + 1)
+                .max(0) as u32;
 
-                surface.draw_bitmap(
-                    self.cursor_x,
-                    glyph_top,
-                    &bitmap.coverage,
-                    bitmap.width,
-                    bitmap.height,
-                    self.foreground.r, self.foreground.g, self.foreground.b,
-                    self.background.r, self.background.g, self.background.b,
-                );
+            surface.draw_bitmap(
+                glyph_x,
+                glyph_top,
+                &bitmap.coverage,
+                bitmap.width,
+                bitmap.height,
+                self.foreground.r, self.foreground.g, self.foreground.b,
+                self.background.r, self.background.g, self.background.b,
+            );
+        }
 
-                advance_pixels
-            }
-            None => {
-                // No glyph — advance by a fixed amount to avoid stalling.
-                (self.point_size * 0.6) as u32
-            }
-        };
-
-        self.last_advance = advance;
-        self.cursor_x += advance;
+        self.cursor_x += self.cell_width;
 
         // Wrap at right edge.
-        if self.cursor_x + advance > surface.width {
+        if self.cursor_x + self.cell_width > surface.width {
             self.newline(surface);
         }
     }

@@ -5,6 +5,7 @@ members = [
     "system/bzdisplayd",
     "system/bzctl",
     "system/fontmanager",
+    "system/permissiond",
 
     # User programs — shell and POSIX utilities
     "programs/sh",

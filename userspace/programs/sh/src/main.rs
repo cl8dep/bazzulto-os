@@ -314,6 +314,8 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
 
 /// Read one full line from fd. Strips the trailing '\n'.
 /// Returns None on EOF.
+///
+/// For non-interactive use (fd != 0 or piped scripts).
 fn read_line(fd: i32) -> Option<String> {
     let mut result = String::new();
     let mut buf = [0u8; 1];
@@ -329,6 +331,308 @@ fn read_line(fd: i32) -> Option<String> {
             result.push_str(ch);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive line editor
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TTY raw mode control
+// ---------------------------------------------------------------------------
+
+/// Termios struct layout — matches the kernel's `Termios` (48 bytes, repr(C)).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_cc: [u8; 32],
+}
+
+const TERMIOS_ICANON: u32 = 0x0002;
+const TERMIOS_ECHO:   u32 = 0x0008;
+
+fn tcgetattr(fd: i32, termios: &mut Termios) -> i64 {
+    let r: i64;
+    unsafe {
+        core::arch::asm!("svc #61",
+            in("x0") fd as u64,
+            in("x1") termios as *mut Termios as u64,
+            lateout("x0") r,
+            options(nostack));
+    }
+    r
+}
+
+fn tcsetattr(fd: i32, termios: &Termios) -> i64 {
+    let r: i64;
+    unsafe {
+        core::arch::asm!("svc #62",
+            in("x0") fd as u64,
+            in("x1") 0u64,  // TCSANOW
+            in("x2") termios as *const Termios as u64,
+            lateout("x0") r,
+            options(nostack));
+    }
+    r
+}
+
+/// Switch fd 0 to raw mode (no echo, no line buffering).
+/// Returns the original termios for restoration.
+fn tty_enter_raw_mode() -> Termios {
+    let mut original = Termios {
+        c_iflag: 0, c_oflag: 0, c_cflag: 0, c_lflag: 0, c_cc: [0; 32],
+    };
+    tcgetattr(0, &mut original);
+    let mut raw = original;
+    raw.c_lflag &= !(TERMIOS_ICANON | TERMIOS_ECHO);
+    tcsetattr(0, &raw);
+    original
+}
+
+/// Restore the original termios.
+fn tty_restore_mode(termios: &Termios) {
+    tcsetattr(0, termios);
+}
+
+/// Read a byte from stdin. Returns None on EOF/error.
+fn read_byte() -> Option<u8> {
+    let mut buf = [0u8; 1];
+    let n = raw::raw_read(0, buf.as_mut_ptr(), 1);
+    if n <= 0 { None } else { Some(buf[0]) }
+}
+
+/// Write raw bytes to stderr (the terminal output fd).
+fn term_write(bytes: &[u8]) {
+    raw::raw_write(2, bytes.as_ptr(), bytes.len());
+}
+
+/// Move the terminal cursor `n` positions to the right.
+fn cursor_forward(n: usize) {
+    if n == 0 { return; }
+    let mut buf = [0u8; 16];
+    let len = fmt_csi_n(&mut buf, n, b'C');
+    term_write(&buf[..len]);
+}
+
+/// Move the terminal cursor `n` positions to the left.
+fn cursor_backward(n: usize) {
+    if n == 0 { return; }
+    let mut buf = [0u8; 16];
+    let len = fmt_csi_n(&mut buf, n, b'D');
+    term_write(&buf[..len]);
+}
+
+/// Format `ESC[<n><cmd>` into `buf`. Returns length written.
+fn fmt_csi_n(buf: &mut [u8; 16], n: usize, cmd: u8) -> usize {
+    buf[0] = 0x1B;
+    buf[1] = b'[';
+    let digits = format_usize(n);
+    let dlen = digits.len();
+    buf[2..2 + dlen].copy_from_slice(digits.as_bytes());
+    buf[2 + dlen] = cmd;
+    3 + dlen
+}
+
+/// Format a usize as a decimal string (stack-allocated, max 20 digits).
+fn format_usize(mut value: usize) -> String {
+    if value == 0 { return String::from("0"); }
+    let mut digits = [0u8; 20];
+    let mut pos = 20;
+    while value > 0 {
+        pos -= 1;
+        digits[pos] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    String::from(core::str::from_utf8(&digits[pos..]).unwrap_or("0"))
+}
+
+/// Interactive line editor with cursor movement support.
+///
+/// Supports:
+///   - Printable characters (insert at cursor)
+///   - Backspace / Ctrl+H (delete before cursor)
+///   - Delete key ESC[3~ (delete at cursor)
+///   - Left arrow ESC[D / Ctrl+B (move left)
+///   - Right arrow ESC[C / Ctrl+F (move right)
+///   - Home ESC[H / Ctrl+A (move to start)
+///   - End ESC[F / Ctrl+E (move to end)
+///   - Ctrl+U (kill line — erase entire input)
+///   - Ctrl+K (kill to end of line)
+///   - Ctrl+W (kill word backward)
+///   - Ctrl+C (cancel line, return empty)
+///   - Ctrl+D on empty line (EOF)
+///   - Enter (submit line)
+///
+/// Returns None on EOF, Some(line) on Enter.
+fn read_line_interactive() -> Option<String> {
+    let mut line: Vec<u8> = Vec::new();
+    let mut cursor: usize = 0; // byte offset into `line`
+
+    // Enter raw mode so we get bytes one at a time without echo.
+    let saved_termios = tty_enter_raw_mode();
+
+    let result = read_line_inner(&mut line, &mut cursor);
+
+    // Restore cooked mode before returning.
+    tty_restore_mode(&saved_termios);
+
+    result
+}
+
+fn read_line_inner(line: &mut Vec<u8>, pos: &mut usize) -> Option<String> {
+    loop {
+        let byte = match read_byte() {
+            Some(b) => b,
+            None => {
+                if line.is_empty() { return None; }
+                return Some(String::from(core::str::from_utf8(line).unwrap_or("")));
+            }
+        };
+
+        match byte {
+            // Enter — submit.
+            b'\n' | b'\r' => {
+                term_write(b"\n");
+                return Some(String::from(core::str::from_utf8(line).unwrap_or("")));
+            }
+
+            // Ctrl+D — EOF on empty line, delete-at-cursor otherwise.
+            0x04 => {
+                if line.is_empty() { return None; }
+                if *pos < line.len() {
+                    line.remove(*pos);
+                    redraw_from_cursor(line, *pos);
+                }
+            }
+
+            // Ctrl+C — cancel line.
+            // Move cursor to end, erase trailing text, then print ^C and newline.
+            0x03 => {
+                let remaining = line.len() - *pos;
+                if remaining > 0 {
+                    cursor_forward(remaining);
+                }
+                term_write(b"\x1b[K\n");
+                return Some(String::new());
+            }
+
+            // Backspace (0x7F) or Ctrl+H (0x08) — delete before cursor.
+            0x7F | 0x08 => {
+                if *pos > 0 {
+                    *pos -= 1;
+                    line.remove(*pos);
+                    cursor_backward(1);
+                    redraw_from_cursor(line, *pos);
+                }
+            }
+
+            // Ctrl+A — home.
+            0x01 => {
+                cursor_backward(*pos);
+                *pos = 0;
+            }
+
+            // Ctrl+E — end.
+            0x05 => {
+                cursor_forward(line.len() - *pos);
+                *pos = line.len();
+            }
+
+            // Ctrl+B — left.
+            0x02 => {
+                if *pos > 0 { *pos -= 1; cursor_backward(1); }
+            }
+
+            // Ctrl+F — right.
+            0x06 => {
+                if *pos < line.len() { *pos += 1; cursor_forward(1); }
+            }
+
+            // Ctrl+U — kill entire line.
+            0x15 => {
+                cursor_backward(*pos);
+                let len = line.len();
+                for _ in 0..len { term_write(b" "); }
+                cursor_backward(len);
+                line.clear();
+                *pos = 0;
+            }
+
+            // Ctrl+K — kill to end of line.
+            0x0B => {
+                line.truncate(*pos);
+                term_write(b"\x1b[K");
+            }
+
+            // Ctrl+W — kill word backward.
+            0x17 => {
+                if *pos > 0 {
+                    let original = *pos;
+                    while *pos > 0 && line[*pos - 1] == b' ' { *pos -= 1; }
+                    while *pos > 0 && line[*pos - 1] != b' ' { *pos -= 1; }
+                    let removed = original - *pos;
+                    line.drain(*pos..original);
+                    cursor_backward(removed);
+                    redraw_from_cursor(line, *pos);
+                }
+            }
+
+            // ESC — start of escape sequence.
+            0x1B => {
+                if let Some(b'[') = read_byte() {
+                    match read_byte() {
+                        Some(b'C') => { if *pos < line.len() { *pos += 1; cursor_forward(1); } }
+                        Some(b'D') => { if *pos > 0 { *pos -= 1; cursor_backward(1); } }
+                        Some(b'A') | Some(b'B') => {} // history — not yet
+                        Some(b'H') => { cursor_backward(*pos); *pos = 0; }
+                        Some(b'F') => { cursor_forward(line.len() - *pos); *pos = line.len(); }
+                        Some(b'3') => {
+                            if read_byte() == Some(b'~') && *pos < line.len() {
+                                line.remove(*pos);
+                                redraw_from_cursor(line, *pos);
+                            }
+                        }
+                        Some(b'1') => { if read_byte() == Some(b'~') { cursor_backward(*pos); *pos = 0; } }
+                        Some(b'4') => { if read_byte() == Some(b'~') { cursor_forward(line.len() - *pos); *pos = line.len(); } }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Printable ASCII — insert at cursor.
+            0x20..=0x7E => {
+                line.insert(*pos, byte);
+                *pos += 1;
+                term_write(&[byte]);
+                if *pos < line.len() {
+                    redraw_from_cursor(line, *pos);
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// Redraw the line from `cursor` to end, clear trailing chars, restore cursor.
+///
+/// After inserting or deleting a character in the middle of the line, the
+/// characters from the cursor to the end need to be reprinted, and any
+/// leftover characters from a longer previous line must be erased.
+fn redraw_from_cursor(line: &[u8], cursor: usize) {
+    let tail = &line[cursor..];
+    if !tail.is_empty() {
+        term_write(tail);
+    }
+    // Erase anything beyond the new end of line.
+    term_write(b"\x1b[K");
+    // Move cursor back to its logical position.
+    let overshoot = tail.len();
+    cursor_backward(overshoot);
 }
 
 /// §2.7.4: For each here-document redirect in the pipeline, read body lines
@@ -373,9 +677,16 @@ fn shell_main(state: &mut ShellState) {
         };
         write_err(&prompt);
 
-        let line = match read_line(0) {
-            Some(l) => l,
-            None => break, // EOF
+        let line = if state.is_interactive {
+            match read_line_interactive() {
+                Some(l) => l,
+                None => break, // EOF
+            }
+        } else {
+            match read_line(0) {
+                Some(l) => l,
+                None => break, // EOF
+            }
         };
 
         // Skip empty lines and comment lines (only when not in a continuation).

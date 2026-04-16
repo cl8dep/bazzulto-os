@@ -1,0 +1,26 @@
+[package]
+name    = "permissiond"
+version = "0.1.0"
+edition = "2021"
+
+# permissiond — Bazzulto Binary Permission Model daemon.
+#
+# Completely standalone — no BSL dependency.
+# Uses only raw inline SVC for syscalls to avoid any initialization issues.
+
+[[bin]]
+name = "permissiond"
+path = "src/main.rs"
+
+[dependencies]
+bazzulto-system = { path = "../../libraries/bsl/Bazzulto.System" }
+coreutils       = { path = "../../programs/coreutils" }
+
+[profile.release]
+panic     = "abort"
+opt-level = "s"
+lto       = true
+strip     = true
+
+[profile.dev]
+panic = "abort"

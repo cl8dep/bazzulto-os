@@ -36,6 +36,9 @@
 // # Reference
 //   docs/features/Binary Permission Model.md
 
+pub mod ipc_channel;
+pub mod policy_store;
+
 extern crate alloc;
 
 use alloc::string::String;
@@ -200,6 +203,10 @@ pub enum ActionPermission {
     ModifyKernelParams,
     /// Hard-reject: only permissiond may hold this, and the kernel never grants it.
     GrantPermissions,
+    /// Register as the permission daemon.  Only one process may hold this at
+    /// a time.  The kernel rejects further registrations once permissiond is
+    /// connected.  Impossible for userspace to self-grant.
+    RegisterPermissiond,
 }
 
 impl ActionPermission {
@@ -211,7 +218,8 @@ impl ActionPermission {
             Self::ModifyNetworkConfig => ApprovalLevel::Authenticated,
             Self::InstallPackage      => ApprovalLevel::Authenticated,
             Self::ModifyKernelParams  => ApprovalLevel::Authenticated,
-            Self::GrantPermissions    => ApprovalLevel::Impossible,
+            Self::GrantPermissions      => ApprovalLevel::Impossible,
+            Self::RegisterPermissiond   => ApprovalLevel::Impossible,
         }
     }
 }
@@ -414,7 +422,10 @@ pub fn resolve_exec_permissions(
                 ActionPermission::ModifyNetworkConfig,
                 ActionPermission::InstallPackage,
                 ActionPermission::ModifyKernelParams,
-                // GrantPermissions is intentionally excluded.
+                ActionPermission::RegisterPermissiond,
+                // GrantPermissions is intentionally excluded — only
+                // permissiond can hold it, and the kernel enforces this
+                // at the sys_perm_respond level, not via the action list.
             ],
         ));
     }
@@ -446,7 +457,7 @@ pub fn is_system_binary_path(path: &str) -> bool {
 ///
 /// In a future release, this warning will be forwarded to the process's
 /// stderr via a permissiond message.
-fn emit_tier4_warning(binary_name: &str) {
+pub fn emit_tier4_warning(binary_name: &str) {
     crate::drivers::uart::puts("[bazzulto] warning: ");
     crate::drivers::uart::puts(binary_name);
     crate::drivers::uart::puts(" has no permission declaration — running with inherited permissions\r\n");

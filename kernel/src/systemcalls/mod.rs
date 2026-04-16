@@ -213,6 +213,10 @@ pub mod numbers {
     pub const SETREUID:         u64 = 164;
     pub const SETREGID:         u64 = 165;
     pub const SETGROUPS:        u64 = 166;
+    // M5 — Binary Permission Model IPC
+    pub const BPM_REGISTER:     u64 = 167;  // sys_register_permissiond
+    pub const BPM_READ_REQUEST: u64 = 168;  // permissiond reads next request
+    pub const BPM_RESPOND:      u64 = 169;  // permissiond submits decision
 }
 
 use numbers::*;
@@ -230,6 +234,7 @@ mod scheduler;
 mod vfs;
 mod terminal;
 mod threads;
+mod bpm;
 mod identity;
 mod system;
 mod multiplexing;
@@ -727,6 +732,10 @@ pub fn dispatch(frame: *mut ExceptionFrame, syscall_number: u64) {
             SETREUID         => identity::sys_setreuid(arg0 as u32, arg1 as u32),
             SETREGID         => identity::sys_setregid(arg0 as u32, arg1 as u32),
             SETGROUPS        => identity::sys_setgroups(arg0 as usize, arg1 as *const u32),
+            // M5 — Binary Permission Model IPC
+            BPM_REGISTER     => bpm::sys_register_permissiond(),
+            BPM_READ_REQUEST => bpm::sys_bpm_read_request(arg0 as *mut u8, arg1 as usize),
+            BPM_RESPOND      => bpm::sys_bpm_respond(arg0 as u32, arg1 as u32, arg2 as *const u8, arg3 as usize),
             _          => ENOSYS,
         }
     };

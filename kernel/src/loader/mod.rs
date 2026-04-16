@@ -269,6 +269,63 @@ const USER_STACK_TOP_BASE: u64 = 0x0000_7FFF_FFFF_F000;
 // load_elf()
 // ---------------------------------------------------------------------------
 
+/// Compute the SHA-256 hash over all PT_LOAD segments of an ELF binary.
+///
+/// This is the **binary identity** used as the key for the BPM policy store.
+/// Hashes the raw bytes of each loadable segment in program-header order.
+/// For static binaries (v1.0), this is the complete identity.  For dynamic
+/// binaries (post-v1.0), the Merkle root would chain this with library hashes.
+///
+/// Returns the 32-byte SHA-256 digest, or `None` if the ELF is malformed.
+///
+/// Reference: docs/features/Binary Permission Model.md §Merkle root computation.
+pub fn compute_binary_hash(elf_data: &[u8]) -> Option<[u8; 32]> {
+    if elf_data.len() < 64 { return None; }
+
+    let e_phoff = u64::from_le_bytes(
+        elf_data[32..40].try_into().unwrap_or([0; 8])
+    ) as usize;
+    let e_phentsize = u16::from_le_bytes(
+        elf_data[54..56].try_into().unwrap_or([0; 2])
+    ) as usize;
+    let e_phnum = u16::from_le_bytes(
+        elf_data[56..58].try_into().unwrap_or([0; 2])
+    ) as usize;
+
+    if e_phoff == 0 || e_phentsize < 56 || e_phnum == 0 {
+        return None;
+    }
+
+    let mut hasher = crate::crypto::Sha256::new();
+    let mut found_load = false;
+
+    for i in 0..e_phnum {
+        let ph_offset = e_phoff + i * e_phentsize;
+        if ph_offset + e_phentsize > elf_data.len() { break; }
+
+        let p_type = u32::from_le_bytes(
+            elf_data[ph_offset..ph_offset + 4].try_into().unwrap_or([0; 4])
+        );
+        if p_type != PT_LOAD { continue; }
+
+        let p_offset = u64::from_le_bytes(
+            elf_data[ph_offset + 8..ph_offset + 16].try_into().unwrap_or([0; 8])
+        ) as usize;
+        let p_filesz = u64::from_le_bytes(
+            elf_data[ph_offset + 32..ph_offset + 40].try_into().unwrap_or([0; 8])
+        ) as usize;
+
+        if p_filesz == 0 { continue; }
+        let end = p_offset.saturating_add(p_filesz).min(elf_data.len());
+        if p_offset >= end { continue; }
+
+        hasher.update(&elf_data[p_offset..end]);
+        found_load = true;
+    }
+
+    if found_load { Some(hasher.finalize()) } else { None }
+}
+
 /// Parse and load an ELF64 binary into a new user address space.
 ///
 /// Steps:

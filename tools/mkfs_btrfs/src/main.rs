@@ -263,6 +263,8 @@ fn main() {
                 0o104755u32  // Setuid root: S_ISUID + rwxr-xr-x
             } else if path.contains("/system/bin/") || path.ends_with(".sh") {
                 0o100755u32  // Executables need +x for DAC
+            } else if path.contains("/home/user/") && !entry.is_dir {
+                0o100755u32  // User binaries need +x (BPM test programs)
             } else if path.ends_with("/shadow") || path.ends_with("/root_secret.txt") {
                 0o100600u32  // Root only — tests DAC denial for uid=1000
             } else {

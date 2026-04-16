@@ -62,6 +62,8 @@ pub enum SpecialFolder {
     DataLogs,
     /// `/apps` — user-installed applications.
     Apps,
+    /// `/system/config/policies` — BPM policy store (SHA-256 keyed).
+    SystemPolicies,
 }
 
 impl SpecialFolder {
@@ -80,6 +82,7 @@ impl SpecialFolder {
             SpecialFolder::DataTemp       => "/data/temp",
             SpecialFolder::DataLogs       => "/data/logs",
             SpecialFolder::Apps           => "/apps",
+            SpecialFolder::SystemPolicies => "/system/config/policies",
         }
     }
 }
