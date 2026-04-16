@@ -253,7 +253,15 @@ fn do_spawn(service_state: &mut ServiceState, binary: &str) {
             return;
         }
         if pid == 0 {
-            // Child: drop privileges, then exec.
+            // Child: close inherited fds (3..64) to avoid leaking pipe
+            // endpoints.  Without this, the shell inherits bzinit's copy
+            // of the display pipe read/write fds, and when a grandchild
+            // (su) closes them, the pipe write_end_count can drop to zero
+            // causing bzdisplayd to see EOF and stop rendering.
+            let mut fd = 3i32;
+            while fd < 64 { raw::raw_close(fd); fd += 1; }
+
+            // Drop privileges, then exec.
             raw::raw_setgid(gid);
             raw::raw_setuid(uid);
             let mut binary_buf = [0u8; 512];

@@ -138,8 +138,9 @@ fn render_loop(
     loop {
         let bytes_read = raw::raw_read(0, read_buf.as_mut_ptr(), read_buf.len());
         if bytes_read <= 0 {
-            // Pipe closed or read error — stay resident, drain nothing.
-            raw::raw_yield();
+            // Pipe returned EOF or error.  Sleep briefly and retry.
+            let sleep_ts: [u64; 2] = [0, 50_000_000]; // 50ms
+            raw::raw_nanosleep(sleep_ts.as_ptr());
             continue;
         }
 

@@ -1,60 +1,70 @@
 // POSIX — su (switch user)
 //
-// Bazzulto compatibility shim.  Exists for POSIX compliance; the normal
-// administration model uses the Binary Permission Model (BPM), not su.
+// Setuid-root binary (mode 4755). When exec'd by uid=1000, the kernel
+// sets euid=0 via the setuid bit, allowing su to change identity.
 //
-// This binary MUST be installed setuid-root (mode 4755, owner uid=0).
-// When uid=1000 executes it, the kernel's setuid-on-exec sets euid=0,
-// allowing su to call setuid/setgid to the target user.
+// Usage: su [username]   (default: "system")
 //
-// Usage: su [username]   (default: "system" = uid 0)
-//
-// Reference: docs/Roadmap.md M3 §3.9.
+// Written WITHOUT alloc — only stack buffers and raw syscalls.
+// The userspace heap allocator has issues in setuid binaries.
 
 #![no_std]
 #![no_main]
-extern crate alloc;
 extern crate coreutils;
 
-use alloc::string::String;
 use bazzulto_system::raw;
 use bazzulto_system::environment::{Environment, SpecialFile};
-use coreutils::{args, write_stdout, write_stderr};
 
 #[no_mangle]
-pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *const u8) -> ! {
-    bazzulto_system::init_with_args_envp(argc, argv, envp);
-
-    let arguments = args();
-    let target_user = if arguments.len() > 1 {
-        arguments[1].as_str()
-    } else {
-        "system"
-    };
-
-    // Resolve target uid/gid from passwd.
-    let (target_uid, target_gid, target_shell) = match resolve_user(target_user) {
-        Some(info) => info,
-        None => {
-            write_stderr("su: unknown user '");
-            write_stderr(target_user);
-            write_stderr("'\n");
-            raw::raw_exit(1);
-            unreachable!()
+pub extern "C" fn _start(argc: usize, argv: *const *const u8, _envp: *const *const u8) -> ! {
+    // Parse target username from argv (default: "system").
+    let mut target_user = b"system" as &[u8];
+    if argc > 1 && !argv.is_null() {
+        let arg1 = unsafe { *argv.add(1) };
+        if !arg1.is_null() {
+            let mut len = 0;
+            while unsafe { *arg1.add(len) } != 0 && len < 64 { len += 1; }
+            target_user = unsafe { core::slice::from_raw_parts(arg1, len) };
         }
-    };
+    }
 
-    // The binary must be setuid-root.  After exec, euid should be 0.
-    let current_euid = raw::raw_geteuid();
-    if current_euid != 0 {
-        write_stderr("su: must be setuid root\n");
+    // Resolve uid/gid/shell from passwd.
+    let mut target_uid: u32 = 0;
+    let mut target_gid: u32 = 0;
+    let mut shell_buf = [0u8; 128];
+    let mut shell_len: usize = 0;
+    if !resolve_user_from_passwd(target_user, &mut target_uid, &mut target_gid, &mut shell_buf, &mut shell_len) {
+        raw::raw_write(1, b"su: unknown user\n".as_ptr(), 17);
         raw::raw_exit(1);
     }
 
-    // Password check: required when a non-root user escalates to root.
+    // Password check: only when escalating to root from non-root.
     if target_uid == 0 && raw::raw_getuid() != 0 {
-        if !verify_password(target_user) {
-            write_stderr("su: authentication failure\n");
+        // Read expected hash from shadow.
+        let mut expected_hash = [0u8; 128];
+        let mut hash_len: usize = 0;
+        if !read_shadow_hash(target_user, &mut expected_hash, &mut hash_len) {
+            raw::raw_write(1, b"su: authentication failure\n".as_ptr(), 27);
+            raw::raw_exit(1);
+        }
+        // Locked account (* or !)
+        if hash_len == 1 && (expected_hash[0] == b'*' || expected_hash[0] == b'!') {
+            raw::raw_write(1, b"su: account locked\n".as_ptr(), 19);
+            raw::raw_exit(1);
+        }
+
+        raw::raw_write(1, b"Password: ".as_ptr(), 10);
+        let mut input = [0u8; 256];
+        let n = raw::raw_read(0, input.as_mut_ptr(), input.len());
+        if n <= 0 {
+            raw::raw_write(1, b"\nsu: authentication failure\n".as_ptr(), 28);
+            raw::raw_exit(1);
+        }
+        // Trim trailing newline.
+        let input_len = if n > 0 && input[(n - 1) as usize] == b'\n' { (n - 1) as usize } else { n as usize };
+
+        if input_len != hash_len || input[..input_len] != expected_hash[..hash_len] {
+            raw::raw_write(1, b"\nsu: authentication failure\n".as_ptr(), 28);
             raw::raw_exit(1);
         }
     }
@@ -63,89 +73,117 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, envp: *const *cons
     raw::raw_setgid(target_gid);
     raw::raw_setuid(target_uid);
 
-    // Exec the target user's shell with proper argv and envp.
-    let mut shell_buf = [0u8; 256];
-    let shell_len = target_shell.len().min(255);
-    shell_buf[..shell_len].copy_from_slice(&target_shell.as_bytes()[..shell_len]);
+    // Exec the target shell.
+    let argv_exec: [*const u8; 1] = [core::ptr::null()];
+    let envp_exec: [*const u8; 1] = [core::ptr::null()];
+    raw::raw_exec(shell_buf.as_ptr(), argv_exec.as_ptr(), envp_exec.as_ptr());
 
-    // argv: [shell_path, NULL]
-    let argv: [*const u8; 2] = [shell_buf.as_ptr(), core::ptr::null()];
-
-    // envp: inherit basic environment variables.
-    let home_var = b"HOME=/home/user\0";
-    let path_var = b"PATH=/system/bin\0";
-    let term_var = b"TERM=vt100\0";
-    let envp: [*const u8; 4] = [
-        home_var.as_ptr(),
-        path_var.as_ptr(),
-        term_var.as_ptr(),
-        core::ptr::null(),
-    ];
-    raw::raw_exec(shell_buf.as_ptr(), argv.as_ptr(), envp.as_ptr());
-
-    write_stderr("su: failed to exec shell\n");
+    raw::raw_write(1, b"su: exec failed\n".as_ptr(), 16);
     raw::raw_exit(1)
 }
 
-fn resolve_user(username: &str) -> Option<(u32, u32, String)> {
-    let content = read_special_file(SpecialFile::Passwd)?;
-    for line in content.lines() {
-        let mut fields = line.splitn(8, ':');
-        let name    = fields.next()?;
-        if name != username { continue; }
-        let _pass   = fields.next();
-        let uid_str = fields.next()?;
-        let gid_str = fields.next()?;
-        let _gecos  = fields.next();
-        let _home   = fields.next();
-        let shell   = fields.next().unwrap_or("/system/bin/sh");
-        let uid: u32 = uid_str.parse().ok()?;
-        let gid: u32 = gid_str.parse().ok()?;
-        return Some((uid, gid, String::from(shell)));
-    }
-    None
-}
+/// Read /system/config/passwd and find the line matching `username`.
+/// Fills uid, gid, and shell path. Returns false if not found.
+fn resolve_user_from_passwd(
+    username: &[u8],
+    uid: &mut u32,
+    gid: &mut u32,
+    shell: &mut [u8; 128],
+    shell_len: &mut usize,
+) -> bool {
+    let path = Environment::get_special_file(SpecialFile::Passwd);
+    let mut path_buf = [0u8; 64];
+    let plen = path.len().min(63);
+    path_buf[..plen].copy_from_slice(&path.as_bytes()[..plen]);
 
-fn verify_password(username: &str) -> bool {
-    let content = match read_special_file(SpecialFile::Shadow) {
-        Some(c) => c,
-        None => return false,
-    };
-    for line in content.lines() {
-        let mut fields = line.splitn(3, ':');
-        let name = match fields.next() { Some(n) => n, None => continue };
-        if name != username { continue; }
-        let hash = match fields.next() { Some(h) => h, None => continue };
-        if hash == "*" || hash == "!" || hash.is_empty() {
-            return false; // Account locked
+    let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
+    if fd < 0 { return false; }
+    let mut buf = [0u8; 1024];
+    let n = raw::raw_read(fd as i32, buf.as_mut_ptr(), buf.len());
+    raw::raw_close(fd as i32);
+    if n <= 0 { return false; }
+
+    // Parse: name:x:uid:gid:gecos:home:shell
+    let content = &buf[..n as usize];
+    let mut start = 0;
+    while start < content.len() {
+        let end = content[start..].iter().position(|&b| b == b'\n')
+            .map(|p| start + p).unwrap_or(content.len());
+        let line = &content[start..end];
+        start = end + 1;
+
+        // Find colons.
+        let mut colons = [0usize; 6];
+        let mut cc = 0;
+        for (i, &b) in line.iter().enumerate() {
+            if b == b':' && cc < 6 { colons[cc] = i; cc += 1; }
         }
-        // v1.0: plaintext comparison.
-        write_stdout("Password: ");
-        let input = read_line_stdin();
-        return input.trim() == hash;
+        if cc < 6 { continue; }
+
+        let name = &line[..colons[0]];
+        if name != username { continue; }
+
+        // Parse uid (between colon[1] and colon[2]).
+        *uid = parse_u32(&line[colons[1]+1..colons[2]]);
+        // Parse gid (between colon[2] and colon[3]).
+        *gid = parse_u32(&line[colons[2]+1..colons[3]]);
+        // Shell (after colon[5]).
+        let sh = &line[colons[5]+1..];
+        let slen = sh.len().min(127);
+        shell[..slen].copy_from_slice(&sh[..slen]);
+        *shell_len = slen;
+        return true;
     }
     false
 }
 
-fn read_special_file(file: SpecialFile) -> Option<String> {
-    let path = Environment::get_special_file(file);
+/// Read /system/config/shadow and find the hash for `username`.
+fn read_shadow_hash(username: &[u8], hash: &mut [u8; 128], hash_len: &mut usize) -> bool {
+    let path = Environment::get_special_file(SpecialFile::Shadow);
     let mut path_buf = [0u8; 64];
     let plen = path.len().min(63);
     path_buf[..plen].copy_from_slice(&path.as_bytes()[..plen]);
+
     let fd = raw::raw_open(path_buf.as_ptr(), 0, 0);
-    if fd < 0 { return None; }
-    let mut buf = [0u8; 2048];
+    if fd < 0 { return false; }
+    let mut buf = [0u8; 1024];
     let n = raw::raw_read(fd as i32, buf.as_mut_ptr(), buf.len());
     raw::raw_close(fd as i32);
-    if n <= 0 { return None; }
-    core::str::from_utf8(&buf[..n as usize]).ok().map(String::from)
+    if n <= 0 { return false; }
+
+    let content = &buf[..n as usize];
+    let mut start = 0;
+    while start < content.len() {
+        let end = content[start..].iter().position(|&b| b == b'\n')
+            .map(|p| start + p).unwrap_or(content.len());
+        let line = &content[start..end];
+        start = end + 1;
+
+        // name:hash:...
+        let colon1 = match line.iter().position(|&b| b == b':') {
+            Some(p) => p,
+            None => continue,
+        };
+        let name = &line[..colon1];
+        if name != username { continue; }
+
+        let rest = &line[colon1+1..];
+        let colon2 = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+        let h = &rest[..colon2];
+        let hlen = h.len().min(127);
+        hash[..hlen].copy_from_slice(&h[..hlen]);
+        *hash_len = hlen;
+        return true;
+    }
+    false
 }
 
-fn read_line_stdin() -> String {
-    let mut buf = [0u8; 256];
-    let n = raw::raw_read(0, buf.as_mut_ptr(), buf.len());
-    if n <= 0 { return String::new(); }
-    String::from(core::str::from_utf8(&buf[..n as usize]).unwrap_or(""))
+fn parse_u32(bytes: &[u8]) -> u32 {
+    let mut val: u32 = 0;
+    for &b in bytes {
+        if b >= b'0' && b <= b'9' { val = val * 10 + (b - b'0') as u32; }
+    }
+    val
 }
 
 #[panic_handler]
