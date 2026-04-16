@@ -325,7 +325,18 @@ fn execute_command(cmd: &SimpleCommand, in_fd: i32, out_fd: i32, state: &mut She
             words:       expanded_words,
             redirects:   expanded_redirects,
         };
-        return run_builtin_with_io(&expanded_cmd, in_fd, out_fd, &[], state);
+        // Special builtins (exit, exec, return, etc.) MUST run in the current
+        // process, not a forked child.  run_builtin_with_io forks, which is
+        // wrong for exit (the child exits, not the shell).
+        //
+        // Only use run_builtin_with_io when there's actual I/O redirection
+        // that requires a separate process.
+        let has_io_change = in_fd != 0 || out_fd != 1 || !expanded_cmd.redirects.is_empty();
+        if has_io_change {
+            return run_builtin_with_io(&expanded_cmd, in_fd, out_fd, &[], state);
+        }
+        // No I/O redirection — run directly in the current shell.
+        return try_builtin(&expanded_cmd.words, state).unwrap_or(0);
     }
 
     let expanded_cmd = SimpleCommand {
@@ -1248,7 +1259,7 @@ fn open_redirects(redirects: &[Redirect]) -> Option<(Option<i32>, Option<i32>)> 
                     close_optional(redir_out);
                     return None;
                 }
-                raw::raw_write(pipe_fds[1], body.as_ptr(), body.len());
+                (pipe_fds[1], body.as_ptr(), body.len());
                 raw::raw_close(pipe_fds[1]);
                 close_optional(redir_in);
                 redir_in = Some(pipe_fds[0]);

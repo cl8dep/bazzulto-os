@@ -228,9 +228,44 @@ pub unsafe fn tty_read_bytes(destination: &mut [u8]) -> usize {
 
     match state.mode {
         TtyMode::Raw => {
-            let byte = uart_receive_blocking();
-            destination[0] = byte;
-            1
+            // Raw mode: return one character at a time, no line buffering.
+            // Uses the same yield + WFI + IRQ pattern as cooked mode so that
+            // virtio keyboard input works (not just UART serial).
+            //
+            // Characters arrive either from:
+            //   - UART serial (uart_receive_nonblocking)
+            //   - Virtio keyboard IRQ → tty_receive_char() → line_buffer
+            //
+            // In raw mode, tty_receive_char still puts bytes in line_buffer.
+            // We return the first available byte without waiting for newline.
+            loop {
+                // Check if line_buffer has any data (from keyboard IRQ).
+                if state.line_buffer_length > 0 {
+                    let byte = state.line_buffer[0];
+                    // Shift remaining bytes left.
+                    let remaining = state.line_buffer_length - 1;
+                    if remaining > 0 {
+                        state.line_buffer.copy_within(1..1 + remaining, 0);
+                    }
+                    state.line_buffer_length = remaining;
+                    state.line_ready = false;
+                    destination[0] = byte;
+                    return 1;
+                }
+                // Check UART.
+                if let Some(byte) = uart_receive_nonblocking() {
+                    destination[0] = byte;
+                    return 1;
+                }
+                // Yield + WFI to allow keyboard IRQs.
+                crate::scheduler::schedule_next();
+                unsafe {
+                    core::arch::asm!("msr daifclr, #2", options(nostack, nomem));
+                    core::arch::asm!("wfi");
+                    core::arch::asm!("msr daifset, #2", options(nostack, nomem));
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
         }
         TtyMode::Cooked => {
             // Fill the line buffer until a newline or buffer-full condition.
@@ -444,7 +479,18 @@ pub unsafe fn tty_clear_echo_sink() {
 /// Must be called from an IRQ handler with IRQs masked at EL1.
 pub unsafe fn tty_receive_char(byte: u8) {
     let state = &mut *TTY.0.get();
-    cooked_mode_process_byte(state, byte);
+    match state.mode {
+        TtyMode::Raw => {
+            // Raw mode: put byte directly in buffer, no echo, no processing.
+            if state.line_buffer_length < TTY_LINE_BUFFER_CAPACITY {
+                state.line_buffer[state.line_buffer_length] = byte;
+                state.line_buffer_length += 1;
+            }
+        }
+        TtyMode::Cooked => {
+            cooked_mode_process_byte(state, byte);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

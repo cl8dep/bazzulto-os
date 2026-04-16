@@ -87,10 +87,13 @@ fn procfs_process_status(pid_index: u16) -> Option<ProcSnapshot> {
             .unwrap_or(0);
 
         let text = format!(
-            "pid: {}\nppid: {}\nstate: {}\n",
+            "Name:\t{}\nPid:\t{}\nPPid:\t{}\nState:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n",
+            process.pid.index, // Name: use pid as placeholder until comm is implemented
             process.pid.index,
             parent_index,
             state_name,
+            process.uid, process.euid, process.suid, process.uid,
+            process.gid, process.egid, process.sgid, process.gid,
         );
         Some(text.into_bytes())
     }) };

@@ -9,6 +9,12 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 pub(super) unsafe fn sys_exit(exit_code: i32) -> i64 {
+    let pid = crate::scheduler::with_scheduler(|s| s.current_pid());
+    crate::drivers::uart::puts("[exit] pid=");
+    crate::drivers::uart::put_hex(pid.index as u64);
+    crate::drivers::uart::puts(" code=");
+    crate::drivers::uart::put_hex(exit_code as u64);
+    crate::drivers::uart::puts("\r\n");
     // Grab the FD table Arc before entering the scheduler critical section.
     let fd_table_arc = crate::scheduler::with_scheduler(|scheduler| {
         scheduler.current_process()

@@ -54,14 +54,42 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, _envp: *const *con
         }
 
         raw::raw_write(1, b"Password: ".as_ptr(), 10);
+
+        // Switch TTY to raw mode (no ICANON, no ECHO) for char-by-char input.
+        // Each keystroke prints '*' in real time.
+        let mut saved_termios = [0u8; 48];
+        raw::raw_tcgetattr(0, saved_termios.as_mut_ptr());
+        let mut raw_termios = [0u8; 48];
+        raw_termios.copy_from_slice(&saved_termios);
+        // c_lflag at offset 12: clear ICANON (0x02) and ECHO (0x08).
+        let c_lflag = u32::from_le_bytes([raw_termios[12], raw_termios[13], raw_termios[14], raw_termios[15]]);
+        raw_termios[12..16].copy_from_slice(&(c_lflag & !(0x0002 | 0x0008)).to_le_bytes());
+        raw::raw_tcsetattr(0, 0, raw_termios.as_ptr());
+
         let mut input = [0u8; 256];
-        let n = raw::raw_read(0, input.as_mut_ptr(), input.len());
-        if n <= 0 {
-            raw::raw_write(1, b"\nsu: authentication failure\n".as_ptr(), 28);
-            raw::raw_exit(1);
+        let mut input_len: usize = 0;
+        loop {
+            let mut ch = [0u8; 1];
+            let n = raw::raw_read(0, ch.as_mut_ptr(), 1);
+            if n != 1 { break; }
+            if ch[0] == b'\n' || ch[0] == b'\r' { break; }
+            if ch[0] == 127 || ch[0] == 8 {
+                if input_len > 0 {
+                    input_len -= 1;
+                    raw::raw_write(1, b"\x08 \x08".as_ptr(), 3);
+                }
+                continue;
+            }
+            if input_len < 255 {
+                input[input_len] = ch[0];
+                input_len += 1;
+                raw::raw_write(1, b"*".as_ptr(), 1);
+            }
         }
-        // Trim trailing newline.
-        let input_len = if n > 0 && input[(n - 1) as usize] == b'\n' { (n - 1) as usize } else { n as usize };
+
+        // Restore TTY to cooked mode.
+        raw::raw_tcsetattr(0, 0, saved_termios.as_ptr());
+        raw::raw_write(1, b"\n".as_ptr(), 1);
 
         if input_len != hash_len || input[..input_len] != expected_hash[..hash_len] {
             raw::raw_write(1, b"\nsu: authentication failure\n".as_ptr(), 28);
@@ -69,17 +97,30 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8, _envp: *const *con
         }
     }
 
-    // Drop privileges to target user.
-    raw::raw_setgid(target_gid);
-    raw::raw_setuid(target_uid);
-
-    // Exec the target shell.
-    let argv_exec: [*const u8; 1] = [core::ptr::null()];
-    let envp_exec: [*const u8; 1] = [core::ptr::null()];
-    raw::raw_exec(shell_buf.as_ptr(), argv_exec.as_ptr(), envp_exec.as_ptr());
-
-    raw::raw_write(1, b"su: exec failed\n".as_ptr(), 16);
-    raw::raw_exit(1)
+    // Fork + exec pattern (standard Unix su behavior).
+    // su stays alive as parent, waits for the child shell to exit,
+    // then su itself exits.  This ensures the original shell (grandparent)
+    // properly resumes when the user types `exit`.
+    let pid = raw::raw_fork();
+    if pid < 0 {
+        raw::raw_write(1, b"su: fork failed\n".as_ptr(), 16);
+        raw::raw_exit(1);
+    }
+    if pid == 0 {
+        // Child: drop privileges and exec the target shell.
+        raw::raw_setgid(target_gid);
+        raw::raw_setuid(target_uid);
+        let argv_exec: [*const u8; 1] = [core::ptr::null()];
+        let envp_exec: [*const u8; 1] = [core::ptr::null()];
+        raw::raw_exec(shell_buf.as_ptr(), argv_exec.as_ptr(), envp_exec.as_ptr());
+        raw::raw_write(1, b"su: exec failed\n".as_ptr(), 16);
+        raw::raw_exit(1);
+    }
+    // Parent (su): wait for the child shell to exit.
+    let mut status: i32 = 0;
+    raw::raw_wait(pid as i32, &mut status, 0);
+    // Child exited — su exits too, returning control to the original shell.
+    raw::raw_exit(0)
 }
 
 /// Read /system/config/passwd and find the line matching `username`.

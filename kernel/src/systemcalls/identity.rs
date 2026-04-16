@@ -27,7 +27,17 @@ pub(super) unsafe fn sys_getgid() -> i64 {
 
 pub(super) unsafe fn sys_geteuid() -> i64 {
     crate::scheduler::with_scheduler(|s| {
-        s.current_process().map(|p| p.euid as i64).unwrap_or(0)
+        let (pid, ppid, euid) = s.current_process()
+            .map(|p| (s.current_pid().index, p.parent_pid.map(|pp| pp.index).unwrap_or(0), p.euid))
+            .unwrap_or((0, 0, 0));
+        crate::drivers::uart::puts("[geteuid] pid=");
+        crate::drivers::uart::put_hex(pid as u64);
+        crate::drivers::uart::puts(" ppid=");
+        crate::drivers::uart::put_hex(ppid as u64);
+        crate::drivers::uart::puts(" euid=");
+        crate::drivers::uart::put_hex(euid as u64);
+        crate::drivers::uart::puts("\r\n");
+        euid as i64
     })
 }
 

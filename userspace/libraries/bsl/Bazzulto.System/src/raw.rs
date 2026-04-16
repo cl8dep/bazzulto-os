@@ -16,7 +16,8 @@ use crate::vdso::{vdso_slot_va, SLOT_EXIT, SLOT_WRITE, SLOT_READ, SLOT_YIELD,
                   SLOT_MACHINE_REBOOT, SLOT_MACHINE_POWEROFF,
                   SLOT_MOUNT, SLOT_GETMOUNTS,
                   SLOT_UNAME, SLOT_SYSINFO,
-                  SLOT_GETUID, SLOT_GETGID};
+                  SLOT_GETUID, SLOT_GETGID,
+                  SLOT_TCGETATTR, SLOT_TCSETATTR};
 
 // Branch into a vDSO slot that takes 0 arguments and returns i64.
 macro_rules! vdso_call0 {
@@ -455,4 +456,16 @@ pub fn raw_getegid() -> u32 {
 #[inline]
 pub fn raw_getgroups(size: i32, list: *mut u32) -> i64 {
     vdso_call2!(SLOT_GETGROUPS, size, list)
+}
+
+/// Get terminal attributes.  `termios_ptr` must point to a 48-byte Termios struct.
+#[inline]
+pub fn raw_tcgetattr(fd: i32, termios_ptr: *mut u8) -> i64 {
+    vdso_call2!(SLOT_TCGETATTR, fd, termios_ptr)
+}
+
+/// Set terminal attributes.  `termios_ptr` must point to a 48-byte Termios struct.
+#[inline]
+pub fn raw_tcsetattr(fd: i32, optional_actions: i32, termios_ptr: *const u8) -> i64 {
+    vdso_call3!(SLOT_TCSETATTR, fd, optional_actions, termios_ptr)
 }
