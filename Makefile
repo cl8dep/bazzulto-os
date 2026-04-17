@@ -51,6 +51,7 @@ BSL_DIRS := \
 	DIR:/home/user/.bin \
 	DIR:/home/user/.lib \
 	DIR:/system/lib \
+	DIR:/system/include \
 	DIR:/system/share \
 	DIR:/system/config \
 	DIR:/system/fonts \
@@ -78,7 +79,12 @@ DISK_FILES := \
 	userspace/config/test_files/script.sh:/data/test/script.sh \
 	userspace/target/aarch64-unknown-none/release/hello:/data/test/hello \
 	userspace/target/aarch64-unknown-none/release/readhome:/data/test/readhome \
-	tests/libc/test_hello:/data/test/test_hello
+	tests/libc/test_hello:/data/test/test_hello \
+	tests/libc/test_stdlib:/data/test/test_stdlib \
+	tests/libc/test_string:/data/test/test_string \
+	tests/libc/test_signal:/data/test/test_signal \
+	tests/libc/test_time:/data/test/test_time \
+	tests/libc/test_pthread:/data/test/test_pthread
 
 # ---------------------------------------------------------------------------
 # Default: build everything (kernel + disk image)
@@ -225,7 +231,12 @@ $(MKBTRFS_BIN): $(MKBTRFS)/src/main.rs $(MKBTRFS)/Cargo.toml
 disk: bsl zoneinfo $(MKBTRFS_BIN)
 	$(MKBTRFS_BIN) disk.img 1024 --label BAZZULTO $(DISK_FILES) $(BSL_DIRS) \
 	  TREE:$(BSL_SVC_DIR):/system/config/services \
-	  TREE:$(ZONEINFO_OUTDIR):/system/share/zoneinfo
+	  TREE:$(ZONEINFO_OUTDIR):/system/share/zoneinfo \
+	  $(MUSL_SYSROOT)/lib/libc.a:/system/lib/libc.a \
+	  $(MUSL_SYSROOT)/lib/crt1.o:/system/lib/crt1.o \
+	  $(MUSL_SYSROOT)/lib/crti.o:/system/lib/crti.o \
+	  $(MUSL_SYSROOT)/lib/crtn.o:/system/lib/crtn.o \
+	  TREE:$(MUSL_SYSROOT)/include:/system/include
 
 # Second disk — 2 GiB Btrfs volume, mounted at /home/user by the kernel.
 .PHONY: disk2
