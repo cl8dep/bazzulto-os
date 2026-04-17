@@ -133,8 +133,9 @@ kernel-release: musl-patch
 # cloning, and again whenever patches/ is updated.
 # ---------------------------------------------------------------------------
 
-MUSL_DIR    := userspace/libraries/libc/musl
-PATCHES_DIR := userspace/libraries/libc/patches/musl
+MUSL_DIR      := userspace/libraries/libc/musl
+MUSL_SYSROOT  := userspace/libraries/libc/musl-sysroot
+PATCHES_DIR   := userspace/libraries/libc/patches/musl
 
 .PHONY: musl-patch
 musl-patch:
@@ -146,6 +147,25 @@ musl-patch:
 	    echo "  patched: $$dst"; \
 	done
 	@echo "Done."
+
+# ---------------------------------------------------------------------------
+# musl libc — static library for C programs
+# ---------------------------------------------------------------------------
+
+.PHONY: musl
+musl: musl-patch
+	@if [ ! -f $(MUSL_DIR)/config.mak ]; then \
+	    echo "Configuring musl..."; \
+	    cd $(MUSL_DIR) && ./configure \
+	        --target=aarch64-elf \
+	        --prefix=$(CURDIR)/$(MUSL_SYSROOT) \
+	        --disable-shared \
+	        CROSS_COMPILE=aarch64-elf-; \
+	fi
+	$(MAKE) -C $(MUSL_DIR) -j$$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+	@rm -rf $(MUSL_SYSROOT)
+	@mkdir -p $(MUSL_SYSROOT)
+	$(MAKE) -C $(MUSL_DIR) install
 
 # ---------------------------------------------------------------------------
 # Timezone database — compiled from the IANA source (third_party/tz).

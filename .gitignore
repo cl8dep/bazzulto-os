@@ -33,6 +33,9 @@ userspace/libraries/**/target/
 # Cargo build output — mkfs_btrfs host tool
 tools/mkfs_btrfs/target/
 
+# musl libc — sysroot installed by `make musl-install` (headers + libc.a)
+userspace/libraries/libc/musl-sysroot/
+
 # Compiled IANA TZif binaries — generated at build time from third_party/tz
 third_party/zoneinfo/
 
