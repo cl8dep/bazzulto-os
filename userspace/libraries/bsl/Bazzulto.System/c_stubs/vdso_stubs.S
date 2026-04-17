@@ -4,13 +4,13 @@
 // The SVC instruction lives in the kernel-managed vDSO page — never here.
 //
 // Slot VA = VDSO_BASE + slot * VDSO_SLOT_SIZE
-//         = 0x1000   + slot * 16
+//         = 0x1000   + slot * 8
 //
 // Arguments follow AAPCS64: x0–x5 in, x0 out. The vDSO stub ends with ret,
 // so these trampolines are simple indirect branches — no stack frame needed.
 
 .equ VDSO_BASE,      0x1000
-.equ VDSO_SLOT_SIZE, 16
+.equ VDSO_SLOT_SIZE, 8
 
 // Helper macro: branch to vDSO slot N.
 // Uses x16 (intra-procedure-call scratch register — safe to clobber).

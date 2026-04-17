@@ -229,6 +229,10 @@ pub struct LoadedImage {
     pub stack_demand_base: u64,
     /// Virtual address one past the end of the stack demand region (== stack top).
     pub stack_demand_top: u64,
+    /// Initial program break (end of the last PT_LOAD segment, page-aligned).
+    ///
+    /// Used by `sys_brk` to set the heap base for C programs (musl `malloc`).
+    pub brk_start: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +403,8 @@ pub unsafe fn load_elf(
     let program_header_count = header.e_phnum as usize;
     let program_header_offset = header.e_phoff as usize;
     let program_header_entry_size = header.e_phentsize as usize;
+    // Track the highest mapped VA to compute brk_start.
+    let mut segments_end: u64 = 0;
 
     for index in 0..program_header_count {
         let ph_offset = program_header_offset
@@ -473,7 +479,16 @@ pub unsafe fn load_elf(
                 )
                 .map_err(LoaderError::MappingFailed)?;
         }
+
+        // Track the highest virtual address mapped by this segment.
+        let seg_top = segment_vaddr + ph.p_memsz;
+        if seg_top > segments_end {
+            segments_end = seg_top;
+        }
     }
+
+    // Compute brk_start: end of last PT_LOAD segment, page-aligned.
+    let brk_start = align_up(segments_end, page_size);
 
     // --- 4. Map signal trampoline ---
     // The trampoline is one page at SIGNAL_TRAMPOLINE_VA.
@@ -550,6 +565,7 @@ pub unsafe fn load_elf(
         envp_va,
         page_table,
         stack_demand_base: stack_bottom,
+        brk_start,
         stack_demand_top:  stack_top,
     })
 }

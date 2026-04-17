@@ -77,7 +77,8 @@ DISK_FILES := \
 	userspace/config/test_files/public.txt:/data/test/public.txt \
 	userspace/config/test_files/script.sh:/data/test/script.sh \
 	userspace/target/aarch64-unknown-none/release/hello:/data/test/hello \
-	userspace/target/aarch64-unknown-none/release/readhome:/data/test/readhome
+	userspace/target/aarch64-unknown-none/release/readhome:/data/test/readhome \
+	tests/libc/test_hello:/data/test/test_hello
 
 # ---------------------------------------------------------------------------
 # Default: build everything (kernel + disk image)

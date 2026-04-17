@@ -128,6 +128,7 @@
 #define __NR_mq_timedsend       92
 #define __NR_mq_timedreceive    93
 #define __NR_mq_notify          95
+#define __NR_mq_getsetattr      95
 #define __NR_select             96
 #define __NR_pselect6           96
 #define __NR_umask              97
@@ -232,6 +233,9 @@
 #define __NR_faccessat          130
 #define __NR_faccessat2         130
 
+/* mknodat: not implemented */
+#define __NR_mknodat            162
+
 /* mkfifoat: no dirfd form; falls back to mkfifo */
 #define __NR_mkfifoat           71
 
@@ -270,9 +274,27 @@
 #define __NR_inotify_add_watch  162
 #define __NR_inotify_rm_watch   162
 
-/* splice / tee / sendfile: not implemented */
+/* SysV IPC: not implemented */
+#define __NR_msgget             162
+#define __NR_msgctl             162
+#define __NR_msgsnd             162
+#define __NR_msgrcv             162
+#define __NR_semget             162
+#define __NR_semctl             162
+#define __NR_semop              162
+#define __NR_semtimedop         162
+#define __NR_shmget             162
+#define __NR_shmctl             162
+#define __NR_shmat              162
+#define __NR_shmdt              162
+
+/* remap_file_pages: not implemented */
+#define __NR_remap_file_pages   162
+
+/* splice / tee / sendfile / vmsplice: not implemented */
 #define __NR_splice             162
 #define __NR_tee                162
+#define __NR_vmsplice           162
 #define __NR_sendfile           162
 
 /* copy_file_range: not implemented */
@@ -320,9 +342,13 @@
 
 /* xattr: not implemented */
 #define __NR_setxattr           162
+#define __NR_lsetxattr          162
 #define __NR_getxattr           162
+#define __NR_lgetxattr          162
 #define __NR_listxattr          162
+#define __NR_llistxattr         162
 #define __NR_removexattr        162
+#define __NR_lremovexattr       162
 #define __NR_fsetxattr          162
 #define __NR_fgetxattr          162
 #define __NR_flistxattr         162

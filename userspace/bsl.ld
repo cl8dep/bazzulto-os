@@ -12,7 +12,7 @@
 PHDRS {
     rodata PT_LOAD FLAGS(4);   /* R */
     text   PT_LOAD FLAGS(5);   /* R+X */
-    bss    PT_LOAD FLAGS(6);   /* R+W */
+    data   PT_LOAD FLAGS(6);   /* R+W */
 }
 
 SECTIONS {
@@ -26,12 +26,16 @@ SECTIONS {
 
     .text : ALIGN(0x1000) {
         *(.text .text.*)
+        *(.init)
+        *(.fini)
     } :text
 
-    .bss : ALIGN(0x1000) {
+    .data : ALIGN(0x1000) {
+        *(.got .got.*)
+        *(.data .data.*)
         *(.bss .bss.*)
         *(COMMON)
-    } :bss
+    } :data
 
     /DISCARD/ : {
         *(.comment)

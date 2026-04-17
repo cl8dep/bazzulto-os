@@ -1,7 +1,7 @@
 //! vDSO — Virtual Dynamic Shared Object for Bazzulto OS.
 //!
 //! The kernel generates a 4 KiB read-only code page containing one stub per
-//! syscall slot.  Each stub is exactly 16 bytes (4 words):
+//! syscall slot.  Each stub is exactly 8 bytes (2 words):
 //!
 //!   svc #N      (4 bytes) — invoke syscall N
 //!   ret         (4 bytes) — return to caller
@@ -54,18 +54,19 @@ pub const VDSO_DATA_VA: usize = 0x3000;
 /// Must be ≥ (highest syscall number + 1). Increase when adding syscalls.
 /// Current highest: SETGROUPS = 166 → need at least 167 slots.
 ///
-/// The 4 KiB page fits at most 248 slots (3968 bytes) with room for the
-/// fast clock_gettime implementation (128 bytes).  200 slots provides
-/// headroom for ~33 more syscalls before another increase is needed.
-pub const VDSO_SLOT_COUNT: usize = 200;
+/// Each slot is 8 bytes (svc #N; ret).  With 448 slots (3584 bytes) the
+/// remaining 512 bytes of the 4 KiB page hold the fast clock_gettime
+/// implementation.  448 slots is enough for ~280 more syscalls beyond
+/// the current 167.
+pub const VDSO_SLOT_COUNT: usize = 448;
 
-/// Bytes per slot: 4 instructions × 4 bytes.
-pub const VDSO_SLOT_SIZE: usize = 16;
+/// Bytes per slot: 2 instructions × 4 bytes = 8 bytes.
+pub const VDSO_SLOT_SIZE: usize = 8;
 
 /// Word index within the code page where the fast clock_gettime implementation
-/// begins.  Must be > VDSO_SLOT_COUNT * 4 (last slot word = 199*4+3 = 799).
-/// Using 800 (byte offset 3200 from page start).
-const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 800;
+/// begins.  Must be > VDSO_SLOT_COUNT * 2 (last slot word = 447*2+1 = 895).
+/// Using 896 (byte offset 3584 from page start).
+const FAST_CLOCK_GETTIME_WORD_OFFSET: usize = 896;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -184,29 +185,25 @@ struct VdsoPage([u32; PAGE_SIZE / 4]);
 const fn generate_vdso_page() -> VdsoPage {
     let mut words = [NOP; PAGE_SIZE / 4];
 
-    // Generate stubs for all slots.
+    // Generate stubs for all slots (8 bytes each: svc #N; ret).
     let mut slot = 0usize;
     while slot < VDSO_SLOT_COUNT {
-        let base = slot * 4;
+        let base = slot * 2;
         words[base]     = SVC_BASE | ((slot as u32) << 5); // svc #slot
         words[base + 1] = RET;
-        words[base + 2] = NOP;
-        words[base + 3] = NOP;
         slot += 1;
     }
 
     // Replace slot 19 (clock_gettime) with a direct branch to the fast impl.
     //
-    // Slot 19 base word index: 19 * 4 = 76.
+    // Slot 19 base word index: 19 * 2 = 38.
     // B encoding: 0x14000000 | imm26 (word offset to target).
     {
-        let slot_base = SYSCALL_CLOCK_GETTIME * 4; // 76
+        let slot_base = SYSCALL_CLOCK_GETTIME * 2; // 38
         let target = FAST_CLOCK_GETTIME_WORD_OFFSET;
         let imm26 = (target - slot_base) as u32;
         words[slot_base]     = 0x14000000 | imm26; // B #fast_clock_gettime
         words[slot_base + 1] = NOP;
-        words[slot_base + 2] = NOP;
-        words[slot_base + 3] = NOP;
     }
 
     // ---------------------------------------------------------------------------

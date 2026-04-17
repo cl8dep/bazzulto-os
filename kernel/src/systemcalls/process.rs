@@ -181,6 +181,9 @@ pub(super) unsafe fn sys_spawn(name_ptr: *const u8, capability_mask: u64) -> i64
         child.mmap_regions.insert(loaded.stack_demand_base, stack_region);
         // Grant requested capabilities (already validated above).
         child.capabilities = capability_mask;
+        // Set initial program break for musl brk()/malloc().
+        child.brk_base = loaded.brk_start;
+        child.brk_current = loaded.brk_start;
         // Inherit the parent's environment.
         child.environ = parent_environ.iter()
             .filter_map(|v| core::str::from_utf8(v).ok().map(|s| alloc::string::String::from(s)))
@@ -695,6 +698,9 @@ pub(super) unsafe fn sys_exec(
             process.page_table = Some(loaded_page_table);
             process.mmap_next_va = crate::process::MMAP_USER_BASE;
             process.mmap_regions.clear();
+            // Set initial program break for musl brk()/malloc().
+            process.brk_base = loaded.brk_start;
+            process.brk_current = loaded.brk_start;
             // Register the demand-paged stack region for the new image.
             let stack_region = crate::process::MmapRegion {
                 base:   loaded.stack_demand_base,

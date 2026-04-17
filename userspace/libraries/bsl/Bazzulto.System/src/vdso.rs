@@ -44,8 +44,8 @@
 /// This constant is permanent — changing it breaks all compiled binaries.
 pub const VDSO_BASE: usize = 0x1000;
 
-/// Bytes per vDSO slot: `svc #N` (4 bytes) + `ret` (4 bytes) + 8 bytes padding.
-pub const VDSO_SLOT_SIZE: usize = 16;
+/// Bytes per vDSO slot: `svc #N` (4 bytes) + `ret` (4 bytes).
+pub const VDSO_SLOT_SIZE: usize = 8;
 
 /// Compute the virtual address of a vDSO slot.
 #[inline(always)]
